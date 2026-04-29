@@ -1,5 +1,5 @@
-import { ref, computed } from 'vue'
-import { announcements } from '@/config/announcements'
+import { ref, computed, onMounted } from 'vue'
+import { getAnnouncements } from '@/api'
 
 const STORAGE_KEY = 'read_announcements'
 
@@ -31,13 +31,29 @@ function saveReadIds(readIds) {
 
 export function useAnnouncements() {
   const readIds = ref(loadReadIds())
+  const announcements = ref([])
+  const loading = ref(false)
+
+  /** 从后端 API 加载公告 */
+  async function fetchAnnouncements() {
+    loading.value = true
+    try {
+      const resp = await getAnnouncements()
+      announcements.value = resp.announcements || []
+    } catch {
+      // API 不可用时静默失败，保持空列表
+      announcements.value = []
+    } finally {
+      loading.value = false
+    }
+  }
 
   /** 所有公告列表 */
-  const allAnnouncements = computed(() => announcements)
+  const allAnnouncements = computed(() => announcements.value)
 
   /** 未读公告数量 */
   const unreadCount = computed(
-    () => announcements.filter((a) => !readIds.value.has(a.id)).length,
+    () => announcements.value.filter((a) => !readIds.value.has(a.id)).length,
   )
 
   /** 是否有未读公告 */
@@ -51,14 +67,14 @@ export function useAnnouncements() {
   /** 标记所有公告为已读 */
   function markAllAsRead() {
     const ids = new Set(readIds.value)
-    announcements.forEach((a) => ids.add(a.id))
+    announcements.value.forEach((a) => ids.add(a.id))
     readIds.value = ids
     saveReadIds(ids)
   }
 
   /** 清理缓存中已不存在的旧公告 id，保持 localStorage 干净 */
   function cleanupStaleIds() {
-    const currentIds = new Set(announcements.map((a) => a.id))
+    const currentIds = new Set(announcements.value.map((a) => a.id))
     const cleaned = new Set([...readIds.value].filter((id) => currentIds.has(id)))
     if (cleaned.size !== readIds.value.size) {
       readIds.value = cleaned
@@ -66,8 +82,11 @@ export function useAnnouncements() {
     }
   }
 
-  // 初始化时自动清理
-  cleanupStaleIds()
+  // 组件挂载时从 API 加载公告
+  onMounted(async () => {
+    await fetchAnnouncements()
+    cleanupStaleIds()
+  })
 
   return {
     allAnnouncements,
@@ -75,5 +94,6 @@ export function useAnnouncements() {
     hasUnread,
     isRead,
     markAllAsRead,
+    loading,
   }
 }

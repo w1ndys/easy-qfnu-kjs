@@ -721,6 +721,11 @@ func (s *StatsService) getDashboardHourlyDist(startTime string) ([]model.HourlyD
 	return items, nil
 }
 
+// DB 返回底层数据库连接，供其他服务复用
+func (s *StatsService) DB() *sql.DB {
+	return s.db
+}
+
 // Close 关闭数据库连接
 func (s *StatsService) Close() error {
 	return s.db.Close()
