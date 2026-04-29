@@ -159,6 +159,57 @@ type HourlyDistItem struct {
 	Count int `json:"count"` // 查询次数
 }
 
+// ---- 公告管理相关模型 ----
+
+// Announcement 公告数据模型
+type Announcement struct {
+	ID        int64  `json:"id"`
+	Title     string `json:"title"`
+	Content   string `json:"content"`
+	Important bool   `json:"important"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// CreateAnnouncementRequest 创建公告请求
+type CreateAnnouncementRequest struct {
+	Title     string `json:"title" binding:"required"`
+	Content   string `json:"content" binding:"required"`
+	Important bool   `json:"important"`
+}
+
+// UpdateAnnouncementRequest 更新公告请求
+type UpdateAnnouncementRequest struct {
+	Title     string `json:"title" binding:"required"`
+	Content   string `json:"content" binding:"required"`
+	Important bool   `json:"important"`
+}
+
+// AnnouncementListResponse 公告列表响应 (前台)
+type AnnouncementListResponse struct {
+	Announcements []AnnouncementPublic `json:"announcements"`
+}
+
+// AnnouncementPublic 前台公告展示结构 (兼容前端已有字段)
+type AnnouncementPublic struct {
+	ID        string `json:"id"`        // 字符串 id，兼容前端已读缓存
+	Date      string `json:"date"`      // 发布日期 YYYY-MM-DD
+	Title     string `json:"title"`     // 标题
+	Content   string `json:"content"`   // 正文
+	Important bool   `json:"important"` // 是否重要
+}
+
+// AdminLoginRequest 管理员登录请求
+type AdminLoginRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+// AdminLoginResponse 管理员登录响应
+type AdminLoginResponse struct {
+	Token string `json:"token"`
+}
+
 // FullDayStatusResponse 全天状态查询响应
 type FullDayStatusResponse struct {
 	Date        string                `json:"date"`         // 查询日期 (YYYY-MM-DD)

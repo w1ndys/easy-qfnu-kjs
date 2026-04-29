@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 	"github.com/W1ndys/easy-qfnu-kjs/internal/middleware"
 	"github.com/W1ndys/easy-qfnu-kjs/internal/service"
 	"github.com/W1ndys/easy-qfnu-kjs/pkg/cas"
+	"github.com/W1ndys/easy-qfnu-kjs/pkg/jwt"
 	"github.com/W1ndys/easy-qfnu-kjs/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -84,6 +87,45 @@ func main() {
 		defer statsService.Close()
 	}
 
+	// 初始化公告服务（复用 StatsService 的 SQLite 连接，生命周期由 StatsService 管理）
+	var announcementService *service.AnnouncementService
+	if statsService != nil {
+		as, err := service.NewAnnouncementService(statsService.DB())
+		if err != nil {
+			logger.Warn("初始化公告服务失败：%v。公告功能将不可用。", err)
+		} else {
+			announcementService = as
+		}
+	}
+
+	// 初始化 JWT 管理器
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		if os.Getenv("GIN_MODE") == "release" {
+			logger.Fatal("生产环境必须设置 JWT_SECRET 环境变量")
+		}
+		// 开发环境未配置时自动生成随机密钥（重启后旧 token 失效）
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			logger.Fatal("生成随机 JWT 密钥失败：%v", err)
+		}
+		jwtSecret = hex.EncodeToString(buf)
+		logger.Warn("未设置 JWT_SECRET，已自动生成随机密钥。重启后管理员需重新登录。")
+	}
+	jwtManager := jwt.NewManager(jwtSecret, 24*time.Hour)
+
+	// 读取管理员账号
+	adminUser := os.Getenv("ADMIN_USERNAME")
+	adminPass := os.Getenv("ADMIN_PASSWORD")
+	if adminUser == "" || adminPass == "" {
+		logger.Warn("未设置 ADMIN_USERNAME/ADMIN_PASSWORD，管理后台将不可用。")
+	}
+
+	var adminHandler *v1.AdminHandler
+	if announcementService != nil && adminUser != "" && adminPass != "" {
+		adminHandler = v1.NewAdminHandler(announcementService, jwtManager, adminUser, adminPass)
+	}
+
 	apiHandler := v1.NewHandler(classroomService, statsService)
 
 	// 3. 设置 Gin
@@ -105,6 +147,25 @@ func main() {
 		api.GET("/stats", apiHandler.GetStats)
 		api.GET("/top-buildings", apiHandler.GetTopBuildings)
 		api.GET("/dashboard", apiHandler.GetDashboard)
+
+		// 前台公告公开接口
+		if adminHandler != nil {
+			api.GET("/announcements", adminHandler.GetPublicAnnouncements)
+		}
+	}
+
+	// 管理后台 API
+	if adminHandler != nil {
+		api.POST("/admin/login", adminHandler.Login)
+
+		admin := api.Group("/admin")
+		admin.Use(middleware.JWTAuth(jwtManager))
+		{
+			admin.GET("/announcements", adminHandler.ListAnnouncements)
+			admin.POST("/announcements", adminHandler.CreateAnnouncement)
+			admin.PUT("/announcements/:id", adminHandler.UpdateAnnouncement)
+			admin.DELETE("/announcements/:id", adminHandler.DeleteAnnouncement)
+		}
 	}
 
 	// 启动

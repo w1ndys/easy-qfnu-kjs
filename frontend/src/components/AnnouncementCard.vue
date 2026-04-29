@@ -1,9 +1,11 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 import { useAnnouncements } from '@/composables/useAnnouncements'
 
-const { allAnnouncements, unreadCount, hasUnread, isRead, markAllAsRead } =
+const { allAnnouncements, unreadCount, hasUnread, isRead, markAllAsRead, fetchAnnouncements } =
   useAnnouncements()
+
+onMounted(() => fetchAnnouncements())
 
 // 有未读公告时默认展开，全部已读时默认折叠
 const expanded = ref(hasUnread.value)
