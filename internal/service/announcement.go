@@ -12,7 +12,7 @@ import (
 // AnnouncementService 公告管理服务
 type AnnouncementService struct {
 	db *sql.DB
-	mu sync.Mutex
+	mu sync.RWMutex
 }
 
 // NewAnnouncementService 创建公告服务，复用已有的 SQLite 数据库连接
@@ -44,6 +44,9 @@ func migrateAnnouncementSchema(db *sql.DB) error {
 
 // List 获取所有公告（按创建时间倒序）
 func (s *AnnouncementService) List() ([]model.Announcement, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	rows, err := s.db.Query(`
 		SELECT id, title, content, important, created_at, updated_at
 		FROM announcements ORDER BY created_at DESC
@@ -74,6 +77,14 @@ func (s *AnnouncementService) List() ([]model.Announcement, error) {
 
 // GetByID 根据 ID 获取单条公告
 func (s *AnnouncementService) GetByID(id int64) (*model.Announcement, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.getByIDLocked(id)
+}
+
+// getByIDLocked 内部方法，调用方需自行持有锁
+func (s *AnnouncementService) getByIDLocked(id int64) (*model.Announcement, error) {
 	var a model.Announcement
 	var imp int
 	err := s.db.QueryRow(`
@@ -112,7 +123,7 @@ func (s *AnnouncementService) Create(req model.CreateAnnouncementRequest) (*mode
 		return nil, fmt.Errorf("获取公告 ID 失败: %w", err)
 	}
 
-	return s.GetByID(id)
+	return s.getByIDLocked(id)
 }
 
 // Update 更新公告
@@ -141,7 +152,7 @@ func (s *AnnouncementService) Update(id int64, req model.UpdateAnnouncementReque
 		return nil, nil
 	}
 
-	return s.GetByID(id)
+	return s.getByIDLocked(id)
 }
 
 // Delete 删除公告

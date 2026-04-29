@@ -87,7 +87,7 @@ func main() {
 		defer statsService.Close()
 	}
 
-	// 初始化公告服务（复用 StatsService 的 SQLite 连接）
+	// 初始化公告服务（复用 StatsService 的 SQLite 连接，生命周期由 StatsService 管理）
 	var announcementService *service.AnnouncementService
 	if statsService != nil {
 		as, err := service.NewAnnouncementService(statsService.DB())
@@ -101,7 +101,10 @@ func main() {
 	// 初始化 JWT 管理器
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
-		// 未配置时自动生成随机密钥（重启后旧 token 失效）
+		if os.Getenv("GIN_MODE") == "release" {
+			logger.Fatal("生产环境必须设置 JWT_SECRET 环境变量")
+		}
+		// 开发环境未配置时自动生成随机密钥（重启后旧 token 失效）
 		buf := make([]byte, 32)
 		if _, err := rand.Read(buf); err != nil {
 			logger.Fatal("生成随机 JWT 密钥失败：%v", err)

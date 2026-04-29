@@ -1,4 +1,4 @@
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed } from 'vue'
 import { getAnnouncements } from '@/api'
 
 const STORAGE_KEY = 'read_announcements'
@@ -82,12 +82,7 @@ export function useAnnouncements() {
     }
   }
 
-  // 组件挂载时从 API 加载公告
-  onMounted(async () => {
-    await fetchAnnouncements()
-    cleanupStaleIds()
-  })
-
+  // 暴露 fetchAnnouncements 让调用方在组件 onMounted 中自行调用
   return {
     allAnnouncements,
     unreadCount,
@@ -95,5 +90,6 @@ export function useAnnouncements() {
     isRead,
     markAllAsRead,
     loading,
+    fetchAnnouncements,
   }
 }

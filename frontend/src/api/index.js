@@ -79,6 +79,7 @@ adminApi.interceptors.response.use(
   },
 )
 
+// 登录接口使用普通 api 实例（无需 token），与 adminApi（需 token）区分
 export async function adminLogin(username, password) {
   const { data } = await api.post('/api/v1/admin/login', { username, password })
   return data

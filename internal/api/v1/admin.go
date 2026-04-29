@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strconv"
 
@@ -40,7 +41,10 @@ func (h *AdminHandler) Login(c *gin.Context) {
 		return
 	}
 
-	if req.Username != h.adminUsername || req.Password != h.adminPassword {
+	// 使用常量时间比较防止时序攻击
+	usernameMatch := subtle.ConstantTimeCompare([]byte(req.Username), []byte(h.adminUsername))
+	passwordMatch := subtle.ConstantTimeCompare([]byte(req.Password), []byte(h.adminPassword))
+	if usernameMatch != 1 || passwordMatch != 1 {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}

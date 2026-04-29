@@ -53,6 +53,24 @@ function cancelForm() {
   form.value = { title: '', content: '', important: false }
 }
 
+async function handleSave() {
+  saving.value = true
+  error.value = ''
+  try {
+    if (editingId.value) {
+      await adminUpdateAnnouncement(editingId.value, form.value)
+    } else {
+      await adminCreateAnnouncement(form.value)
+    }
+    cancelForm()
+    await fetchList()
+  } catch (e) {
+    error.value = getErrorMessage(e, '保存失败')
+  } finally {
+    saving.value = false
+  }
+}
+
 async function handleDelete(id) {
   if (!confirm('确定要删除这条公告吗？')) return
   error.value = ''
