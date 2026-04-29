@@ -5,10 +5,13 @@ import { useAnnouncements } from '@/composables/useAnnouncements'
 const { allAnnouncements, unreadCount, hasUnread, isRead, markAllAsRead, fetchAnnouncements } =
   useAnnouncements()
 
-onMounted(() => fetchAnnouncements())
+const expanded = ref(false)
 
-// 有未读公告时默认展开，全部已读时默认折叠
-const expanded = ref(hasUnread.value)
+onMounted(async () => {
+  await fetchAnnouncements()
+  // 加载完成后，有未读公告则自动展开
+  expanded.value = hasUnread.value
+})
 
 function handleToggle() {
   if (expanded.value && hasUnread.value) {
