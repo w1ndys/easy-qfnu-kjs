@@ -40,28 +40,68 @@ SSH_OPTS=(
   -o StrictHostKeyChecking=accept-new
 )
 
-EXCLUDES=(
-  --exclude .git
-  --exclude .monkeycode
-  --exclude node_modules
-  --exclude frontend/node_modules
-  --exclude web
-  --exclude tmp
+IMAGE_FRONTEND="easy-qfnu-kjs-frontend"
+IMAGE_BACKEND="easy-qfnu-kjs-backend"
+TAR_FILE="easy-qfnu-kjs-images.tar"
+LOCAL_TAR="/tmp/${TAR_FILE}"
+
+# ---------- 本地构建镜像 ----------
+log "building frontend image locally"
+docker build -t "${IMAGE_FRONTEND}:latest" -f "${ROOT_DIR}/frontend/Dockerfile" "${ROOT_DIR}/frontend" \
+  || fail "frontend image build failed"
+
+log "building backend image locally"
+docker build -t "${IMAGE_BACKEND}:latest" -f "${ROOT_DIR}/Dockerfile" "${ROOT_DIR}" \
+  || fail "backend image build failed"
+
+# ---------- 导出镜像为 tar ----------
+log "saving images to ${LOCAL_TAR}"
+docker save -o "${LOCAL_TAR}" "${IMAGE_FRONTEND}:latest" "${IMAGE_BACKEND}:latest" \
+  || fail "docker save failed"
+
+# ---------- 同步配置文件到远端 ----------
+SYNC_FILES=(
+  docker-compose.yml
+  .env
 )
 
 log "ensuring remote directory exists: ${REMOTE}:${DIR}"
-ssh "${SSH_OPTS[@]}" "${REMOTE}" "mkdir -p '${DIR}'" || fail "failed to create remote directory ${DIR}"
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "mkdir -p '${DIR}'" \
+  || fail "failed to create remote directory ${DIR}"
 
-log "syncing project files to remote host"
-rsync -az "${EXCLUDES[@]}" -e "ssh -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
-  "${ROOT_DIR}/" "${REMOTE}:${DIR}/" || fail "rsync upload failed"
+log "syncing config files to remote host"
+for f in "${SYNC_FILES[@]}"; do
+  if [ -f "${ROOT_DIR}/${f}" ]; then
+    rsync -az -e "ssh -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
+      "${ROOT_DIR}/${f}" "${REMOTE}:${DIR}/${f}" || fail "rsync ${f} failed"
+  fi
+done
 
-log "updating remote script permissions"
-ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${DIR}/scripts/ops/'*.sh" || fail "failed to update remote script permissions"
+# ---------- 上传镜像 tar ----------
+log "uploading image tar to remote host"
+rsync -az --progress -e "ssh -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
+  "${LOCAL_TAR}" "${REMOTE}:${DIR}/${TAR_FILE}" \
+  || fail "image upload failed"
 
-run_remote "rebuilding and starting remote containers" "docker compose up -d --build"
-run_remote "showing remote container status" "docker compose ps"
+# ---------- 远端：删除旧镜像、加载新镜像、重启容器 ----------
+run_remote "stopping containers" "docker compose down || true"
 
+run_remote "removing old images" \
+  "docker rmi ${IMAGE_FRONTEND}:latest ${IMAGE_BACKEND}:latest 2>/dev/null || true"
+
+run_remote "loading new images" "docker load -i '${TAR_FILE}'"
+
+run_remote "starting containers" "docker compose up -d"
+
+run_remote "cleaning up image tar" "rm -f '${TAR_FILE}'"
+
+run_remote "showing container status" "docker compose ps"
+
+# ---------- 清理本地临时文件 ----------
+log "cleaning up local tar"
+rm -f "${LOCAL_TAR}"
+
+# ---------- 远端健康检查 ----------
 log "waiting for remote services to become healthy"
 ssh "${SSH_OPTS[@]}" "${REMOTE}" 'bash -s' -- "${DIR}" <<'EOF' || fail "remote health check failed"
 set -euo pipefail

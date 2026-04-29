@@ -3,6 +3,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    image: easy-qfnu-kjs-frontend:latest
     container_name: easy-qfnu-kjs-frontend
     restart: unless-stopped
     depends_on:
@@ -29,6 +30,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: easy-qfnu-kjs-backend:latest
     container_name: easy-qfnu-kjs-backend
     restart: unless-stopped
     env_file:
