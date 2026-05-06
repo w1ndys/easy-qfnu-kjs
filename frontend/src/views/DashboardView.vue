@@ -19,7 +19,6 @@ echarts.use([
   CanvasRenderer,
 ])
 
-// ---- 主色调 ----
 const COLORS = {
   primary: '#884F22',
   primaryLight: '#A67C52',
@@ -39,7 +38,6 @@ const CHART_PALETTE = [
   COLORS.rose, COLORS.slate, COLORS.primaryLight, '#6366F1',
 ]
 
-// ---- 状态 ----
 const timeRange = ref('today')
 const customDays = ref(14)
 const loading = ref(true)
@@ -59,7 +57,7 @@ const timeRangeLabel = computed(() =>
     : timeRangeOptions.find((o) => o.value === timeRange.value)?.label || ''
 )
 
-// ---- ECharts 实例引用 ----
+// ECharts refs
 const trendChartRef = ref(null)
 const keywordChartRef = ref(null)
 const nodeChartRef = ref(null)
@@ -72,7 +70,6 @@ const nodeChart = shallowRef(null)
 const resultChart = shallowRef(null)
 const hourlyChart = shallowRef(null)
 
-// ---- 数据加载 ----
 async function fetchData() {
   loading.value = true
   error.value = null
@@ -85,7 +82,6 @@ async function fetchData() {
   }
 }
 
-// ---- 图表通用配置 ----
 function baseTooltip() {
   return {
     backgroundColor: 'rgba(255,255,255,0.95)',
@@ -96,29 +92,18 @@ function baseTooltip() {
   }
 }
 
-// 确保 ECharts 实例绑定到当前 DOM。
-// 切换时间范围时，loading 状态会导致图表容器被 v-if 卸载重挂，
-// 原实例仍持有已分离的 DOM 引用，setOption 将无法显示。
-// 此处检测到不一致即销毁重建。
 function ensureChart(instanceRef, domRef) {
   if (!domRef.value) {
-    if (instanceRef.value) {
-      instanceRef.value.dispose()
-      instanceRef.value = null
-    }
+    if (instanceRef.value) { instanceRef.value.dispose(); instanceRef.value = null }
     return null
   }
   if (instanceRef.value && instanceRef.value.getDom() !== domRef.value) {
-    instanceRef.value.dispose()
-    instanceRef.value = null
+    instanceRef.value.dispose(); instanceRef.value = null
   }
-  if (!instanceRef.value) {
-    instanceRef.value = echarts.init(domRef.value)
-  }
+  if (!instanceRef.value) { instanceRef.value = echarts.init(domRef.value) }
   return instanceRef.value
 }
 
-// ---- 渲染图表 ----
 function renderTrendChart() {
   if (!data.value?.trend) return
   const chart = ensureChart(trendChart, trendChartRef)
@@ -128,39 +113,17 @@ function renderTrendChart() {
     tooltip: { ...baseTooltip(), trigger: 'axis' },
     grid: { left: 50, right: 20, top: 20, bottom: 30 },
     xAxis: {
-      type: 'category',
-      data: trend.map((t) => t.label),
-      axisLabel: {
-        color: COLORS.slate,
-        fontSize: 11,
-        rotate: timeRange.value === 'month' || timeRange.value === 'custom' ? 45 : 0,
-      },
-      axisLine: { lineStyle: { color: COLORS.cream } },
-      axisTick: { show: false },
+      type: 'category', data: trend.map((t) => t.label),
+      axisLabel: { color: COLORS.slate, fontSize: 11, rotate: timeRange.value === 'month' || timeRange.value === 'custom' ? 45 : 0 },
+      axisLine: { lineStyle: { color: COLORS.cream } }, axisTick: { show: false },
     },
-    yAxis: {
-      type: 'value',
-      minInterval: 1,
-      axisLabel: { color: COLORS.slate, fontSize: 11 },
-      splitLine: { lineStyle: { color: COLORS.cream, type: 'dashed' } },
-    },
-    series: [
-      {
-        type: 'line',
-        data: trend.map((t) => t.count),
-        smooth: true,
-        symbol: 'circle',
-        symbolSize: 6,
-        lineStyle: { color: COLORS.primary, width: 3 },
-        itemStyle: { color: COLORS.primary, borderColor: '#fff', borderWidth: 2 },
-        areaStyle: {
-          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-            { offset: 0, color: 'rgba(136,79,34,0.25)' },
-            { offset: 1, color: 'rgba(136,79,34,0.02)' },
-          ]),
-        },
-      },
-    ],
+    yAxis: { type: 'value', minInterval: 1, axisLabel: { color: COLORS.slate, fontSize: 11 }, splitLine: { lineStyle: { color: COLORS.cream, type: 'dashed' } } },
+    series: [{
+      type: 'line', data: trend.map((t) => t.count), smooth: true, symbol: 'circle', symbolSize: 6,
+      lineStyle: { color: COLORS.primary, width: 3 },
+      itemStyle: { color: COLORS.primary, borderColor: '#fff', borderWidth: 2 },
+      areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(136,79,34,0.25)' }, { offset: 1, color: 'rgba(136,79,34,0.02)' }]) },
+    }],
   }, true)
 }
 
@@ -172,48 +135,9 @@ function renderKeywordChart() {
   chart.setOption({
     tooltip: { ...baseTooltip(), trigger: 'axis', axisPointer: { type: 'shadow' } },
     grid: { left: 100, right: 30, top: 10, bottom: 20 },
-    xAxis: {
-      type: 'value',
-      minInterval: 1,
-      axisLabel: { color: COLORS.slate, fontSize: 11 },
-      splitLine: { lineStyle: { color: COLORS.cream, type: 'dashed' } },
-    },
-    yAxis: {
-      type: 'category',
-      data: kw.map((k) => k.keyword),
-      axisLabel: {
-        color: COLORS.primary,
-        fontSize: 12,
-        fontWeight: 600,
-        width: 80,
-        overflow: 'truncate',
-      },
-      axisLine: { show: false },
-      axisTick: { show: false },
-    },
-    series: [
-      {
-        type: 'bar',
-        data: kw.map((k, i) => ({
-          value: k.count,
-          itemStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [
-              { offset: 0, color: CHART_PALETTE[i % CHART_PALETTE.length] },
-              { offset: 1, color: CHART_PALETTE[i % CHART_PALETTE.length] + '88' },
-            ]),
-            borderRadius: [0, 8, 8, 0],
-          },
-        })),
-        barWidth: '60%',
-        label: {
-          show: true,
-          position: 'right',
-          color: COLORS.slate,
-          fontSize: 12,
-          fontWeight: 600,
-        },
-      },
-    ],
+    xAxis: { type: 'value', minInterval: 1, axisLabel: { color: COLORS.slate, fontSize: 11 }, splitLine: { lineStyle: { color: COLORS.cream, type: 'dashed' } } },
+    yAxis: { type: 'category', data: kw.map((k) => k.keyword), axisLabel: { color: COLORS.primary, fontSize: 12, fontWeight: 600, width: 80, overflow: 'truncate' }, axisLine: { show: false }, axisTick: { show: false } },
+    series: [{ type: 'bar', data: kw.map((k, i) => ({ value: k.count, itemStyle: { color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [{ offset: 0, color: CHART_PALETTE[i % CHART_PALETTE.length] }, { offset: 1, color: CHART_PALETTE[i % CHART_PALETTE.length] + '88' }]), borderRadius: [0, 8, 8, 0] } })), barWidth: '60%', label: { show: true, position: 'right', color: COLORS.slate, fontSize: 12, fontWeight: 600 } }],
   }, true)
 }
 
@@ -222,45 +146,10 @@ function renderNodeChart() {
   const chart = ensureChart(nodeChart, nodeChartRef)
   if (!chart) return
   const nd = data.value.node_dist
-  const nodeLabels = {
-    '01-02': '1-2节', '03-04': '3-4节', '05-06': '5-6节',
-    '07-08': '7-8节', '09-10': '9-10节', '09-11': '9-11节',
-    '01-04': '1-4节', '05-08': '5-8节', '01-11': '全天',
-  }
+  const nodeLabels = { '01-02': '1-2节', '03-04': '3-4节', '05-06': '5-6节', '07-08': '7-8节', '09-10': '9-10节', '09-11': '9-11节', '01-04': '1-4节', '05-08': '5-8节', '01-11': '全天' }
   chart.setOption({
-    tooltip: {
-      ...baseTooltip(),
-      trigger: 'item',
-      formatter: '{b}: {c} ({d}%)',
-    },
-    series: [
-      {
-        type: 'pie',
-        radius: ['40%', '70%'],
-        center: ['50%', '50%'],
-        avoidLabelOverlap: true,
-        itemStyle: { borderRadius: 8, borderColor: '#fff', borderWidth: 2 },
-        label: {
-          show: true,
-          fontSize: 12,
-          color: COLORS.slate,
-          formatter: '{b}\n{d}%',
-        },
-        emphasis: {
-          label: { fontSize: 14, fontWeight: 'bold' },
-          itemStyle: {
-            shadowBlur: 10,
-            shadowOffsetX: 0,
-            shadowColor: 'rgba(136,79,34,0.2)',
-          },
-        },
-        data: nd.map((n, i) => ({
-          name: nodeLabels[n.node] || n.node,
-          value: n.count,
-          itemStyle: { color: CHART_PALETTE[i % CHART_PALETTE.length] },
-        })),
-      },
-    ],
+    tooltip: { ...baseTooltip(), trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+    series: [{ type: 'pie', radius: ['40%', '70%'], center: ['50%', '50%'], avoidLabelOverlap: true, itemStyle: { borderRadius: 8, borderColor: '#fff', borderWidth: 2 }, label: { show: true, fontSize: 12, color: COLORS.slate, formatter: '{b}\n{d}%' }, emphasis: { label: { fontSize: 14, fontWeight: 'bold' }, itemStyle: { shadowBlur: 10, shadowOffsetX: 0, shadowColor: 'rgba(136,79,34,0.2)' } }, data: nd.map((n, i) => ({ name: nodeLabels[n.node] || n.node, value: n.count, itemStyle: { color: CHART_PALETTE[i % CHART_PALETTE.length] } })) }],
   }, true)
 }
 
@@ -272,42 +161,9 @@ function renderResultChart() {
   chart.setOption({
     tooltip: { ...baseTooltip(), trigger: 'axis', axisPointer: { type: 'shadow' } },
     grid: { left: 50, right: 20, top: 20, bottom: 30 },
-    xAxis: {
-      type: 'category',
-      data: dist.map((d) => d.range),
-      axisLabel: { color: COLORS.slate, fontSize: 11 },
-      axisLine: { lineStyle: { color: COLORS.cream } },
-      axisTick: { show: false },
-    },
-    yAxis: {
-      type: 'value',
-      minInterval: 1,
-      axisLabel: { color: COLORS.slate, fontSize: 11 },
-      splitLine: { lineStyle: { color: COLORS.cream, type: 'dashed' } },
-    },
-    series: [
-      {
-        type: 'bar',
-        data: dist.map((d, i) => ({
-          value: d.count,
-          itemStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: CHART_PALETTE[i % CHART_PALETTE.length] },
-              { offset: 1, color: CHART_PALETTE[i % CHART_PALETTE.length] + '66' },
-            ]),
-            borderRadius: [8, 8, 0, 0],
-          },
-        })),
-        barWidth: '50%',
-        label: {
-          show: true,
-          position: 'top',
-          color: COLORS.slate,
-          fontSize: 11,
-          fontWeight: 600,
-        },
-      },
-    ],
+    xAxis: { type: 'category', data: dist.map((d) => d.range), axisLabel: { color: COLORS.slate, fontSize: 11 }, axisLine: { lineStyle: { color: COLORS.cream } }, axisTick: { show: false } },
+    yAxis: { type: 'value', minInterval: 1, axisLabel: { color: COLORS.slate, fontSize: 11 }, splitLine: { lineStyle: { color: COLORS.cream, type: 'dashed' } } },
+    series: [{ type: 'bar', data: dist.map((d, i) => ({ value: d.count, itemStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: CHART_PALETTE[i % CHART_PALETTE.length] }, { offset: 1, color: CHART_PALETTE[i % CHART_PALETTE.length] + '66' }]), borderRadius: [8, 8, 0, 0] } })), barWidth: '50%', label: { show: true, position: 'top', color: COLORS.slate, fontSize: 11, fontWeight: 600 } }],
   }, true)
 }
 
@@ -318,337 +174,392 @@ function renderHourlyChart() {
   const hd = data.value.hourly_dist
   const maxCount = Math.max(...hd.map((h) => h.count), 1)
   chart.setOption({
-    tooltip: {
-      ...baseTooltip(),
-      trigger: 'axis',
-      axisPointer: { type: 'shadow' },
-      formatter: (params) => {
-        const p = params[0]
-        return `${p.name}:00 - ${p.name}:59<br/>查询次数: <b>${p.value}</b>`
-      },
-    },
+    tooltip: { ...baseTooltip(), trigger: 'axis', axisPointer: { type: 'shadow' }, formatter: (params) => { const p = params[0]; return `${p.name}:00 - ${p.name}:59<br/>查询次数: <b>${p.value}</b>` } },
     grid: { left: 50, right: 20, top: 20, bottom: 30 },
-    xAxis: {
-      type: 'category',
-      data: hd.map((h) => String(h.hour).padStart(2, '0')),
-      axisLabel: { color: COLORS.slate, fontSize: 10 },
-      axisLine: { lineStyle: { color: COLORS.cream } },
-      axisTick: { show: false },
-    },
-    yAxis: {
-      type: 'value',
-      minInterval: 1,
-      axisLabel: { color: COLORS.slate, fontSize: 11 },
-      splitLine: { lineStyle: { color: COLORS.cream, type: 'dashed' } },
-    },
-    series: [
-      {
-        type: 'bar',
-        data: hd.map((h) => ({
-          value: h.count,
-          itemStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              {
-                offset: 0,
-                color: h.count >= maxCount * 0.8
-                  ? COLORS.rose
-                  : h.count >= maxCount * 0.5
-                    ? COLORS.warning
-                    : COLORS.success,
-              },
-              {
-                offset: 1,
-                color: h.count >= maxCount * 0.8
-                  ? COLORS.rose + '44'
-                  : h.count >= maxCount * 0.5
-                    ? COLORS.warning + '44'
-                    : COLORS.success + '44',
-              },
-            ]),
-            borderRadius: [6, 6, 0, 0],
-          },
-        })),
-        barWidth: '60%',
-      },
-    ],
+    xAxis: { type: 'category', data: hd.map((h) => String(h.hour).padStart(2, '0')), axisLabel: { color: COLORS.slate, fontSize: 10 }, axisLine: { lineStyle: { color: COLORS.cream } }, axisTick: { show: false } },
+    yAxis: { type: 'value', minInterval: 1, axisLabel: { color: COLORS.slate, fontSize: 11 }, splitLine: { lineStyle: { color: COLORS.cream, type: 'dashed' } } },
+    series: [{ type: 'bar', data: hd.map((h) => ({ value: h.count, itemStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: h.count >= maxCount * 0.8 ? COLORS.rose : h.count >= maxCount * 0.5 ? COLORS.warning : COLORS.success }, { offset: 1, color: (h.count >= maxCount * 0.8 ? COLORS.rose : h.count >= maxCount * 0.5 ? COLORS.warning : COLORS.success) + '44' }]), borderRadius: [6, 6, 0, 0] } })), barWidth: '60%' }],
   }, true)
 }
 
-function renderAllCharts() {
-  nextTick(() => {
-    renderTrendChart()
-    renderKeywordChart()
-    renderNodeChart()
-    renderResultChart()
-    renderHourlyChart()
-  })
-}
+function renderAllCharts() { nextTick(() => { renderTrendChart(); renderKeywordChart(); renderNodeChart(); renderResultChart(); renderHourlyChart() }) }
+function resizeAllCharts() { trendChart.value?.resize(); keywordChart.value?.resize(); nodeChart.value?.resize(); resultChart.value?.resize(); hourlyChart.value?.resize() }
+function disposeAllCharts() { trendChart.value?.dispose(); keywordChart.value?.dispose(); nodeChart.value?.dispose(); resultChart.value?.dispose(); hourlyChart.value?.dispose() }
 
-function resizeAllCharts() {
-  trendChart.value?.resize()
-  keywordChart.value?.resize()
-  nodeChart.value?.resize()
-  resultChart.value?.resize()
-  hourlyChart.value?.resize()
-}
+watch(timeRange, async () => { await fetchData(); renderAllCharts() })
+watch(customDays, async () => { if (timeRange.value !== 'custom') return; await fetchData(); renderAllCharts() })
+watch(data, () => { if (data.value) renderAllCharts() })
 
-function disposeAllCharts() {
-  trendChart.value?.dispose()
-  keywordChart.value?.dispose()
-  nodeChart.value?.dispose()
-  resultChart.value?.dispose()
-  hourlyChart.value?.dispose()
-}
+onMounted(async () => { await fetchData(); renderAllCharts(); window.addEventListener('resize', resizeAllCharts) })
+onUnmounted(() => { window.removeEventListener('resize', resizeAllCharts); disposeAllCharts() })
 
-// ---- 生命周期 ----
-watch(timeRange, async () => {
-  await fetchData()
-  renderAllCharts()
-})
-
-watch(customDays, async () => {
-  if (timeRange.value !== 'custom') return
-  await fetchData()
-  renderAllCharts()
-})
-
-watch(data, () => {
-  if (data.value) renderAllCharts()
-})
-
-onMounted(async () => {
-  await fetchData()
-  renderAllCharts()
-  window.addEventListener('resize', resizeAllCharts)
-})
-
-onUnmounted(() => {
-  window.removeEventListener('resize', resizeAllCharts)
-  disposeAllCharts()
-})
-
-// ---- 计算属性 ----
 const overview = computed(() => data.value?.overview || {})
-const peakHour = computed(() => {
-  if (!data.value?.hourly_dist) return '--'
-  const max = data.value.hourly_dist.reduce(
-    (a, b) => (b.count > a.count ? b : a),
-    { hour: 0, count: 0 }
-  )
-  if (max.count === 0) return '--'
-  return `${String(max.hour).padStart(2, '0')}:00`
-})
-const resultRate = computed(() => {
-  const rs = data.value?.result_stats
-  if (!rs || (rs.zero_count + rs.non_zero_count) === 0) return '--'
-  return ((rs.non_zero_count / (rs.zero_count + rs.non_zero_count)) * 100).toFixed(1) + '%'
-})
+const peakHour = computed(() => { if (!data.value?.hourly_dist) return '--'; const max = data.value.hourly_dist.reduce((a, b) => (b.count > a.count ? b : a), { hour: 0, count: 0 }); if (max.count === 0) return '--'; return `${String(max.hour).padStart(2, '0')}:00` })
+const resultRate = computed(() => { const rs = data.value?.result_stats; if (!rs || (rs.zero_count + rs.non_zero_count) === 0) return '--'; return ((rs.non_zero_count / (rs.zero_count + rs.non_zero_count)) * 100).toFixed(1) + '%' })
 
 const overviewCards = computed(() => [
-  { label: '总查询次数', value: overview.value.total_count || 0, class: 'border-primary-200 bg-primary-100 text-primary' },
-  { label: '独立用户(UV)', value: overview.value.unique_visitors || 0, class: 'border-[#B7CBFF] bg-[#ECF3FF] text-[#1D4ED8]' },
-  { label: '独立 IP', value: overview.value.unique_ips || 0, class: 'border-[#F5B3AE] bg-[#FDEEEE] text-[#B42318]' },
-  { label: '搜索词数', value: overview.value.unique_keywords || 0, class: 'border-[#B7CBFF] bg-[#ECF3FF] text-[#1D4ED8]' },
-  { label: '有结果率', value: resultRate.value, class: 'border-[#A7DEC7] bg-[#EAF8F3] text-[#156B52]' },
-  { label: '高峰时段', value: peakHour.value, class: 'border-[#F3CF8D] bg-[#FFF6E8] text-[#9A5A00]' },
+  { label: '总查询次数', value: overview.value.total_count || 0, color: 'var(--color-brand-500)', bg: 'var(--color-brand-100)' },
+  { label: '独立用户(UV)', value: overview.value.unique_visitors || 0, color: 'var(--color-info-fg)', bg: 'var(--color-info-bg)' },
+  { label: '独立 IP', value: overview.value.unique_ips || 0, color: 'var(--color-error-fg)', bg: 'var(--color-error-bg)' },
+  { label: '搜索词数', value: overview.value.unique_keywords || 0, color: 'var(--color-info-fg)', bg: 'var(--color-info-bg)' },
+  { label: '有结果率', value: resultRate.value, color: 'var(--color-success-fg)', bg: 'var(--color-success-bg)' },
+  { label: '高峰时段', value: peakHour.value, color: 'var(--color-warning-fg)', bg: 'var(--color-warning-bg)' },
 ])
 </script>
 
 <template>
-  <div class="page-shell relative pb-10 antialiased">
-    <AppHeader title="数据大屏" show-back />
+  <div class="page-container">
+    <AppHeader title="数据大屏" showBack />
 
-    <main class="relative z-10 mx-auto max-w-7xl space-y-5 px-4 py-6 sm:px-6 lg:px-8">
-      <div class="clay-card p-4">
-        <div class="relative z-10 flex flex-col gap-3 lg:flex-row lg:items-center">
-          <div class="flex flex-1 items-center justify-center rounded-xl bg-[#F3EFEB] p-1">
-            <button
-              v-for="opt in timeRangeOptions"
-              :key="opt.value"
-              @click="timeRange = opt.value"
-              class="min-h-10 flex-1 rounded-lg px-5 py-2.5 text-sm font-semibold transition"
-              :class="timeRange === opt.value
-                ? 'bg-white text-primary shadow-sm'
-                : 'text-clay-muted hover:text-clay-foreground'"
-            >
-              {{ opt.label }}
-            </button>
+    <div class="page-content dashboard-content">
+      <!-- 时间范围选择 -->
+      <div class="app-card time-range-card">
+        <div class="time-tabs">
+          <div
+            v-for="opt in timeRangeOptions"
+            :key="opt.value"
+            class="time-tab"
+            :class="{ active: timeRange === opt.value }"
+            @click="timeRange = opt.value"
+          >
+            {{ opt.label }}
           </div>
-
-          <label class="flex items-center justify-between gap-3 rounded-xl border border-subtle bg-white px-4 py-2.5 text-sm font-semibold text-clay-foreground lg:w-56">
-            <span>最近</span>
-            <input
-              v-model.number="customDays"
-              :disabled="timeRange !== 'custom'"
-              type="number"
-              min="1"
-              max="365"
-              class="w-20 rounded-lg border border-subtle bg-[#FDFBF8] px-3 py-1.5 text-center text-primary outline-none transition focus:border-primary disabled:cursor-not-allowed disabled:bg-[#F3EFEB] disabled:text-clay-muted"
-              @focus="timeRange = 'custom'"
-            />
-            <span>天</span>
-          </label>
+        </div>
+        <div class="custom-days">
+          <span>最近</span>
+          <van-field
+            v-model.number="customDays"
+            type="digit"
+            :disabled="timeRange !== 'custom'"
+            :border="false"
+            class="days-input"
+            @focus="timeRange = 'custom'"
+          />
+          <span>天</span>
         </div>
       </div>
 
-      <div v-if="loading" class="clay-card p-12 text-center">
-        <div class="relative z-10">
-          <div class="inline-block w-10 h-10 border-4 border-primary-200 border-t-primary rounded-full animate-spin"></div>
-          <p class="text-clay-muted mt-4 font-medium">加载中...</p>
-        </div>
+      <!-- Loading -->
+      <div v-if="loading" class="app-card loading-card">
+        <van-loading type="spinner" color="var(--color-brand-500)" size="32">加载中...</van-loading>
       </div>
 
-      <div v-else-if="error" class="clay-card p-8 text-center">
-        <div class="relative z-10">
-          <p class="text-red-500 font-semibold">{{ error }}</p>
-          <button @click="fetchData" class="mt-4 btn-clay-primary px-6 py-2 text-sm">重试</button>
-        </div>
+      <!-- Error -->
+      <div v-else-if="error" class="app-card error-card">
+        <p class="error-text">{{ error }}</p>
+        <van-button type="primary" size="small" round @click="fetchData">重试</van-button>
       </div>
 
       <template v-else-if="data">
-        <div class="clay-card p-6">
-          <div class="relative z-10">
-            <h3 class="mb-5 text-base font-semibold text-clay-foreground font-heading">
-              数据总览
-              <span class="ml-2 text-xs font-medium text-clay-muted">{{ timeRangeLabel }}</span>
-            </h3>
-            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-              <div
-                v-for="item in overviewCards"
-                :key="item.label"
-                :class="['rounded-2xl border p-4 text-center', item.class]"
-              >
-                <div class="text-2xl font-bold sm:text-3xl font-heading">
-                  {{ item.value }}
-                </div>
-                <div class="mt-1 text-xs font-medium text-clay-muted">{{ item.label }}</div>
-              </div>
+        <!-- 数据总览 -->
+        <div class="app-card">
+          <div class="card-title">数据总览 <span class="card-subtitle">{{ timeRangeLabel }}</span></div>
+          <div class="overview-grid">
+            <div
+              v-for="item in overviewCards"
+              :key="item.label"
+              class="overview-item"
+              :style="{ background: item.bg }"
+            >
+              <div class="overview-value" :style="{ color: item.color }">{{ item.value }}</div>
+              <div class="overview-label">{{ item.label }}</div>
             </div>
+          </div>
 
-            <div class="grid grid-cols-3 gap-3 mt-4">
-              <div class="rounded-2xl border border-subtle bg-white p-3 text-center">
-                <div class="text-lg font-bold text-primary font-heading">{{ overview.today_count || 0 }}</div>
-                <div class="text-xs text-clay-muted font-medium">今日</div>
+          <van-row gutter="12" class="sub-stats">
+            <van-col span="8">
+              <div class="sub-stat-item">
+                <div class="sub-stat-value brand">{{ overview.today_count || 0 }}</div>
+                <div class="sub-stat-label">今日</div>
               </div>
-              <div class="rounded-2xl border border-subtle bg-white p-3 text-center">
-                <div class="text-lg font-bold text-emerald-600 font-heading">{{ overview.week_count || 0 }}</div>
-                <div class="text-xs text-clay-muted font-medium">本周</div>
+            </van-col>
+            <van-col span="8">
+              <div class="sub-stat-item">
+                <div class="sub-stat-value success">{{ overview.week_count || 0 }}</div>
+                <div class="sub-stat-label">本周</div>
               </div>
-              <div class="rounded-2xl border border-subtle bg-white p-3 text-center">
-                <div class="text-lg font-bold text-sky-600 font-heading">{{ overview.month_count || 0 }}</div>
-                <div class="text-xs text-clay-muted font-medium">本月</div>
+            </van-col>
+            <van-col span="8">
+              <div class="sub-stat-item">
+                <div class="sub-stat-value info">{{ overview.month_count || 0 }}</div>
+                <div class="sub-stat-label">本月</div>
               </div>
+            </van-col>
+          </van-row>
+        </div>
+
+        <!-- 查询趋势 -->
+        <div class="app-card">
+          <div class="card-title">查询次数趋势</div>
+          <div ref="trendChartRef" class="chart-container" style="height: 280px;"></div>
+        </div>
+
+        <!-- 搜索词排行 -->
+        <div class="app-card">
+          <div class="card-title">搜索词排行榜</div>
+          <div v-if="data.top_keywords && data.top_keywords.length > 0">
+            <div ref="keywordChartRef" class="chart-container" style="height: 300px;"></div>
+          </div>
+          <van-empty v-else description="暂无搜索数据" />
+        </div>
+
+        <!-- 节次分布 + 结果分布 -->
+        <div class="chart-row">
+          <div class="app-card chart-half">
+            <div class="card-title">节次分布</div>
+            <div v-if="data.node_dist && data.node_dist.length > 0">
+              <div ref="nodeChartRef" class="chart-container" style="height: 260px;"></div>
             </div>
+            <van-empty v-else description="暂无节次数据" />
+          </div>
+
+          <div class="app-card chart-half">
+            <div class="card-title">结果数量分布</div>
+            <div v-if="data.result_stats">
+              <div ref="resultChartRef" class="chart-container" style="height: 260px;"></div>
+              <van-row gutter="8" class="result-summary">
+                <van-col span="8">
+                  <div class="summary-value brand">{{ data.result_stats.avg_count?.toFixed(1) || '0' }}</div>
+                  <div class="summary-label">平均结果数</div>
+                </van-col>
+                <van-col span="8">
+                  <div class="summary-value success">{{ data.result_stats.max_count || 0 }}</div>
+                  <div class="summary-label">最多结果</div>
+                </van-col>
+                <van-col span="8">
+                  <div class="summary-value info">{{ data.result_stats.non_zero_count || 0 }}</div>
+                  <div class="summary-label">有效查询</div>
+                </van-col>
+              </van-row>
+            </div>
+            <van-empty v-else description="暂无结果数据" />
           </div>
         </div>
 
-        <!-- 查询次数趋势 -->
-        <div class="clay-card p-6">
-          <div class="relative z-10">
-            <h3 class="text-base font-bold text-clay-foreground mb-4 font-heading">
-              查询次数趋势
-            </h3>
-            <div ref="trendChartRef" class="w-full" style="height: 280px;"></div>
-          </div>
-        </div>
-
-        <!-- 搜索词排行榜 -->
-        <div class="clay-card p-6">
-          <div class="relative z-10">
-            <h3 class="text-base font-bold text-clay-foreground mb-4 font-heading">
-              搜索词排行榜
-            </h3>
-            <div v-if="data.top_keywords && data.top_keywords.length > 0">
-              <div ref="keywordChartRef" class="w-full" style="height: 300px;"></div>
-            </div>
-            <div v-else class="text-center py-8 text-clay-muted font-medium">
-              暂无搜索数据
-            </div>
-          </div>
-        </div>
-
-        <!-- 节次分布 + 高峰时段 (并排) -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-5">
-          <!-- 节次分布 -->
-          <div class="clay-card p-6">
-            <div class="relative z-10">
-              <h3 class="text-base font-bold text-clay-foreground mb-4 font-heading">
-                节次分布
-              </h3>
-              <div v-if="data.node_dist && data.node_dist.length > 0">
-                <div ref="nodeChartRef" class="w-full" style="height: 260px;"></div>
-              </div>
-              <div v-else class="text-center py-8 text-clay-muted font-medium">
-                暂无节次数据
-              </div>
-            </div>
-          </div>
-
-          <!-- 查询结果分布 -->
-          <div class="clay-card p-6">
-            <div class="relative z-10">
-              <h3 class="text-base font-bold text-clay-foreground mb-4 font-heading">
-                结果数量分布
-              </h3>
-              <div v-if="data.result_stats">
-                <div ref="resultChartRef" class="w-full" style="height: 260px;"></div>
-                <!-- 结果摘要 -->
-                <div class="grid grid-cols-3 gap-2 mt-3">
-                  <div class="text-center">
-                    <div class="text-sm font-bold text-primary font-heading">
-                      {{ data.result_stats.avg_count?.toFixed(1) || '0' }}
-                    </div>
-                    <div class="text-xs text-clay-muted">平均结果数</div>
-                  </div>
-                  <div class="text-center">
-                    <div class="text-sm font-bold text-emerald-600 font-heading">
-                      {{ data.result_stats.max_count || 0 }}
-                    </div>
-                    <div class="text-xs text-clay-muted">最多结果</div>
-                  </div>
-                  <div class="text-center">
-                    <div class="text-sm font-bold text-sky-600 font-heading">
-                      {{ data.result_stats.non_zero_count || 0 }}
-                    </div>
-                    <div class="text-xs text-clay-muted">有效查询</div>
-                  </div>
-                </div>
-              </div>
-              <div v-else class="text-center py-8 text-clay-muted font-medium">
-                暂无结果数据
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- 高峰时段分析 -->
-        <div class="clay-card p-6">
-          <div class="relative z-10">
-            <h3 class="text-base font-bold text-clay-foreground mb-4 font-heading">
-              高峰时段分析
-              <span class="text-xs font-medium text-clay-muted ml-2">24小时查询分布</span>
-            </h3>
-            <div ref="hourlyChartRef" class="w-full" style="height: 260px;"></div>
-            <!-- 高峰时段提示 -->
-            <div v-if="data.hourly_dist" class="flex items-center justify-center gap-4 mt-3 text-xs text-clay-muted">
-              <span class="flex items-center gap-1">
-                <span class="inline-block w-3 h-3 rounded-sm" style="background: #10B981;"></span>
-                低峰
-              </span>
-              <span class="flex items-center gap-1">
-                <span class="inline-block w-3 h-3 rounded-sm" style="background: #F59E0B;"></span>
-                中峰
-              </span>
-              <span class="flex items-center gap-1">
-                <span class="inline-block w-3 h-3 rounded-sm" style="background: #F43F5E;"></span>
-                高峰
-              </span>
-            </div>
+        <!-- 高峰时段 -->
+        <div class="app-card">
+          <div class="card-title">高峰时段分析 <span class="card-subtitle">24小时查询分布</span></div>
+          <div ref="hourlyChartRef" class="chart-container" style="height: 260px;"></div>
+          <div v-if="data.hourly_dist" class="peak-legend">
+            <span class="peak-item"><span class="peak-dot" style="background: #10B981;"></span>低峰</span>
+            <span class="peak-item"><span class="peak-dot" style="background: #F59E0B;"></span>中峰</span>
+            <span class="peak-item"><span class="peak-dot" style="background: #F43F5E;"></span>高峰</span>
           </div>
         </div>
       </template>
 
       <AppFooter />
-    </main>
+    </div>
   </div>
 </template>
+
+<style scoped>
+.dashboard-content {
+  max-width: 1280px;
+}
+
+.time-range-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+@media (min-width: 768px) {
+  .time-range-card {
+    flex-direction: row;
+    align-items: center;
+  }
+}
+
+.time-tabs {
+  display: flex;
+  background: var(--color-surface-section);
+  border-radius: 12px;
+  padding: 4px;
+  flex: 1;
+}
+
+.time-tab {
+  flex: 1;
+  text-align: center;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.time-tab.active {
+  background: var(--color-surface-card);
+  color: var(--color-brand-500);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.custom-days {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.days-input {
+  width: 80px;
+}
+
+.days-input :deep(.van-field) {
+  border-radius: 8px;
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-surface-card);
+}
+
+.loading-card, .error-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 16px;
+}
+
+.error-text {
+  color: var(--color-error-fg);
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+
+.card-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-bottom: 16px;
+}
+
+.card-subtitle {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-tertiary);
+  margin-left: 8px;
+}
+
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+@media (min-width: 480px) {
+  .overview-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (min-width: 1024px) {
+  .overview-grid {
+    grid-template-columns: repeat(6, 1fr);
+  }
+}
+
+.overview-item {
+  border-radius: 12px;
+  padding: 14px 8px;
+  text-align: center;
+}
+
+.overview-value {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.overview-label {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  margin-top: 4px;
+}
+
+.sub-stats {
+  margin-top: 12px;
+}
+
+.sub-stat-item {
+  border-radius: 12px;
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-surface-card);
+  padding: 10px;
+  text-align: center;
+}
+
+.sub-stat-value {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.sub-stat-value.brand { color: var(--color-brand-500); }
+.sub-stat-value.success { color: var(--color-success-fg); }
+.sub-stat-value.info { color: var(--color-info-fg); }
+
+.sub-stat-label {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  margin-top: 2px;
+}
+
+.chart-container {
+  width: 100%;
+}
+
+.chart-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+@media (min-width: 768px) {
+  .chart-row {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.result-summary {
+  margin-top: 12px;
+  text-align: center;
+}
+
+.summary-value {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.summary-value.brand { color: var(--color-brand-500); }
+.summary-value.success { color: var(--color-success-fg); }
+.summary-value.info { color: var(--color-info-fg); }
+
+.summary-label {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+
+.peak-legend {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+.peak-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.peak-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+}
+</style>
