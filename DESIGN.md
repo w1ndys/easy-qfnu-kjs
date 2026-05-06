@@ -14,12 +14,13 @@
 
 ### 技术理解
 
-- 当前前端技术栈：`Vue 3` + `Vue Router 4` + `Axios` + `Vite` + `Tailwind CSS 3`。
-- 数据可视化依赖：`ECharts 6` + `vue-echarts` 已安装，但当前大屏页直接使用 `echarts/core`。
-- 设计相关依赖：没有使用 Ant Design、Element Plus、shadcn、Radix 等现成设计系统；目前主要依赖 Tailwind 与自定义 CSS token。
+- 当前前端技术栈：`Vue 3` + `Vue Router 4` + `Axios` + `Vite` + `Vant 4`（移动端组件库）。
+- 数据可视化依赖：`ECharts 6` 直接使用 `echarts/core` 按需引入。
+- 设计相关依赖：使用 Vant 4 作为基础组件库，通过 CSS 变量覆盖 Vant 主题实现品牌定制；不再使用 Tailwind CSS。
+- 组件按需引入：通过 `unplugin-vue-components` + `@vant/auto-import-resolver` 实现 Vant 组件自动按需导入。
 - 项目结构：
-  - 4 个主路由页面：`/`、`/empty-classroom`、`/full-day-status`、`/dashboard`
-  - 一组通用组件：头部、底部、日期选择器、对话框、空状态、加载态、警告条、统计卡片、公告卡片、二维码卡片
+  - 6 个主路由页面：`/`、`/empty-classroom`、`/full-day-status`、`/dashboard`、`/admin/login`、`/admin`
+  - 一组通用组件：头部（NavBar）、底部、日期选择器、对话框、空状态、加载态、警告条、统计卡片、公告卡片、二维码卡片
   - 多个 composables 管理状态查询、搜索历史、热搜、公告已读、教学楼别名提醒、弹窗提示等轻量逻辑
 - 复杂度判断：整体不是复杂后台系统，但已经具备多页面、多状态、表格、图表、弹窗、历史记录、快捷入口等中等复杂度前端特征。
 
@@ -643,27 +644,44 @@
 --color-focus-ring
 ```
 
-### Tailwind Token 映射
+### Vant 4 主题变量覆盖
 
-| Tailwind Token | CSS Variable |
-|----------------|--------------|
-| `bg-brand` | `var(--color-brand-500)` |
-| `bg-brand-soft` | `var(--color-brand-100)` |
-| `text-brand` | `var(--color-brand-500)` |
-| `text-primary` | `var(--color-text-primary)` |
-| `text-secondary` | `var(--color-text-secondary)` |
-| `bg-page` | `var(--color-surface-page)` |
-| `bg-card` | `var(--color-surface-card)` |
-| `border-subtle` | `var(--color-border-subtle)` |
-| `ring-focus` | `var(--color-focus-ring)` |
-| `bg-success-soft` | `var(--color-success-bg)` |
-| `text-success` | `var(--color-success-fg)` |
-| `bg-warning-soft` | `var(--color-warning-bg)` |
-| `text-warning` | `var(--color-warning-fg)` |
-| `bg-error-soft` | `var(--color-error-bg)` |
-| `text-error` | `var(--color-error-fg)` |
-| `bg-info-soft` | `var(--color-info-bg)` |
-| `text-info` | `var(--color-info-fg)` |
+| Vant Variable | Value |
+|---------------|-------|
+| `--van-primary-color` | `#884F22` |
+| `--van-primary-color-light` | `#F3E5D8` |
+| `--van-primary-color-dark` | `#5F3517` |
+| `--van-success-color` | `#156B52` |
+| `--van-warning-color` | `#9A5A00` |
+| `--van-danger-color` | `#B42318` |
+| `--van-text-color` | `#1F1B18` |
+| `--van-text-color-2` | `#4C433D` |
+| `--van-text-color-3` | `#8A7C70` |
+| `--van-background` | `#F8F5F2` |
+| `--van-background-2` | `#FFFFFF` |
+| `--van-background-3` | `#F3EFEB` |
+| `--van-border-color` | `#E5DED7` |
+
+### 自定义 CSS 变量（补充 Vant 未覆盖的场景）
+
+| Token | CSS Variable |
+|-------|--------------|
+| 品牌色 | `var(--color-brand-500)` |
+| 品牌浅色 | `var(--color-brand-100)` |
+| 页面背景 | `var(--color-surface-page)` |
+| 卡片背景 | `var(--color-surface-card)` |
+| 主文字 | `var(--color-text-primary)` |
+| 次文字 | `var(--color-text-secondary)` |
+| 辅助文字 | `var(--color-text-tertiary)` |
+| 细边框 | `var(--color-border-subtle)` |
+| 成功背景 | `var(--color-success-bg)` |
+| 成功前景 | `var(--color-success-fg)` |
+| 警告背景 | `var(--color-warning-bg)` |
+| 警告前景 | `var(--color-warning-fg)` |
+| 错误背景 | `var(--color-error-bg)` |
+| 错误前景 | `var(--color-error-fg)` |
+| 信息背景 | `var(--color-info-bg)` |
+| 信息前景 | `var(--color-info-fg)` |
 
 ### 给 AI 的快速提示词模板
 
@@ -671,10 +689,11 @@
 为 QFNU 教室查询系统生成界面时，请遵循以下约束：
 1. 保留品牌主色 #884F22，不要改成紫色或霓虹科技风。
 2. 风格定位为校园友好、专业可信、轻量数据感。
-3. 优先保证查询效率与信息可扫描性，不要使用厚重拟物和大面积软浮雕。
-4. 查询页使用中等偏紧凑布局；首页突出功能入口；Dashboard 保持数据卡和图表秩序。
-5. 组件使用 8px/12px/16px 圆角体系，阴影克制，边框清晰。
-6. 状态信息必须同时用颜色和文字表达，不能只依赖 emoji。
-7. 所有尺寸输出时同时给 px 和 rem；所有颜色输出 HEX。
+3. 使用 Vant 4 组件库作为基础 UI 框架，通过 CSS 变量覆盖主题色。
+4. 优先保证查询效率与信息可扫描性，不要使用厚重拟物和大面积软浮雕。
+5. 查询页使用中等偏紧凑布局；首页突出功能入口；Dashboard 保持数据卡和图表秩序。
+6. 组件使用 Vant 默认圆角体系，阴影克制，边框清晰。
+7. 状态信息必须同时用颜色和文字表达，不能只依赖 emoji。
 8. 移动端优先，确保搜索、日期、节次、结果列表和横向表格都可用。
+9. 不再使用 Tailwind CSS，所有样式通过 Vant 主题变量 + scoped CSS 实现。
 ```

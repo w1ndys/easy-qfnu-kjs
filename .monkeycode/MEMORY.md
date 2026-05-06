@@ -32,18 +32,19 @@ Agent 在任务执行过程中发现的条目应遵循以下格式：
 ## 条目
 
 ### 项目技术架构
-- Date: 2026-03-24
-- Context: Agent 在执行前端设计改造任务时发现
+- Date: 2026-05-06
+- Context: Agent 在执行 Vant 4 前端重构任务时更新
 - Category: 代码结构
 - Instructions:
   - 前端使用 Vue 3.5 (Composition API + `<script setup>`) + Vue Router 4.5 + Axios 1.12
-  - 构建工具为 Vite 7.1，样式使用 Tailwind CSS 3.4
-  - 前端构建产物输出到 `../web` 目录，嵌入 Go 后端通过 `embed` 静态文件服务
-  - 主色调为 `rgb(136, 79, 34)` 即 `#884F22`（棕色系）
-  - 项目包含 3 个路由页面：首页、空教室查询、教室全天状态
-  - 8 个组件：AppHeader, AppFooter, DateSelector, EmptyState, LoadingSpinner, QRCodeCard, StatsCard, StatusWarning
-  - 3 个 Composables：useDateSelection, useSearchHistory, useSystemStatus
-  - CSS 变量定义在 `src/assets/css/main.css` 中
+  - UI 组件库为 Vant 4，通过 unplugin-vue-components + @vant/auto-import-resolver 实现按需引入
+  - 构建工具为 Vite 7，样式通过 Vant 主题变量覆盖 + scoped CSS 实现，不再使用 Tailwind CSS
+  - 前端构建产物输出到 `dist` 目录
+  - 主色调为 `#884F22`（棕色系），通过 `--van-primary-color` 覆盖 Vant 默认主题
+  - 项目包含 6 个路由页面：首页、空教室查询、教室全天状态、数据大屏、管理登录、公告管理
+  - 10 个组件：AppHeader(NavBar), AppFooter, DateSelector, ConfirmDialog(Dialog), EmptyState(Empty), LoadingSpinner(Loading), StatusWarning(NoticeBar), StatsCard, AnnouncementCard, QRCodeCard
+  - 7 个 Composables：useAlertDialog, useAnnouncements, useBuildingAliasReminder, useDateSelection, useSearchHistory, useSystemStatus, useTopBuildings
+  - CSS 变量定义在 `src/assets/css/main.css` 中，覆盖 Vant 主题变量并定义项目自定义变量
 
 ### 速率限制中间件
 - Date: 2026-04-10
@@ -110,10 +111,13 @@ Agent 在任务执行过程中发现的条目应遵循以下格式：
   - 若用户要求提交，优先使用中文环境展示 Git 信息
 
 ### 前端设计规范输出约定
-- Date: 2026-04-25
-- Context: Agent 在执行前端设计规范生成任务时发现
+- Date: 2026-05-06
+- Context: Agent 在执行 Vant 4 前端重构任务时更新
 - Category: 代码模式
 - Instructions:
-  - 该项目前端并非纯展示站，而是移动优先的校园查询工具，设计规范应优先服务高频检索与信息扫描效率
-  - 页面结构目前由首页、空教室查询、全天状态、数据大屏四个路由组成，设计系统需同时覆盖轻查询页与高密度数据页
-  - 品牌主色继续沿用 `#884F22`，但整体风格应从厚重 clay / soft UI 转向更克制的校园友好型专业界面
+  - 该项目前端使用 Vant 4 作为移动端组件库，不再使用 Tailwind CSS
+  - 页面结构由首页、空教室查询、全天状态、数据大屏、管理登录、公告管理六个路由组成
+  - 品牌主色继续沿用 `#884F22`，通过 Vant CSS 变量 `--van-primary-color` 覆盖
+  - 组件样式通过 scoped CSS + Vant 主题变量实现，不使用原子化 CSS 类
+  - 全局样式文件 `src/assets/css/main.css` 负责覆盖 Vant 主题变量和定义项目级 CSS 变量
+  - 支持亮色/暗色主题切换，通过 `[data-theme="dark"]` 选择器覆盖变量

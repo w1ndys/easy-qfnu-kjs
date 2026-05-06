@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { showConfirmDialog, showToast } from 'vant'
 import {
   adminGetAnnouncements,
   adminCreateAnnouncement,
@@ -39,11 +40,7 @@ function openCreate() {
 
 function openEdit(item) {
   editingId.value = item.id
-  form.value = {
-    title: item.title,
-    content: item.content,
-    important: item.important,
-  }
+  form.value = { title: item.title, content: item.content, important: item.important }
   showForm.value = true
 }
 
@@ -62,6 +59,7 @@ async function handleSave() {
     } else {
       await adminCreateAnnouncement(form.value)
     }
+    showToast({ message: '保存成功', type: 'success' })
     cancelForm()
     await fetchList()
   } catch (e) {
@@ -72,13 +70,16 @@ async function handleSave() {
 }
 
 async function handleDelete(id) {
-  if (!confirm('确定要删除这条公告吗？')) return
-  error.value = ''
   try {
+    await showConfirmDialog({ title: '确认删除', message: '确定要删除这条公告吗？' })
+    error.value = ''
     await adminDeleteAnnouncement(id)
+    showToast({ message: '删除成功', type: 'success' })
     await fetchList()
   } catch (e) {
-    error.value = getErrorMessage(e, '删除失败')
+    if (e !== 'cancel') {
+      error.value = getErrorMessage(e, '删除失败')
+    }
   }
 }
 
@@ -91,109 +92,247 @@ onMounted(fetchList)
 </script>
 
 <template>
-  <div class="page-shell min-h-screen antialiased">
-    <div class="mx-auto max-w-4xl px-4 py-6 sm:px-6 lg:px-8">
+  <div class="page-container">
+    <div class="page-content admin-content">
       <!-- 顶部栏 -->
-      <div class="mb-6 flex items-center justify-between">
-        <div class="flex items-center space-x-3">
-          <div class="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary text-white">
-            <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                d="M11 5.882V19.24a1.76 1.76 0 01-3.417.592l-2.147-6.15M18 13a3 3 0 100-6M5.436 13.683A4.001 4.001 0 017 6h1.832c4.1 0 7.625-1.234 9.168-3v14c-1.543-1.766-5.067-3-9.168-3H7a3.988 3.988 0 01-1.564-.317z" />
-            </svg>
-          </div>
-          <h1 class="text-xl font-bold text-clay-foreground">公告管理</h1>
+      <div class="admin-header">
+        <div class="header-left">
+          <van-icon name="volume-o" size="24" color="var(--color-brand-500)" />
+          <h1 class="admin-title">公告管理</h1>
         </div>
-        <div class="flex items-center space-x-3">
-          <router-link to="/" class="text-sm text-clay-muted hover:text-primary">返回首页</router-link>
-          <button @click="handleLogout"
-            class="rounded-xl border border-subtle bg-white px-3 py-1.5 text-sm font-semibold text-clay-muted transition hover:text-red-500">
-            退出登录
-          </button>
+        <div class="header-right">
+          <router-link to="/" class="back-link">返回首页</router-link>
+          <van-button plain size="small" type="danger" @click="handleLogout">退出登录</van-button>
         </div>
       </div>
 
       <!-- 错误提示 -->
-      <div v-if="error" class="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600">
-        {{ error }}
-      </div>
+      <van-notice-bar
+        v-if="error"
+        left-icon="warning-o"
+        :text="error"
+        color="var(--color-error-fg)"
+        background="var(--color-error-bg)"
+        :scrollable="false"
+        closeable
+        class="error-bar"
+        @close="error = ''"
+      />
 
       <!-- 新增按钮 -->
-      <div class="mb-4">
-        <button @click="openCreate"
-          class="rounded-xl bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary/90">
-          新增公告
-        </button>
+      <div class="action-bar">
+        <van-button type="primary" round icon="plus" @click="openCreate">新增公告</van-button>
       </div>
 
-      <!-- 编辑表单 -->
-      <div v-if="showForm" class="clay-card mb-6 p-6">
-        <h2 class="mb-4 text-base font-bold text-clay-foreground">
-          {{ editingId ? '编辑公告' : '新增公告' }}
-        </h2>
-        <form @submit.prevent="handleSave" class="space-y-4">
-          <div>
-            <label class="mb-1 block text-sm font-semibold text-clay-foreground">标题</label>
-            <input v-model="form.title" type="text"
-              class="w-full rounded-xl border border-subtle bg-white px-4 py-2.5 text-sm text-clay-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary-200"
-              placeholder="请输入公告标题" />
-          </div>
-          <div>
-            <label class="mb-1 block text-sm font-semibold text-clay-foreground">内容</label>
-            <textarea v-model="form.content" rows="4"
-              class="w-full rounded-xl border border-subtle bg-white px-4 py-2.5 text-sm text-clay-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary-200"
-              placeholder="请输入公告内容"></textarea>
-          </div>
-          <div class="flex items-center space-x-2">
-            <input v-model="form.important" type="checkbox" id="important"
-              class="h-4 w-4 rounded border-subtle text-primary focus:ring-primary-200" />
-            <label for="important" class="text-sm text-clay-foreground">标记为重要公告</label>
-          </div>
-          <div class="flex space-x-3">
-            <button type="submit" :disabled="saving"
-              class="rounded-xl bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:opacity-50">
-              {{ saving ? '保存中...' : '保存' }}
-            </button>
-            <button type="button" @click="cancelForm"
-              class="rounded-xl border border-subtle bg-white px-4 py-2 text-sm font-semibold text-clay-muted transition hover:bg-gray-50">
-              取消
-            </button>
-          </div>
-        </form>
-      </div>
+      <!-- 编辑表单弹出层 -->
+      <van-popup v-model:show="showForm" position="bottom" round :style="{ maxHeight: '80%' }">
+        <div class="form-popup">
+          <div class="form-title">{{ editingId ? '编辑公告' : '新增公告' }}</div>
+          <van-form @submit="handleSave">
+            <van-cell-group inset>
+              <van-field
+                v-model="form.title"
+                label="标题"
+                placeholder="请输入公告标题"
+                :rules="[{ required: true, message: '请输入标题' }]"
+              />
+              <van-field
+                v-model="form.content"
+                label="内容"
+                type="textarea"
+                rows="4"
+                placeholder="请输入公告内容"
+                :rules="[{ required: true, message: '请输入内容' }]"
+              />
+              <van-cell title="标记为重要公告">
+                <template #right-icon>
+                  <van-switch v-model="form.important" size="20" />
+                </template>
+              </van-cell>
+            </van-cell-group>
+
+            <div class="form-actions">
+              <van-button type="primary" block round :loading="saving" loading-text="保存中..." native-type="submit">
+                保存
+              </van-button>
+              <van-button block round @click="cancelForm">取消</van-button>
+            </div>
+          </van-form>
+        </div>
+      </van-popup>
 
       <!-- 公告列表 -->
-      <div v-if="loading" class="py-12 text-center text-sm text-clay-muted">加载中...</div>
-      <div v-else-if="announcements.length === 0" class="py-12 text-center text-sm text-clay-muted">暂无公告</div>
-      <div v-else class="space-y-3">
-        <div v-for="item in announcements" :key="item.id"
-          class="clay-card p-4 transition-all"
-          :class="item.important ? 'border-[#F3CF8D] bg-[#FFF6E8]' : ''">
-          <div class="flex items-start justify-between gap-3">
-            <div class="flex-1 min-w-0">
-              <div class="flex items-center gap-2">
-                <h3 class="text-sm font-bold text-clay-foreground truncate">{{ item.title }}</h3>
-                <span v-if="item.important"
-                  class="flex-shrink-0 rounded-full bg-[#9A5A00] px-2 py-0.5 text-xs font-bold text-white">
-                  重要
-                </span>
+      <div v-if="loading" class="loading-wrapper">
+        <van-loading type="spinner" color="var(--color-brand-500)">加载中...</van-loading>
+      </div>
+
+      <van-empty v-else-if="announcements.length === 0" description="暂无公告" />
+
+      <div v-else class="announcement-list">
+        <van-swipe-cell v-for="item in announcements" :key="item.id">
+          <div class="admin-announcement-item" :class="{ important: item.important }">
+            <div class="item-main">
+              <div class="item-title-row">
+                <span class="item-title">{{ item.title }}</span>
+                <van-tag v-if="item.important" type="warning" round size="small">重要</van-tag>
               </div>
-              <p class="mt-1 text-sm text-clay-muted line-clamp-2">{{ item.content }}</p>
-              <p class="mt-1 text-xs text-clay-muted/60">{{ item.created_at }}</p>
+              <p class="item-content">{{ item.content }}</p>
+              <p class="item-date">{{ item.created_at }}</p>
             </div>
-            <div class="flex flex-shrink-0 items-center space-x-2">
-              <button @click="openEdit(item)"
-                class="rounded-lg border border-subtle bg-white px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-primary-50">
-                编辑
-              </button>
-              <button @click="handleDelete(item.id)"
-                class="rounded-lg border border-red-200 bg-white px-2.5 py-1 text-xs font-semibold text-red-500 transition hover:bg-red-50">
-                删除
-              </button>
+            <div class="item-actions">
+              <van-button plain size="mini" type="primary" @click="openEdit(item)">编辑</van-button>
+              <van-button plain size="mini" type="danger" @click="handleDelete(item.id)">删除</van-button>
             </div>
           </div>
-        </div>
+          <template #right>
+            <van-button square type="danger" text="删除" class="swipe-btn" @click="handleDelete(item.id)" />
+          </template>
+        </van-swipe-cell>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.admin-content {
+  max-width: 800px;
+}
+
+.admin-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.admin-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.back-link {
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+  text-decoration: none;
+}
+
+.error-bar {
+  margin-bottom: 16px;
+  border-radius: 10px;
+}
+
+.action-bar {
+  margin-bottom: 16px;
+}
+
+.form-popup {
+  padding: 20px 16px;
+}
+
+.form-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-bottom: 16px;
+  text-align: center;
+}
+
+.form-actions {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.loading-wrapper {
+  display: flex;
+  justify-content: center;
+  padding: 48px 0;
+}
+
+.announcement-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.admin-announcement-item {
+  background: var(--color-surface-card);
+  border-radius: 12px;
+  border: 1px solid var(--color-border-subtle);
+  padding: 14px 16px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.admin-announcement-item.important {
+  border-color: #F3CF8D;
+  background: var(--color-warning-bg);
+}
+
+.item-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.item-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.item-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.item-content {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin: 4px 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.item-date {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  margin: 4px 0 0;
+}
+
+.item-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.swipe-btn {
+  height: 100%;
+}
+
+:deep(.van-cell-group--inset) {
+  margin: 0;
+}
+</style>

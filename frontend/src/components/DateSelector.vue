@@ -39,55 +39,123 @@ watch(dateOffset, (nextValue) => {
 function handleCustomOffsetInput() {
   updateCustomOffset(customOffset.value)
 }
+
+function getQuickDateIndex() {
+  if (useCustomDate.value) return 3
+  return dateOffset.value <= 2 ? dateOffset.value : -1
+}
+
+function onTabChange(index) {
+  if (index === 3) {
+    toggleCustomDate()
+  } else {
+    setQuickDate(index)
+  }
+}
 </script>
 
 <template>
-  <div>
-    <label class="mb-2 block text-sm font-semibold text-clay-muted">日期</label>
+  <div class="date-selector">
+    <div class="date-label">日期</div>
 
-    <div class="mb-3 flex rounded-xl bg-[#F3EFEB] p-1">
-      <button
+    <div class="date-tabs">
+      <div
         v-for="(label, idx) in quickDateLabels"
         :key="idx"
-        type="button"
-        class="min-h-10 flex-1 rounded-lg px-2 py-2 text-[13px] font-semibold transition"
-        :class="dateOffset === idx && !useCustomDate
-          ? 'bg-white text-primary shadow-sm'
-          : 'text-clay-muted hover:text-clay-foreground'"
+        class="date-tab"
+        :class="{ active: dateOffset === idx && !useCustomDate }"
         @click="setQuickDate(idx)"
       >
         {{ label }}
-      </button>
-
-      <button
-        type="button"
-        class="min-h-10 flex-1 rounded-lg px-2 py-2 text-[13px] font-semibold transition"
-        :class="useCustomDate
-          ? 'bg-white text-primary shadow-sm'
-          : 'text-clay-muted hover:text-clay-foreground'"
+      </div>
+      <div
+        class="date-tab"
+        :class="{ active: useCustomDate }"
         @click="toggleCustomDate"
       >
         自定义
-      </button>
+      </div>
     </div>
 
-    <!-- Custom date input -->
-    <div v-if="useCustomDate" class="space-y-2">
-      <div class="flex items-center space-x-3">
-        <div class="flex-1">
-          <input
-            v-model.number="customOffset"
-            type="number"
-            min="0"
-            max="180"
-            class="w-full clay-input py-3 px-5 text-[15px] text-clay-foreground"
-            placeholder="输入天数"
-            @input="handleCustomOffsetInput"
-          />
-        </div>
-        <span class="text-clay-muted text-sm font-medium whitespace-nowrap">天后</span>
-      </div>
-      <p class="ml-1 text-xs font-medium text-clay-muted">{{ customDatePreview }}</p>
+    <div v-if="useCustomDate" class="custom-date">
+      <van-field
+        v-model.number="customOffset"
+        type="digit"
+        placeholder="输入天数"
+        :border="false"
+        @update:model-value="handleCustomOffsetInput"
+      >
+        <template #button>
+          <span class="custom-suffix">天后</span>
+        </template>
+      </van-field>
+      <div v-if="customDatePreview" class="date-preview">{{ customDatePreview }}</div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.date-selector {
+  margin-bottom: 4px;
+}
+
+.date-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-bottom: 8px;
+}
+
+.date-tabs {
+  display: flex;
+  background: var(--color-surface-section);
+  border-radius: 12px;
+  padding: 4px;
+  gap: 4px;
+}
+
+.date-tab {
+  flex: 1;
+  text-align: center;
+  padding: 10px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.date-tab:hover {
+  color: var(--color-text-primary);
+}
+
+.date-tab.active {
+  background: var(--color-surface-card);
+  color: var(--color-brand-500);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.custom-date {
+  margin-top: 12px;
+}
+
+.custom-date :deep(.van-field) {
+  border-radius: 10px;
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-surface-card);
+}
+
+.custom-suffix {
+  font-size: 14px;
+  color: var(--color-text-tertiary);
+  font-weight: 500;
+}
+
+.date-preview {
+  margin-top: 6px;
+  padding-left: 4px;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+</style>
