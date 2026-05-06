@@ -1,13 +1,22 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import Components from 'unplugin-vue-components/vite'
+import AutoImport from 'unplugin-auto-import/vite'
+import { VantResolver } from '@vant/auto-import-resolver'
 import { fileURLToPath, URL } from 'node:url'
 
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [
+    vue(),
+    AutoImport({
+      resolvers: [VantResolver()],
+    }),
+    Components({
+      resolvers: [VantResolver()],
+    }),
+  ],
   resolve: {
-    alias: {
-      '@': fileURLToPath(new URL('./src', import.meta.url)),
-    },
+    alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
   base: '/',
   server: {
@@ -28,18 +37,10 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (id.includes('node_modules')) {
-            if (id.includes('echarts')) {
-              return 'vendor-echarts'
-            }
-            if (id.includes('vue-echarts')) {
-              return 'vendor-echarts'
-            }
-            if (id.includes('vue') || id.includes('vue-router')) {
-              return 'vendor-vue'
-            }
-            if (id.includes('axios')) {
-              return 'vendor-axios'
-            }
+            if (id.includes('echarts') || id.includes('vue-echarts')) return 'vendor-echarts'
+            if (id.includes('vant')) return 'vendor-vant'
+            if (id.includes('vue') || id.includes('vue-router')) return 'vendor-vue'
+            if (id.includes('axios')) return 'vendor-axios'
           }
         },
       },
