@@ -148,7 +148,7 @@ func createNewTable(db *sql.DB) error {
 			result_count INTEGER NOT NULL DEFAULT 0,
 			ip TEXT NOT NULL DEFAULT '',
 			ua_hash TEXT NOT NULL DEFAULT '',
-			queried_at DATETIME DEFAULT (datetime('now', 'localtime'))
+			queried_at DATETIME DEFAULT (datetime('now'))
 		);
 		CREATE INDEX IF NOT EXISTS idx_queried_at ON query_logs(queried_at);
 		CREATE INDEX IF NOT EXISTS idx_keyword ON query_logs(keyword);
@@ -248,9 +248,11 @@ func (s *StatsService) RecordQuery(record model.QueryRecord) {
 	}
 }
 
-// GetStats 获取统计数据
+// GetStats 获取统计数据（使用 UTC+8 作为默认时区计算"今天"边界）
 func (s *StatsService) GetStats() (*model.StatsResponse, error) {
-	now := time.Now()
+	// 使用 UTC+8 作为默认时区（面向中国用户）
+	cst := time.FixedZone("CST", 8*3600)
+	now := time.Now().UTC().In(cst)
 	todayStart := now.Format("2006-01-02") + " 00:00:00"
 
 	// 本周一
@@ -264,22 +266,31 @@ func (s *StatsService) GetStats() (*model.StatsResponse, error) {
 	// 本月1号
 	monthStart := now.Format("2006-01") + "-01 00:00:00"
 
+	// 将用户时区的日期边界转换为 UTC 进行查询
+	todayStartUTC, _ := time.ParseInLocation("2006-01-02 15:04:05", todayStart, cst)
+	weekStartUTC, _ := time.ParseInLocation("2006-01-02 15:04:05", weekStart, cst)
+	monthStartUTC, _ := time.ParseInLocation("2006-01-02 15:04:05", monthStart, cst)
+
+	todayStartStr := todayStartUTC.UTC().Format("2006-01-02 15:04:05")
+	weekStartStr := weekStartUTC.UTC().Format("2006-01-02 15:04:05")
+	monthStartStr := monthStartUTC.UTC().Format("2006-01-02 15:04:05")
+
 	resp := &model.StatsResponse{}
 
 	// 今日查询次数
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", todayStart).Scan(&resp.TodayCount); err != nil {
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", todayStartStr).Scan(&resp.TodayCount); err != nil {
 		logger.Error("查询今日统计失败: %v", err)
 		return nil, fmt.Errorf("查询今日统计失败: %w", err)
 	}
 
 	// 本周查询次数
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", weekStart).Scan(&resp.WeekCount); err != nil {
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", weekStartStr).Scan(&resp.WeekCount); err != nil {
 		logger.Error("查询本周统计失败: %v", err)
 		return nil, fmt.Errorf("查询本周统计失败: %w", err)
 	}
 
 	// 本月查询次数
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", monthStart).Scan(&resp.MonthCount); err != nil {
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", monthStartStr).Scan(&resp.MonthCount); err != nil {
 		logger.Error("查询本月统计失败: %v", err)
 		return nil, fmt.Errorf("查询本月统计失败: %w", err)
 	}
@@ -287,7 +298,7 @@ func (s *StatsService) GetStats() (*model.StatsResponse, error) {
 	// 今日最热搜索关键词
 	if err := s.db.QueryRow(
 		"SELECT keyword FROM query_logs WHERE queried_at >= ? GROUP BY keyword ORDER BY COUNT(*) DESC LIMIT 1",
-		todayStart,
+		todayStartStr,
 	).Scan(&resp.TodayTop); err != nil && err != sql.ErrNoRows {
 		logger.Error("查询今日最热关键词失败: %v", err)
 		return nil, fmt.Errorf("查询今日最热关键词失败: %w", err)
@@ -296,7 +307,7 @@ func (s *StatsService) GetStats() (*model.StatsResponse, error) {
 	// 本周最热搜索关键词
 	if err := s.db.QueryRow(
 		"SELECT keyword FROM query_logs WHERE queried_at >= ? GROUP BY keyword ORDER BY COUNT(*) DESC LIMIT 1",
-		weekStart,
+		weekStartStr,
 	).Scan(&resp.WeekTop); err != nil && err != sql.ErrNoRows {
 		logger.Error("查询本周最热关键词失败: %v", err)
 		return nil, fmt.Errorf("查询本周最热关键词失败: %w", err)
@@ -305,7 +316,7 @@ func (s *StatsService) GetStats() (*model.StatsResponse, error) {
 	// 本月最热搜索关键词
 	if err := s.db.QueryRow(
 		"SELECT keyword FROM query_logs WHERE queried_at >= ? GROUP BY keyword ORDER BY COUNT(*) DESC LIMIT 1",
-		monthStart,
+		monthStartStr,
 	).Scan(&resp.MonthTop); err != nil && err != sql.ErrNoRows {
 		logger.Error("查询本月最热关键词失败: %v", err)
 		return nil, fmt.Errorf("查询本月最热关键词失败: %w", err)
@@ -350,25 +361,32 @@ func (s *StatsService) GetTopQueries(limit int) ([]model.TopQueryItem, error) {
 }
 
 // GetDashboardData 获取数据大屏综合统计数据
-func (s *StatsService) GetDashboardData(timeRange string, days int) (*model.DashboardResponse, error) {
-	now := time.Now()
+// tzOffsetMin 为客户端时区相对 UTC 的偏移分钟数（如 UTC+8 传 480）
+func (s *StatsService) GetDashboardData(timeRange string, days int, tzOffsetMin int) (*model.DashboardResponse, error) {
+	// 根据用户时区计算"今天"的起始时间（转为 UTC 表示）
+	tzOffset := time.FixedZone("client", tzOffsetMin*60)
+	nowInUserTZ := time.Now().UTC().In(tzOffset)
 	var startTime string
 
 	switch timeRange {
 	case "today":
-		startTime = now.Format("2006-01-02") + " 00:00:00"
+		startTime = nowInUserTZ.Format("2006-01-02") + " 00:00:00"
 	case "week":
-		startTime = now.AddDate(0, 0, -6).Format("2006-01-02") + " 00:00:00"
+		startTime = nowInUserTZ.AddDate(0, 0, -6).Format("2006-01-02") + " 00:00:00"
 	case "month":
-		startTime = now.AddDate(0, 0, -29).Format("2006-01-02") + " 00:00:00"
+		startTime = nowInUserTZ.AddDate(0, 0, -29).Format("2006-01-02") + " 00:00:00"
 	case "custom":
 		if days < 1 {
 			days = 1
 		}
-		startTime = now.AddDate(0, 0, -(days-1)).Format("2006-01-02") + " 00:00:00"
+		startTime = nowInUserTZ.AddDate(0, 0, -(days-1)).Format("2006-01-02") + " 00:00:00"
 	default:
-		startTime = now.Format("2006-01-02") + " 00:00:00"
+		startTime = nowInUserTZ.Format("2006-01-02") + " 00:00:00"
 	}
+
+	// 将用户时区的日期起始时间转换为 UTC 存储时间进行查询
+	userStart, _ := time.ParseInLocation("2006-01-02 15:04:05", startTime, tzOffset)
+	startTime = userStart.UTC().Format("2006-01-02 15:04:05")
 
 	resp := &model.DashboardResponse{}
 
@@ -380,12 +398,12 @@ func (s *StatsService) GetDashboardData(timeRange string, days int) (*model.Dash
 
 	go func() {
 		defer wg.Done()
-		resp.Overview, overviewErr = s.getDashboardOverview(startTime)
+		resp.Overview, overviewErr = s.getDashboardOverview(startTime, tzOffsetMin)
 	}()
 
 	go func() {
 		defer wg.Done()
-		resp.Trend, trendErr = s.getDashboardTrend(timeRange, startTime, now, days)
+		resp.Trend, trendErr = s.getDashboardTrend(timeRange, startTime, nowInUserTZ, days, tzOffsetMin)
 	}()
 
 	go func() {
@@ -405,7 +423,7 @@ func (s *StatsService) GetDashboardData(timeRange string, days int) (*model.Dash
 
 	go func() {
 		defer wg.Done()
-		resp.HourlyDist, hourlyErr = s.getDashboardHourlyDist(startTime)
+		resp.HourlyDist, hourlyErr = s.getDashboardHourlyDist(startTime, tzOffsetMin)
 	}()
 
 	wg.Wait()
@@ -420,10 +438,11 @@ func (s *StatsService) GetDashboardData(timeRange string, days int) (*model.Dash
 	return resp, nil
 }
 
-// getDashboardOverview 获取总览数据
-func (s *StatsService) getDashboardOverview(startTime string) (model.DashboardOverview, error) {
+// getDashboardOverview 获取总览数据（按用户时区计算日期边界）
+func (s *StatsService) getDashboardOverview(startTime string, tzOffsetMin int) (model.DashboardOverview, error) {
 	var o model.DashboardOverview
-	now := time.Now()
+	tzOffset := time.FixedZone("client", tzOffsetMin*60)
+	now := time.Now().UTC().In(tzOffset)
 
 	// 时间段内总查询次数 + 独立搜索词数 + 平均结果数 + 最大结果数
 	err := s.db.QueryRow(`
@@ -445,9 +464,11 @@ func (s *StatsService) getDashboardOverview(startTime string) (model.DashboardOv
 		return o, fmt.Errorf("查询独立用户数失败: %w", err)
 	}
 
-	// 今日
-	todayStart := now.Format("2006-01-02") + " 00:00:00"
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", todayStart).Scan(&o.TodayCount); err != nil {
+	// 今日（用户时区的今天 00:00 转为 UTC）
+	todayInUserTZ := now.Format("2006-01-02") + " 00:00:00"
+	todayUTC, _ := time.ParseInLocation("2006-01-02 15:04:05", todayInUserTZ, tzOffset)
+	todayStartStr := todayUTC.UTC().Format("2006-01-02 15:04:05")
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", todayStartStr).Scan(&o.TodayCount); err != nil {
 		return o, fmt.Errorf("查询今日统计失败: %w", err)
 	}
 
@@ -456,31 +477,38 @@ func (s *StatsService) getDashboardOverview(startTime string) (model.DashboardOv
 	if weekday == 0 {
 		weekday = 7
 	}
-	weekStart := now.AddDate(0, 0, -(weekday-1)).Format("2006-01-02") + " 00:00:00"
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", weekStart).Scan(&o.WeekCount); err != nil {
+	weekInUserTZ := now.AddDate(0, 0, -(weekday-1)).Format("2006-01-02") + " 00:00:00"
+	weekUTC, _ := time.ParseInLocation("2006-01-02 15:04:05", weekInUserTZ, tzOffset)
+	weekStartStr := weekUTC.UTC().Format("2006-01-02 15:04:05")
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", weekStartStr).Scan(&o.WeekCount); err != nil {
 		return o, fmt.Errorf("查询本周统计失败: %w", err)
 	}
 
 	// 本月
-	monthStart := now.Format("2006-01") + "-01 00:00:00"
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", monthStart).Scan(&o.MonthCount); err != nil {
+	monthInUserTZ := now.Format("2006-01") + "-01 00:00:00"
+	monthUTC, _ := time.ParseInLocation("2006-01-02 15:04:05", monthInUserTZ, tzOffset)
+	monthStartStr := monthUTC.UTC().Format("2006-01-02 15:04:05")
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM query_logs WHERE queried_at >= ?", monthStartStr).Scan(&o.MonthCount); err != nil {
 		return o, fmt.Errorf("查询本月统计失败: %w", err)
 	}
 
 	return o, nil
 }
 
-// getDashboardTrend 获取趋势数据
-func (s *StatsService) getDashboardTrend(timeRange, startTime string, now time.Time, days int) ([]model.TrendPoint, error) {
-	var query string
+// getDashboardTrend 获取趋势数据（按用户时区偏移转换）
+func (s *StatsService) getDashboardTrend(timeRange, startTime string, now time.Time, days int, tzOffsetMin int) ([]model.TrendPoint, error) {
 	var points []model.TrendPoint
+
+	// 构造 SQLite 时区偏移修饰符
+	offsetHours := tzOffsetMin / 60
+	modifier := fmt.Sprintf("%+d hours", offsetHours)
 
 	switch timeRange {
 	case "today":
-		// 按小时分组
-		query = `SELECT strftime('%H', queried_at) AS label, COUNT(*) AS cnt
+		// 按小时分组（带时区偏移）
+		query := fmt.Sprintf(`SELECT strftime('%%H', queried_at, '%s') AS label, COUNT(*) AS cnt
 				 FROM query_logs WHERE queried_at >= ?
-				 GROUP BY label ORDER BY label`
+				 GROUP BY label ORDER BY label`, modifier)
 		rows, err := s.db.Query(query, startTime)
 		if err != nil {
 			return nil, fmt.Errorf("查询今日趋势失败: %w", err)
@@ -504,10 +532,10 @@ func (s *StatsService) getDashboardTrend(timeRange, startTime string, now time.T
 		}
 
 	case "week":
-		// 按天分组，最近 7 天
-		query = `SELECT strftime('%Y-%m-%d', queried_at) AS label, COUNT(*) AS cnt
+		// 按天分组，最近 7 天（带时区偏移）
+		query := fmt.Sprintf(`SELECT strftime('%%Y-%%m-%%d', queried_at, '%s') AS label, COUNT(*) AS cnt
 				 FROM query_logs WHERE queried_at >= ?
-				 GROUP BY label ORDER BY label`
+				 GROUP BY label ORDER BY label`, modifier)
 		rows, err := s.db.Query(query, startTime)
 		if err != nil {
 			return nil, fmt.Errorf("查询本周趋势失败: %w", err)
@@ -532,10 +560,10 @@ func (s *StatsService) getDashboardTrend(timeRange, startTime string, now time.T
 		}
 
 	case "month":
-		// 按天分组，最近 30 天
-		query = `SELECT strftime('%Y-%m-%d', queried_at) AS label, COUNT(*) AS cnt
+		// 按天分组，最近 30 天（带时区偏移）
+		query := fmt.Sprintf(`SELECT strftime('%%Y-%%m-%%d', queried_at, '%s') AS label, COUNT(*) AS cnt
 				 FROM query_logs WHERE queried_at >= ?
-				 GROUP BY label ORDER BY label`
+				 GROUP BY label ORDER BY label`, modifier)
 		rows, err := s.db.Query(query, startTime)
 		if err != nil {
 			return nil, fmt.Errorf("查询本月趋势失败: %w", err)
@@ -563,9 +591,9 @@ func (s *StatsService) getDashboardTrend(timeRange, startTime string, now time.T
 		if days < 1 {
 			days = 1
 		}
-		query = `SELECT strftime('%Y-%m-%d', queried_at) AS label, COUNT(*) AS cnt
+		query := fmt.Sprintf(`SELECT strftime('%%Y-%%m-%%d', queried_at, '%s') AS label, COUNT(*) AS cnt
 				 FROM query_logs WHERE queried_at >= ?
-				 GROUP BY label ORDER BY label`
+				 GROUP BY label ORDER BY label`, modifier)
 		rows, err := s.db.Query(query, startTime)
 		if err != nil {
 			return nil, fmt.Errorf("查询自定义范围趋势失败: %w", err)
@@ -693,12 +721,29 @@ func (s *StatsService) getDashboardResultStats(startTime string) (model.ResultSt
 	return r, nil
 }
 
-// getDashboardHourlyDist 获取每小时查询分布
-func (s *StatsService) getDashboardHourlyDist(startTime string) ([]model.HourlyDistItem, error) {
-	rows, err := s.db.Query(`
-		SELECT CAST(strftime('%H', queried_at) AS INTEGER) AS hour, COUNT(*) AS cnt
+// getDashboardHourlyDist 获取每小时查询分布（按用户时区偏移转换）
+func (s *StatsService) getDashboardHourlyDist(startTime string, tzOffsetMin int) ([]model.HourlyDistItem, error) {
+	// 构造 SQLite 时区偏移修饰符，如 '+8 hours', '-5 hours', '+5 hours +30 minutes'
+	offsetHours := tzOffsetMin / 60
+	offsetMins := tzOffsetMin % 60
+	var modifier string
+	if offsetMins == 0 {
+		modifier = fmt.Sprintf("%+d hours", offsetHours)
+	} else {
+		modifier = fmt.Sprintf("%+d hours", offsetHours)
+		if offsetMins > 0 {
+			modifier += fmt.Sprintf(", '+%d minutes'", offsetMins)
+		} else {
+			modifier += fmt.Sprintf(", '%d minutes'", offsetMins)
+		}
+	}
+
+	query := fmt.Sprintf(`
+		SELECT CAST(strftime('%%H', queried_at, '%s') AS INTEGER) AS hour, COUNT(*) AS cnt
 		FROM query_logs WHERE queried_at >= ?
-		GROUP BY hour ORDER BY hour`, startTime)
+		GROUP BY hour ORDER BY hour`, modifier)
+
+	rows, err := s.db.Query(query, startTime)
 	if err != nil {
 		return nil, fmt.Errorf("查询每小时分布失败: %w", err)
 	}

@@ -38,6 +38,8 @@ export async function getTopBuildings() {
 export async function getDashboard(range = 'today', days) {
   const params = { range }
   if (range === 'custom') params.days = days
+  // 传递客户端时区偏移（分钟），getTimezoneOffset 返回的是 UTC - local，需要取反
+  params.tz_offset = -new Date().getTimezoneOffset()
   const { data } = await api.get('/api/v1/dashboard', { params })
   return data
 }

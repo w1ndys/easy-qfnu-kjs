@@ -183,7 +183,15 @@ func (h *Handler) GetDashboard(c *gin.Context) {
 		days = parsedDays
 	}
 
-	data, err := h.statsService.GetDashboardData(timeRange, days)
+	// 获取客户端时区偏移（分钟），默认 480（UTC+8，中国标准时间）
+	tzOffsetMin := 480
+	if tzStr := c.DefaultQuery("tz_offset", ""); tzStr != "" {
+		if parsed, err := strconv.Atoi(tzStr); err == nil && parsed >= -720 && parsed <= 840 {
+			tzOffsetMin = parsed
+		}
+	}
+
+	data, err := h.statsService.GetDashboardData(timeRange, days, tzOffsetMin)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取大屏数据失败"})
 		return
