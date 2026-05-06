@@ -7,6 +7,9 @@ import {
   adminCreateAnnouncement,
   adminUpdateAnnouncement,
   adminDeleteAnnouncement,
+  adminGetAPIConfig,
+  adminUpdateAPIConfig,
+  adminGetAIModels,
   getErrorMessage,
 } from '@/api'
 
@@ -18,6 +21,17 @@ const showForm = ref(false)
 const editingId = ref(null)
 const form = ref({ title: '', content: '', important: false })
 const saving = ref(false)
+const configLoading = ref(false)
+const configSaving = ref(false)
+const modelLoading = ref(false)
+const modelOptions = ref([])
+const configForm = ref({
+  ai_base_url: '',
+  ai_key: '',
+  ai_model: '',
+  open_api_enabled: false,
+  open_api_key: '',
+})
 
 async function fetchList() {
   loading.value = true
@@ -30,6 +44,53 @@ async function fetchList() {
   } finally {
     loading.value = false
   }
+}
+
+async function fetchConfig() {
+  configLoading.value = true
+  try {
+    configForm.value = await adminGetAPIConfig()
+  } catch (e) {
+    error.value = getErrorMessage(e, '获取开放接口配置失败')
+  } finally {
+    configLoading.value = false
+  }
+}
+
+async function saveConfig() {
+  configSaving.value = true
+  error.value = ''
+  try {
+    configForm.value = await adminUpdateAPIConfig(configForm.value)
+    showToast({ message: '配置已保存', type: 'success' })
+  } catch (e) {
+    error.value = getErrorMessage(e, '保存开放接口配置失败')
+  } finally {
+    configSaving.value = false
+  }
+}
+
+async function fetchModels() {
+  modelLoading.value = true
+  error.value = ''
+  try {
+    const resp = await adminGetAIModels()
+    modelOptions.value = (resp.models || []).map((model) => ({ text: model, value: model }))
+    if (!configForm.value.ai_model && modelOptions.value.length > 0) {
+      configForm.value.ai_model = modelOptions.value[0].value
+    }
+    showToast({ message: '模型列表已更新', type: 'success' })
+  } catch (e) {
+    error.value = getErrorMessage(e, '获取模型列表失败')
+  } finally {
+    modelLoading.value = false
+  }
+}
+
+function generateOpenAPIKey() {
+  const bytes = new Uint8Array(24)
+  crypto.getRandomValues(bytes)
+  configForm.value.open_api_key = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 function openCreate() {
@@ -88,7 +149,10 @@ function handleLogout() {
   router.push('/admin/login')
 }
 
-onMounted(fetchList)
+onMounted(() => {
+  fetchList()
+  fetchConfig()
+})
 </script>
 
 <template>
@@ -97,8 +161,8 @@ onMounted(fetchList)
       <!-- 顶部栏 -->
       <div class="admin-header">
         <div class="header-left">
-          <van-icon name="volume-o" size="24" color="var(--color-brand-500)" />
-          <h1 class="admin-title">公告管理</h1>
+          <van-icon name="setting-o" size="24" color="var(--color-brand-500)" />
+          <h1 class="admin-title">后台管理</h1>
         </div>
         <div class="header-right">
           <router-link to="/" class="back-link">返回首页</router-link>
@@ -119,7 +183,64 @@ onMounted(fetchList)
         @close="error = ''"
       />
 
-      <!-- 新增按钮 -->
+      <div class="admin-section app-card">
+        <div class="section-header">
+          <div>
+            <h2>大模型 API 配置</h2>
+            <p>支持 OpenAI 兼容接口，用于自然语言解析查询条件。</p>
+          </div>
+          <van-button size="small" plain type="primary" :loading="modelLoading" @click="fetchModels">获取模型</van-button>
+        </div>
+        <van-form @submit="saveConfig">
+          <van-cell-group inset>
+            <van-field v-model="configForm.ai_base_url" label="BaseURL" placeholder="https://api.openai.com 或兼容地址" />
+            <van-field v-model="configForm.ai_key" label="Key" type="password" placeholder="请输入 API Key" />
+            <van-field
+              v-if="modelOptions.length === 0"
+              v-model="configForm.ai_model"
+              label="Model"
+              placeholder="例如 gpt-4o-mini"
+            />
+            <van-field v-else label="Model">
+              <template #input>
+                <van-dropdown-menu class="model-menu">
+                  <van-dropdown-item v-model="configForm.ai_model" :options="modelOptions" />
+                </van-dropdown-menu>
+              </template>
+            </van-field>
+          </van-cell-group>
+
+          <div class="section-header open-api-title">
+            <div>
+              <h2>开放接口控制面板</h2>
+              <p>外部调用使用授权 Key，不受前台高频限制影响。</p>
+            </div>
+          </div>
+          <van-cell-group inset>
+            <van-cell title="启用开放接口">
+              <template #right-icon>
+                <van-switch v-model="configForm.open_api_enabled" size="20" />
+              </template>
+            </van-cell>
+            <van-field v-model="configForm.open_api_key" label="授权 Key" placeholder="点击随机生成或手动输入">
+              <template #button>
+                <van-button size="small" type="primary" plain @click="generateOpenAPIKey">随机生成</van-button>
+              </template>
+            </van-field>
+          </van-cell-group>
+
+          <div class="api-docs">
+            <p>直接查询：POST /api/v1/open/query</p>
+            <p>AI 查询：POST /api/v1/open/ai-query</p>
+            <p>请求头：X-API-Key: {{ configForm.open_api_key || 'your-key' }}</p>
+          </div>
+
+          <div class="form-actions compact-actions">
+            <van-button type="primary" block round :loading="configSaving || configLoading" native-type="submit">保存配置</van-button>
+          </div>
+        </van-form>
+      </div>
+
       <div class="action-bar">
         <van-button type="primary" round icon="plus" @click="openCreate">新增公告</van-button>
       </div>
@@ -239,6 +360,64 @@ onMounted(fetchList)
   margin-bottom: 16px;
 }
 
+.admin-section {
+  margin-bottom: 18px;
+  padding: 16px 0;
+}
+
+.section-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px 12px;
+}
+
+.section-header h2 {
+  margin: 0 0 4px;
+  font-size: 16px;
+  color: var(--color-text-primary);
+}
+
+.section-header p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text-tertiary);
+}
+
+.open-api-title {
+  padding-top: 16px;
+}
+
+.model-menu {
+  width: 100%;
+}
+
+.model-menu :deep(.van-dropdown-menu__bar) {
+  height: 28px;
+  box-shadow: none;
+}
+
+.api-docs {
+  margin: 12px 16px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.api-docs p {
+  margin: 0;
+}
+
+.compact-actions {
+  padding-bottom: 0;
+}
+
 .form-popup {
   padding: 20px 16px;
 }
@@ -334,5 +513,17 @@ onMounted(fetchList)
 
 :deep(.van-cell-group--inset) {
   margin: 0;
+}
+
+@media (max-width: 640px) {
+  .admin-header,
+  .section-header {
+    flex-direction: column;
+  }
+
+  .header-right {
+    width: 100%;
+    justify-content: space-between;
+  }
 }
 </style>

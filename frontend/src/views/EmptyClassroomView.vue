@@ -1,6 +1,6 @@
 <script setup>
 import { computed, reactive, ref } from 'vue'
-import { getErrorMessage, queryClassrooms } from '@/api'
+import { getErrorMessage, queryClassrooms, queryClassroomsByAI } from '@/api'
 import { useSystemStatus } from '@/composables/useSystemStatus'
 import { useSearchHistory } from '@/composables/useSearchHistory'
 import { useTopBuildings } from '@/composables/useTopBuildings'
@@ -44,6 +44,8 @@ const showHistory = ref(false)
 const inputFocused = ref(false)
 const showStartPicker = ref(false)
 const showEndPicker = ref(false)
+const aiText = ref('')
+const aiParsed = ref(null)
 
 const form = reactive({
   building: '',
@@ -141,6 +143,59 @@ async function search() {
     loading.value = false
   }
 }
+
+async function aiSearch() {
+  const text = aiText.value.trim()
+  if (!text) {
+    showAlert('请先输入自然语言描述，例如：明天老文史楼第3到4节有哪些空教室', {
+      title: 'AI 查询条件不完整',
+    })
+    return
+  }
+
+  loading.value = true
+  displayLimit.value = 100
+  hasSearched.value = false
+  results.value = []
+  resultInfo.value = null
+  aiParsed.value = null
+  showHistory.value = false
+
+  try {
+    const data = await queryClassroomsByAI(text)
+    const result = data.result || {}
+    const parsed = data.parsed || {}
+
+    results.value = result.classrooms || []
+    resultInfo.value = {
+      date: result.date,
+      week: result.week,
+      day: result.day_of_week,
+    }
+    aiParsed.value = parsed
+    hasSearched.value = true
+
+    if (parsed.building) form.building = parsed.building
+    if (parsed.date_offset !== undefined) form.offset = parsed.date_offset
+    if (parsed.start_node) form.start = parsed.start_node
+    if (parsed.end_node) form.end = parsed.end_node
+
+    addToHistory({
+      building: parsed.building,
+      offset: parsed.date_offset,
+      start: parsed.start_node,
+      end: parsed.end_node,
+      label: text,
+    })
+  } catch (error) {
+    console.error(error)
+    showAlert(getErrorMessage(error, 'AI 解析失败，请完善精确的描述语言，或使用直接查询'), {
+      title: 'AI 查询失败',
+    })
+  } finally {
+    loading.value = false
+  }
+}
 </script>
 
 <template>
@@ -174,6 +229,30 @@ async function search() {
           background="var(--color-success-bg)"
           :scrollable="false"
         />
+
+        <div class="ai-query-card">
+          <div class="ai-query-title">AI 自然语言查询</div>
+          <van-field
+            v-model="aiText"
+            type="textarea"
+            rows="2"
+            autosize
+            clearable
+            :border="false"
+            placeholder="例如：明天老文史楼第3到4节有哪些空教室"
+          />
+          <van-button
+            plain
+            round
+            type="primary"
+            size="small"
+            :loading="loading"
+            loading-text="解析中..."
+            @click="aiSearch"
+          >
+            AI 查询
+          </van-button>
+        </div>
 
         <!-- 教学楼输入 -->
         <div class="form-section">
@@ -283,6 +362,13 @@ async function search() {
         <van-tag type="primary" round>共 {{ results.length }} 间</van-tag>
       </div>
 
+      <div v-if="aiParsed" class="ai-parsed app-card">
+        <span>AI 已解析：</span>
+        <van-tag plain type="primary" round>{{ aiParsed.building }}</van-tag>
+        <van-tag plain type="primary" round>偏移 {{ aiParsed.date_offset }} 天</van-tag>
+        <van-tag plain type="primary" round>{{ aiParsed.start_node }}-{{ aiParsed.end_node }} 节</van-tag>
+      </div>
+
       <!-- 结果网格 -->
       <div v-if="results.length > 0" class="results-section">
         <div class="results-grid">
@@ -345,6 +431,28 @@ async function search() {
 
 .form-section {
   position: relative;
+}
+
+.ai-query-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--color-brand-200);
+  background: linear-gradient(135deg, var(--color-brand-100), var(--color-surface-card));
+}
+
+.ai-query-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--color-brand-500);
+}
+
+.ai-query-card :deep(.van-field) {
+  border-radius: 10px;
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-surface-card);
 }
 
 .form-label {
@@ -419,6 +527,17 @@ async function search() {
   font-size: 13px;
   color: var(--color-text-secondary);
   margin-top: 16px;
+}
+
+.ai-parsed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
 }
 
 .results-section {

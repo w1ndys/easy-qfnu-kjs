@@ -89,12 +89,19 @@ func main() {
 
 	// 初始化公告服务（复用 StatsService 的 SQLite 连接，生命周期由 StatsService 管理）
 	var announcementService *service.AnnouncementService
+	var apiConfigService *service.APIConfigService
 	if statsService != nil {
 		as, err := service.NewAnnouncementService(statsService.DB())
 		if err != nil {
 			logger.Warn("初始化公告服务失败：%v。公告功能将不可用。", err)
 		} else {
 			announcementService = as
+		}
+		acs, err := service.NewAPIConfigService(statsService.DB())
+		if err != nil {
+			logger.Warn("初始化开放接口配置服务失败：%v。开放接口功能将不可用。", err)
+		} else {
+			apiConfigService = acs
 		}
 	}
 
@@ -123,10 +130,10 @@ func main() {
 
 	var adminHandler *v1.AdminHandler
 	if announcementService != nil && adminUser != "" && adminPass != "" {
-		adminHandler = v1.NewAdminHandler(announcementService, jwtManager, adminUser, adminPass)
+		adminHandler = v1.NewAdminHandler(announcementService, apiConfigService, jwtManager, adminUser, adminPass)
 	}
 
-	apiHandler := v1.NewHandler(classroomService, statsService)
+	apiHandler := v1.NewHandler(classroomService, statsService, apiConfigService)
 
 	// 3. 设置 Gin
 	r := gin.Default()
@@ -143,7 +150,10 @@ func main() {
 	{
 		api.GET("/status", apiHandler.GetStatus)
 		api.POST("/query", searchRateLimiter.Middleware(), apiHandler.QueryClassrooms)
+		api.POST("/ai-query", searchRateLimiter.Middleware(), apiHandler.AIQueryClassrooms)
 		api.POST("/query-full-day", searchRateLimiter.Middleware(), apiHandler.QueryFullDayStatus)
+		api.POST("/open/query", apiHandler.OpenQueryClassrooms)
+		api.POST("/open/ai-query", apiHandler.OpenAIQueryClassrooms)
 		api.GET("/stats", apiHandler.GetStats)
 		api.GET("/top-buildings", apiHandler.GetTopBuildings)
 		api.GET("/dashboard", apiHandler.GetDashboard)
@@ -165,6 +175,9 @@ func main() {
 			admin.POST("/announcements", adminHandler.CreateAnnouncement)
 			admin.PUT("/announcements/:id", adminHandler.UpdateAnnouncement)
 			admin.DELETE("/announcements/:id", adminHandler.DeleteAnnouncement)
+			admin.GET("/api-config", adminHandler.GetAPIConfig)
+			admin.PUT("/api-config", adminHandler.UpdateAPIConfig)
+			admin.GET("/ai-models", adminHandler.ListAIModels)
 		}
 	}
 

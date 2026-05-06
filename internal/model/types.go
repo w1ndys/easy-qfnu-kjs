@@ -8,6 +8,27 @@ type QueryRequest struct {
 	DateOffset   int    `json:"date_offset"` // 日期偏移 (0=今天, 1=明天...)
 }
 
+// AIQueryRequest 自然语言查询请求
+type AIQueryRequest struct {
+	Text string `json:"text" binding:"required"` // 自然语言描述
+}
+
+// AIParsedQuery AI 解析出的查询参数
+type AIParsedQuery struct {
+	BuildingName string `json:"building"`
+	DateOffset   int    `json:"date_offset"`
+	StartNode    string `json:"start_node"`
+	EndNode      string `json:"end_node"`
+	Confidence   string `json:"confidence"`
+	Reason       string `json:"reason"`
+}
+
+// AIQueryResponse 自然语言查询响应
+type AIQueryResponse struct {
+	Parsed AIParsedQuery      `json:"parsed"`
+	Result *ClassroomResponse `json:"result"`
+}
+
 // ClassroomResponse 返回给前端的响应
 type ClassroomResponse struct {
 	Date       string   `json:"date"`        // 查询日期 (YYYY-MM-DD)
@@ -208,6 +229,20 @@ type AdminLoginRequest struct {
 // AdminLoginResponse 管理员登录响应
 type AdminLoginResponse struct {
 	Token string `json:"token"`
+}
+
+// APIConfig 管理后台 AI 与开放接口配置
+type APIConfig struct {
+	AIBaseURL      string `json:"ai_base_url"`
+	AIKey          string `json:"ai_key"`
+	AIModel        string `json:"ai_model"`
+	OpenAPIEnabled bool   `json:"open_api_enabled"`
+	OpenAPIKey     string `json:"open_api_key"`
+}
+
+// AIModelsResponse OpenAI 兼容模型列表响应
+type AIModelsResponse struct {
+	Models []string `json:"models"`
 }
 
 // FullDayStatusResponse 全天状态查询响应
