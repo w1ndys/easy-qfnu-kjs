@@ -9,9 +9,12 @@
 ## 开发命令
 - **初始化模块**: `go mod init github.com/W1ndys/easy-qfnu-kjs` (如果是重新开始)
 - **依赖管理**: `go get github.com/PuerkitoBio/goquery` (用于 HTML 解析)
-- **运行**: `go run .`
+- **运行后端**: `go run .`
 - **测试**: `go test ./...`
-- **构建**: `go build -v ./...`
+- **构建后端**: `go build -v ./...`
+- **前端开发**: `cd frontend && npm run dev`
+- **前端构建**: `cd frontend && npm run build`
+- **前端技术栈**: Vue 3 + Vue Router 4 + Vant 4 + Axios + ECharts 6 + Vite 7
 
 ## 架构与逻辑
 核心功能实现了 QFNU CAS 登录流程。
