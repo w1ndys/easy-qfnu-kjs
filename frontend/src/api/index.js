@@ -20,6 +20,11 @@ export async function queryClassrooms(params) {
   return data
 }
 
+export async function queryClassroomsByAI(text) {
+  const { data } = await api.post('/api/v1/ai-query', { text })
+  return data
+}
+
 export async function queryFullDayStatus(params) {
   const { data } = await api.post('/api/v1/query-full-day', params)
   return data
@@ -104,6 +109,21 @@ export async function adminUpdateAnnouncement(id, payload) {
 
 export async function adminDeleteAnnouncement(id) {
   const { data } = await adminApi.delete(`/api/v1/admin/announcements/${id}`)
+  return data
+}
+
+export async function adminGetAPIConfig() {
+  const { data } = await adminApi.get('/api/v1/admin/api-config')
+  return data
+}
+
+export async function adminUpdateAPIConfig(payload) {
+  const { data } = await adminApi.put('/api/v1/admin/api-config', payload)
+  return data
+}
+
+export async function adminGetAIModels() {
+  const { data } = await adminApi.get('/api/v1/admin/ai-models')
   return data
 }
 

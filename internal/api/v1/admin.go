@@ -14,6 +14,7 @@ import (
 // AdminHandler 管理后台 API 处理器
 type AdminHandler struct {
 	announcementService *service.AnnouncementService
+	apiConfigService    *service.APIConfigService
 	jwtManager          *jwt.Manager
 	adminUsername       string
 	adminPassword       string
@@ -22,11 +23,13 @@ type AdminHandler struct {
 // NewAdminHandler 创建管理后台处理器
 func NewAdminHandler(
 	as *service.AnnouncementService,
+	acs *service.APIConfigService,
 	jm *jwt.Manager,
 	username, password string,
 ) *AdminHandler {
 	return &AdminHandler{
 		announcementService: as,
+		apiConfigService:    acs,
 		jwtManager:          jm,
 		adminUsername:       username,
 		adminPassword:       password,
@@ -128,6 +131,58 @@ func (h *AdminHandler) DeleteAnnouncement(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
+
+// GetAPIConfig 获取 AI 与开放接口配置。
+func (h *AdminHandler) GetAPIConfig(c *gin.Context) {
+	if h.apiConfigService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "开放接口配置服务未初始化"})
+		return
+	}
+	cfg, err := h.apiConfigService.Get()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取开放接口配置失败"})
+		return
+	}
+	c.JSON(http.StatusOK, cfg)
+}
+
+// UpdateAPIConfig 保存 AI 与开放接口配置。
+func (h *AdminHandler) UpdateAPIConfig(c *gin.Context) {
+	if h.apiConfigService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "开放接口配置服务未初始化"})
+		return
+	}
+	var req model.APIConfig
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数格式错误"})
+		return
+	}
+	if req.OpenAPIEnabled && req.OpenAPIKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "启用开放接口时必须配置授权 Key"})
+		return
+	}
+
+	cfg, err := h.apiConfigService.Update(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存开放接口配置失败"})
+		return
+	}
+	c.JSON(http.StatusOK, cfg)
+}
+
+// ListAIModels 从 OpenAI 兼容接口获取模型列表。
+func (h *AdminHandler) ListAIModels(c *gin.Context) {
+	if h.apiConfigService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "开放接口配置服务未初始化"})
+		return
+	}
+	models, err := h.apiConfigService.ListModels(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, model.AIModelsResponse{Models: models})
 }
 
 // ---- 前台公开接口 ----
