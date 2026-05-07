@@ -122,6 +122,11 @@ export async function adminUpdateAPIConfig(payload) {
   return data
 }
 
+export async function adminResetAIPrompt() {
+  const { data } = await adminApi.post('/api/v1/admin/api-config/ai-prompt/default')
+  return data
+}
+
 export async function adminGetAIModels() {
   const { data } = await adminApi.get('/api/v1/admin/ai-models')
   return data

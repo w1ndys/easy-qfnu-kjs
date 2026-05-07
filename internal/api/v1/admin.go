@@ -171,6 +171,20 @@ func (h *AdminHandler) UpdateAPIConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, cfg)
 }
 
+// ResetAIPrompt 恢复 AI 解析提示词为系统内置默认值。
+func (h *AdminHandler) ResetAIPrompt(c *gin.Context) {
+	if h.apiConfigService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "开放接口配置服务未初始化"})
+		return
+	}
+	cfg, err := h.apiConfigService.ResetAIPrompt()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "恢复默认 AI 提示词失败"})
+		return
+	}
+	c.JSON(http.StatusOK, cfg)
+}
+
 // ListAIModels 从 OpenAI 兼容接口获取模型列表。
 func (h *AdminHandler) ListAIModels(c *gin.Context) {
 	if h.apiConfigService == nil {

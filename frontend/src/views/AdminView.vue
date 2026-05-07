@@ -9,6 +9,7 @@ import {
   adminDeleteAnnouncement,
   adminGetAPIConfig,
   adminUpdateAPIConfig,
+  adminResetAIPrompt,
   adminGetAIModels,
   getErrorMessage,
 } from '@/api'
@@ -30,6 +31,9 @@ const configForm = ref({
   ai_base_url: '',
   ai_key: '',
   ai_model: '',
+  ai_prompt: '',
+  default_ai_prompt: '',
+  ai_prompt_overridden: false,
   open_api_enabled: false,
   open_api_key: '',
 })
@@ -116,6 +120,26 @@ async function saveConfig() {
   } finally {
     configSaving.value = false
   }
+}
+
+async function resetAIPrompt() {
+  try {
+    await showConfirmDialog({ title: '恢复默认提示词', message: '确定恢复系统内置的 AI 解析提示词吗？' })
+    configSaving.value = true
+    error.value = ''
+    configForm.value = await adminResetAIPrompt()
+    showToast({ message: '已恢复默认提示词', type: 'success' })
+  } catch (e) {
+    if (e !== 'cancel') {
+      error.value = getErrorMessage(e, '恢复默认提示词失败')
+    }
+  } finally {
+    configSaving.value = false
+  }
+}
+
+function fillDefaultAIPrompt() {
+  configForm.value.ai_prompt = configForm.value.default_ai_prompt || ''
 }
 
 async function fetchModels() {
@@ -265,58 +289,95 @@ onMounted(() => {
               <van-button size="small" plain type="primary" :loading="modelLoading" @click="fetchModels">获取模型</van-button>
             </div>
             <van-form @submit="saveConfig">
-              <van-cell-group inset>
-                <van-field v-model="configForm.ai_base_url" label="BaseURL" placeholder="https://api.openai.com 或兼容地址" />
-                <van-field v-model="configForm.ai_key" label="Key" type="password" placeholder="请输入 API Key" />
-                <van-field
-                  v-if="modelOptions.length === 0"
-                  v-model="configForm.ai_model"
-                  label="Model"
-                  placeholder="例如 gpt-4o-mini"
-                />
-                <van-field v-else label="Model">
-                  <template #input>
-                    <van-dropdown-menu class="model-menu">
-                      <van-dropdown-item v-model="configForm.ai_model" :options="modelOptions" />
-                    </van-dropdown-menu>
-                  </template>
-                </van-field>
-              </van-cell-group>
-
-              <div class="section-header open-api-title">
-                <div>
-                  <h2>开放接口控制面板</h2>
-                  <p>外部调用使用授权 Key，不受前台高频限制影响。</p>
-                </div>
-              </div>
-              <van-cell-group inset>
-                <van-cell title="启用开放接口">
-                  <template #right-icon>
-                    <van-switch v-model="configForm.open_api_enabled" size="20" />
-                  </template>
-                </van-cell>
-                <van-field v-model="configForm.open_api_key" label="授权 Key" placeholder="点击随机生成或手动输入">
-                  <template #button>
-                    <van-button size="small" type="primary" plain native-type="button" @click="generateOpenAPIKey">随机生成</van-button>
-                  </template>
-                </van-field>
-              </van-cell-group>
-
-              <div class="api-docs">
-                <p>直接查询：POST /api/v1/open/query</p>
-                <p>AI 查询：POST /api/v1/open/ai-query</p>
-                <p>请求头：X-API-Key: {{ configForm.open_api_key || 'your-key' }}</p>
-              </div>
-
-              <div class="doc-example">
-                <div class="doc-example-header">
-                  <div>
-                    <h3>Python 调用示例</h3>
-                    <p>用于参考文档，可直接替换域名与参数后调用开放接口。</p>
+              <div class="api-config-grid">
+                <div class="config-card">
+                  <div class="config-card-header">
+                    <h3>模型连接</h3>
+                    <p>OpenAI 兼容接口地址、Key 与模型。</p>
                   </div>
-                  <van-button size="small" type="primary" plain icon="description-o" native-type="button" @click="copyPythonExample">复制代码</van-button>
+                  <van-cell-group inset>
+                    <van-field v-model="configForm.ai_base_url" label="BaseURL" placeholder="https://api.openai.com 或兼容地址" />
+                    <van-field v-model="configForm.ai_key" label="Key" type="password" placeholder="请输入 API Key" />
+                    <van-field
+                      v-if="modelOptions.length === 0"
+                      v-model="configForm.ai_model"
+                      label="Model"
+                      placeholder="例如 gpt-4o-mini"
+                    />
+                    <van-field v-else label="Model">
+                      <template #input>
+                        <van-dropdown-menu class="model-menu">
+                          <van-dropdown-item v-model="configForm.ai_model" :options="modelOptions" />
+                        </van-dropdown-menu>
+                      </template>
+                    </van-field>
+                  </van-cell-group>
                 </div>
-                <pre><code>{{ pythonExample }}</code></pre>
+
+                <div class="config-card prompt-card">
+                  <div class="config-card-header prompt-card-header">
+                    <div>
+                      <h3>AI 解析提示词</h3>
+                      <p>系统内置默认提示词，保存自定义内容后会覆盖默认值。</p>
+                    </div>
+                    <van-tag :type="configForm.ai_prompt_overridden ? 'warning' : 'success'" round>
+                      {{ configForm.ai_prompt_overridden ? '自定义覆盖' : '系统默认' }}
+                    </van-tag>
+                  </div>
+                  <van-cell-group inset>
+                    <van-field
+                      v-model="configForm.ai_prompt"
+                      label="提示词"
+                      type="textarea"
+                      rows="10"
+                      autosize
+                      placeholder="请输入 AI 解析提示词"
+                      :rules="[{ required: true, message: '请输入 AI 解析提示词' }]"
+                    />
+                  </van-cell-group>
+                  <div class="prompt-actions">
+                    <van-button size="small" plain native-type="button" @click="fillDefaultAIPrompt">填入默认</van-button>
+                    <van-button size="small" plain type="primary" native-type="button" :loading="configSaving" @click="resetAIPrompt">
+                      恢复默认
+                    </van-button>
+                  </div>
+                </div>
+
+                <div class="config-card">
+                  <div class="config-card-header">
+                    <h3>开放接口控制面板</h3>
+                    <p>外部调用使用授权 Key，不受前台高频限制影响。</p>
+                  </div>
+                  <van-cell-group inset>
+                    <van-cell title="启用开放接口">
+                      <template #right-icon>
+                        <van-switch v-model="configForm.open_api_enabled" size="20" />
+                      </template>
+                    </van-cell>
+                    <van-field v-model="configForm.open_api_key" label="授权 Key" placeholder="点击随机生成或手动输入">
+                      <template #button>
+                        <van-button size="small" type="primary" plain native-type="button" @click="generateOpenAPIKey">随机生成</van-button>
+                      </template>
+                    </van-field>
+                  </van-cell-group>
+
+                  <div class="api-docs">
+                    <p>直接查询：POST /api/v1/open/query</p>
+                    <p>AI 查询：POST /api/v1/open/ai-query</p>
+                    <p>请求头：X-API-Key: {{ configForm.open_api_key || 'your-key' }}</p>
+                  </div>
+                </div>
+
+                <div class="doc-example">
+                  <div class="doc-example-header">
+                    <div>
+                      <h3>Python 调用示例</h3>
+                      <p>用于参考文档，可直接替换域名与参数后调用开放接口。</p>
+                    </div>
+                    <van-button size="small" type="primary" plain icon="description-o" native-type="button" @click="copyPythonExample">复制代码</van-button>
+                  </div>
+                  <pre><code>{{ pythonExample }}</code></pre>
+                </div>
               </div>
 
               <div class="form-actions compact-actions">
@@ -409,7 +470,7 @@ onMounted(() => {
 
 <style scoped>
 .admin-content {
-  max-width: 1180px;
+  max-width: 1440px;
 }
 
 .admin-header {
@@ -451,8 +512,8 @@ onMounted(() => {
 
 .admin-shell {
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr);
-  gap: 18px;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 20px;
   align-items: flex-start;
 }
 
@@ -502,7 +563,7 @@ onMounted(() => {
 
 .admin-panel {
   min-width: 0;
-  padding: 18px 0;
+  padding: 18px;
 }
 
 .tab-panel {
@@ -514,7 +575,7 @@ onMounted(() => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  padding: 0 16px 12px;
+  padding: 0 0 16px;
 }
 
 .section-header h2 {
@@ -530,8 +591,54 @@ onMounted(() => {
   color: var(--color-text-tertiary);
 }
 
-.open-api-title {
-  padding-top: 16px;
+.api-config-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.82fr) minmax(420px, 1.18fr);
+  gap: 16px;
+  align-items: stretch;
+}
+
+.config-card {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 16px;
+  background: var(--color-surface-card);
+}
+
+.config-card-header {
+  margin-bottom: 12px;
+}
+
+.config-card-header h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  color: var(--color-text-primary);
+}
+
+.config-card-header p {
+  margin: 0;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.prompt-card {
+  grid-row: span 2;
+}
+
+.prompt-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.prompt-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 0 0;
 }
 
 .model-menu {
@@ -544,7 +651,7 @@ onMounted(() => {
 }
 
 .api-docs {
-  margin: 12px 16px 0;
+  margin: 12px 0 0;
   padding: 10px 12px;
   border-radius: 10px;
   background: var(--color-surface-muted);
@@ -559,7 +666,8 @@ onMounted(() => {
 }
 
 .doc-example {
-  margin: 14px 16px 0;
+  min-width: 0;
+  margin: 0;
   border: 1px solid var(--color-border-subtle);
   border-radius: 14px;
   background: #15110E;
@@ -597,6 +705,7 @@ onMounted(() => {
   font-size: 12px;
   line-height: 1.7;
   tab-size: 4;
+  max-height: 360px;
 }
 
 .doc-example code {
@@ -604,7 +713,7 @@ onMounted(() => {
 }
 
 .compact-actions {
-  padding-bottom: 0;
+  padding: 16px 0 0;
 }
 
 .form-popup {
@@ -633,8 +742,8 @@ onMounted(() => {
 }
 
 .announcement-list {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 12px;
 }
 
@@ -707,12 +816,35 @@ onMounted(() => {
 @media (max-width: 640px) {
   .admin-header,
   .section-header,
-  .doc-example-header {
+  .doc-example-header,
+  .prompt-card-header {
     flex-direction: column;
   }
 
   .admin-shell {
     display: block;
+  }
+
+  .admin-panel {
+    padding: 16px 0;
+  }
+
+  .api-config-grid,
+  .announcement-list {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .config-card {
+    padding: 14px 0;
+    border-width: 1px 0;
+    border-radius: 0;
+  }
+
+  .api-docs,
+  .doc-example {
+    margin-right: 16px;
+    margin-left: 16px;
   }
 
   .admin-tabs {
