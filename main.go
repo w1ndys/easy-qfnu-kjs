@@ -177,6 +177,7 @@ func main() {
 			admin.DELETE("/announcements/:id", adminHandler.DeleteAnnouncement)
 			admin.GET("/api-config", adminHandler.GetAPIConfig)
 			admin.PUT("/api-config", adminHandler.UpdateAPIConfig)
+			admin.POST("/api-config/ai-prompt/default", adminHandler.ResetAIPrompt)
 			admin.GET("/ai-models", adminHandler.ListAIModels)
 		}
 	}

@@ -9,6 +9,7 @@ import {
   adminDeleteAnnouncement,
   adminGetAPIConfig,
   adminUpdateAPIConfig,
+  adminResetAIPrompt,
   adminGetAIModels,
   getErrorMessage,
 } from '@/api'
@@ -30,6 +31,9 @@ const configForm = ref({
   ai_base_url: '',
   ai_key: '',
   ai_model: '',
+  ai_prompt: '',
+  default_ai_prompt: '',
+  ai_prompt_overridden: false,
   open_api_enabled: false,
   open_api_key: '',
 })
@@ -116,6 +120,26 @@ async function saveConfig() {
   } finally {
     configSaving.value = false
   }
+}
+
+async function resetAIPrompt() {
+  try {
+    await showConfirmDialog({ title: '恢复默认提示词', message: '确定恢复系统内置的 AI 解析提示词吗？' })
+    configSaving.value = true
+    error.value = ''
+    configForm.value = await adminResetAIPrompt()
+    showToast({ message: '已恢复默认提示词', type: 'success' })
+  } catch (e) {
+    if (e !== 'cancel') {
+      error.value = getErrorMessage(e, '恢复默认提示词失败')
+    }
+  } finally {
+    configSaving.value = false
+  }
+}
+
+function fillDefaultAIPrompt() {
+  configForm.value.ai_prompt = configForm.value.default_ai_prompt || ''
 }
 
 async function fetchModels() {
@@ -282,6 +306,33 @@ onMounted(() => {
                   </template>
                 </van-field>
               </van-cell-group>
+
+              <div class="section-header ai-prompt-title">
+                <div>
+                  <h2>AI 解析提示词</h2>
+                  <p>系统内置默认提示词，保存自定义内容后会覆盖默认值。</p>
+                </div>
+                <van-tag :type="configForm.ai_prompt_overridden ? 'warning' : 'success'" round>
+                  {{ configForm.ai_prompt_overridden ? '自定义覆盖' : '系统默认' }}
+                </van-tag>
+              </div>
+              <van-cell-group inset>
+                <van-field
+                  v-model="configForm.ai_prompt"
+                  label="提示词"
+                  type="textarea"
+                  rows="8"
+                  autosize
+                  placeholder="请输入 AI 解析提示词"
+                  :rules="[{ required: true, message: '请输入 AI 解析提示词' }]"
+                />
+              </van-cell-group>
+              <div class="prompt-actions">
+                <van-button size="small" plain native-type="button" @click="fillDefaultAIPrompt">填入默认</van-button>
+                <van-button size="small" plain type="primary" native-type="button" :loading="configSaving" @click="resetAIPrompt">
+                  恢复默认
+                </van-button>
+              </div>
 
               <div class="section-header open-api-title">
                 <div>
@@ -530,8 +581,16 @@ onMounted(() => {
   color: var(--color-text-tertiary);
 }
 
-.open-api-title {
+.open-api-title,
+.ai-prompt-title {
   padding-top: 16px;
+}
+
+.prompt-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 16px 0;
 }
 
 .model-menu {

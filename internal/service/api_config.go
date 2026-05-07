@@ -17,6 +17,8 @@ import (
 	"github.com/W1ndys/easy-qfnu-kjs/pkg/logger"
 )
 
+const defaultAIParsePrompt = `你是曲阜师范大学空教室查询参数解析器。请只返回 JSON，不要返回 Markdown。字段必须为 building、date_offset、start_node、end_node、confidence、reason。building 是教学楼名称，date_offset 是目标日期相对今天的整数偏移，今天为 0，明天为 1，后天为 2；start_node 和 end_node 是两位字符串 01 到 11。confidence 只能是 high 或 low。若描述缺少教学楼、日期或节次范围，confidence 必须为 low，并在 reason 中说明缺少什么。`
+
 // APIConfigService 管理 AI 解析与开放 API 配置。
 type APIConfigService struct {
 	db *sql.DB
@@ -38,6 +40,7 @@ func migrateAPIConfigSchema(db *sql.DB) error {
 			ai_base_url TEXT NOT NULL DEFAULT '',
 			ai_key TEXT NOT NULL DEFAULT '',
 			ai_model TEXT NOT NULL DEFAULT '',
+			ai_prompt_override TEXT NOT NULL DEFAULT '',
 			open_api_enabled INTEGER NOT NULL DEFAULT 0,
 			open_api_key TEXT NOT NULL DEFAULT '',
 			updated_at DATETIME DEFAULT (datetime('now', 'localtime'))
@@ -46,6 +49,42 @@ func migrateAPIConfigSchema(db *sql.DB) error {
 	`)
 	if err != nil {
 		return fmt.Errorf("创建 api_config 表失败: %w", err)
+	}
+	if err := ensureAPIConfigColumn(db, "ai_prompt_override", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureAPIConfigColumn(db *sql.DB, name, definition string) error {
+	rows, err := db.Query(`PRAGMA table_info(api_config)`)
+	if err != nil {
+		return fmt.Errorf("读取 api_config 表结构失败: %w", err)
+	}
+
+	for rows.Next() {
+		var cid int
+		var columnName, columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &columnName, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("解析 api_config 表结构失败: %w", err)
+		}
+		if columnName == name {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("遍历 api_config 表结构失败: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("关闭 api_config 表结构查询失败: %w", err)
+	}
+
+	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE api_config ADD COLUMN %s %s", name, definition)); err != nil {
+		return fmt.Errorf("迁移 api_config.%s 字段失败: %w", name, err)
 	}
 	return nil
 }
@@ -59,12 +98,19 @@ func (s *APIConfigService) Get() (*model.APIConfig, error) {
 func (s *APIConfigService) getLocked() (*model.APIConfig, error) {
 	var cfg model.APIConfig
 	var enabled int
+	var promptOverride string
 	err := s.db.QueryRow(`
-		SELECT ai_base_url, ai_key, ai_model, open_api_enabled, open_api_key
+		SELECT ai_base_url, ai_key, ai_model, ai_prompt_override, open_api_enabled, open_api_key
 		FROM api_config WHERE id = 1
-	`).Scan(&cfg.AIBaseURL, &cfg.AIKey, &cfg.AIModel, &enabled, &cfg.OpenAPIKey)
+	`).Scan(&cfg.AIBaseURL, &cfg.AIKey, &cfg.AIModel, &promptOverride, &enabled, &cfg.OpenAPIKey)
 	if err != nil {
 		return nil, fmt.Errorf("读取开放接口配置失败: %w", err)
+	}
+	cfg.DefaultAIPrompt = defaultAIParsePrompt
+	cfg.AIPrompt = defaultAIParsePrompt
+	if promptOverride != "" {
+		cfg.AIPrompt = promptOverride
+		cfg.AIPromptOverridden = true
 	}
 	cfg.OpenAPIEnabled = enabled != 0
 	return &cfg, nil
@@ -77,7 +123,12 @@ func (s *APIConfigService) Update(cfg model.APIConfig) (*model.APIConfig, error)
 	cfg.AIBaseURL = strings.TrimSpace(cfg.AIBaseURL)
 	cfg.AIKey = strings.TrimSpace(cfg.AIKey)
 	cfg.AIModel = strings.TrimSpace(cfg.AIModel)
+	cfg.AIPrompt = strings.TrimSpace(cfg.AIPrompt)
 	cfg.OpenAPIKey = strings.TrimSpace(cfg.OpenAPIKey)
+	promptOverride := cfg.AIPrompt
+	if promptOverride == "" || promptOverride == defaultAIParsePrompt {
+		promptOverride = ""
+	}
 	enabled := 0
 	if cfg.OpenAPIEnabled {
 		enabled = 1
@@ -85,11 +136,27 @@ func (s *APIConfigService) Update(cfg model.APIConfig) (*model.APIConfig, error)
 
 	_, err := s.db.Exec(`
 		UPDATE api_config
-		SET ai_base_url = ?, ai_key = ?, ai_model = ?, open_api_enabled = ?, open_api_key = ?, updated_at = datetime('now', 'localtime')
+		SET ai_base_url = ?, ai_key = ?, ai_model = ?, ai_prompt_override = ?, open_api_enabled = ?, open_api_key = ?, updated_at = datetime('now', 'localtime')
 		WHERE id = 1
-	`, cfg.AIBaseURL, cfg.AIKey, cfg.AIModel, enabled, cfg.OpenAPIKey)
+	`, cfg.AIBaseURL, cfg.AIKey, cfg.AIModel, promptOverride, enabled, cfg.OpenAPIKey)
 	if err != nil {
 		return nil, fmt.Errorf("保存开放接口配置失败: %w", err)
+	}
+
+	return s.getLocked()
+}
+
+func (s *APIConfigService) ResetAIPrompt() (*model.APIConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		UPDATE api_config
+		SET ai_prompt_override = '', updated_at = datetime('now', 'localtime')
+		WHERE id = 1
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("恢复默认 AI 提示词失败: %w", err)
 	}
 
 	return s.getLocked()
@@ -159,11 +226,10 @@ func (s *APIConfigService) ParseNaturalLanguage(ctx context.Context, text string
 		return nil, fmt.Errorf("AI 配置不完整，请先配置 BaseURL、Key 和 Model")
 	}
 
-	prompt := `你是曲阜师范大学空教室查询参数解析器。请只返回 JSON，不要返回 Markdown。字段必须为 building、date_offset、start_node、end_node、confidence、reason。building 是教学楼名称，date_offset 是目标日期相对今天的整数偏移，今天为 0，明天为 1，后天为 2；start_node 和 end_node 是两位字符串 01 到 11。confidence 只能是 high 或 low。若描述缺少教学楼、日期或节次范围，confidence 必须为 low，并在 reason 中说明缺少什么。`
 	payload := map[string]any{
 		"model": cfg.AIModel,
 		"messages": []map[string]string{
-			{"role": "system", "content": prompt},
+			{"role": "system", "content": cfg.AIPrompt},
 			{"role": "user", "content": strings.TrimSpace(text)},
 		},
 		"temperature": 0,

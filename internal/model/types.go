@@ -233,11 +233,14 @@ type AdminLoginResponse struct {
 
 // APIConfig 管理后台 AI 与开放接口配置
 type APIConfig struct {
-	AIBaseURL      string `json:"ai_base_url"`
-	AIKey          string `json:"ai_key"`
-	AIModel        string `json:"ai_model"`
-	OpenAPIEnabled bool   `json:"open_api_enabled"`
-	OpenAPIKey     string `json:"open_api_key"`
+	AIBaseURL          string `json:"ai_base_url"`
+	AIKey              string `json:"ai_key"`
+	AIModel            string `json:"ai_model"`
+	AIPrompt           string `json:"ai_prompt"`
+	DefaultAIPrompt    string `json:"default_ai_prompt"`
+	AIPromptOverridden bool   `json:"ai_prompt_overridden"`
+	OpenAPIEnabled     bool   `json:"open_api_enabled"`
+	OpenAPIKey         string `json:"open_api_key"`
 }
 
 // AIModelsResponse OpenAI 兼容模型列表响应
