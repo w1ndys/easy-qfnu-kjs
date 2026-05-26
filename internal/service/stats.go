@@ -57,10 +57,12 @@ func NewStatsService(dbPath string) (*StatsService, error) {
 		return nil, fmt.Errorf("设置 busy_timeout 失败: %w", err)
 	}
 
-	// 限制连接池：SQLite 是文件级数据库，多连接写入会导致锁冲突
-	// 设置最大打开连接数为 1，确保写入串行化
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// 连接池配置：SQLite 在 WAL 模式下支持"多读单写"，写入冲突由 busy_timeout 处理。
+	// 不能将 MaxOpenConns 设为 1：GetDashboardData 内部用 6 个 goroutine 并发查询，
+	// 单连接会导致 goroutine 互相等连接 + 主协程 wg.Wait() 永久阻塞，整个连接池死锁。
+	// 应用层各 Service 的 mu sync.Mutex 已经为同一服务内的写入提供串行化。
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(0)
 
 	// 执行迁移
