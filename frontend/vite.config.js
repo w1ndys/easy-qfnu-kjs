@@ -3,16 +3,17 @@ import vue from '@vitejs/plugin-vue'
 import Components from 'unplugin-vue-components/vite'
 import AutoImport from 'unplugin-auto-import/vite'
 import { VantResolver } from '@vant/auto-import-resolver'
+import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 import { fileURLToPath, URL } from 'node:url'
 
 export default defineConfig({
   plugins: [
     vue(),
     AutoImport({
-      resolvers: [VantResolver()],
+      resolvers: [VantResolver(), ElementPlusResolver()],
     }),
     Components({
-      resolvers: [VantResolver()],
+      resolvers: [VantResolver(), ElementPlusResolver()],
     }),
   ],
   resolve: {
@@ -38,6 +39,7 @@ export default defineConfig({
         manualChunks(id) {
           if (id.includes('node_modules')) {
             if (id.includes('echarts') || id.includes('vue-echarts')) return 'vendor-echarts'
+            if (id.includes('element-plus') || id.includes('@element-plus/icons-vue')) return 'vendor-element'
             if (id.includes('vant')) return 'vendor-vant'
             if (id.includes('vue') || id.includes('vue-router')) return 'vendor-vue'
             if (id.includes('axios')) return 'vendor-axios'

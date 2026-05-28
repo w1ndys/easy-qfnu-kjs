@@ -50,6 +50,16 @@
   --color-error-fg: #B42318;
   --color-info-bg: #ECF3FF;
   --color-info-fg: #1D4ED8;
+
+  /* Element Plus 主题色覆盖（仅后台使用） */
+  --el-color-primary: #884F22;
+  --el-color-primary-light-3: #A67C52;
+  --el-color-primary-light-5: #C4956A;
+  --el-color-primary-light-7: #E7CFBA;
+  --el-color-primary-light-8: #F0DBC6;
+  --el-color-primary-light-9: #F8EDE0;
+  --el-color-primary-dark-2: #5F3517;
+  --el-border-radius-base: 8px;
 }
 
 /* ===== 暗色模式 ===== */

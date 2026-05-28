@@ -1,7 +1,22 @@
 <script setup>
 import { computed, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { showConfirmDialog, showToast } from 'vant'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  Setting,
+  Bell,
+  Plus,
+  Edit,
+  Delete,
+  RefreshRight,
+  CopyDocument,
+  Key,
+  MagicStick,
+  Connection,
+  Document,
+  ArrowLeft,
+  SwitchButton,
+} from '@element-plus/icons-vue'
 import {
   adminGetAnnouncements,
   adminCreateAnnouncement,
@@ -22,6 +37,7 @@ const error = ref('')
 const showForm = ref(false)
 const editingId = ref(null)
 const form = ref({ title: '', content: '', important: false })
+const formRef = ref(null)
 const saving = ref(false)
 const configLoading = ref(false)
 const configSaving = ref(false)
@@ -38,10 +54,10 @@ const configForm = ref({
   open_api_key: '',
 })
 
-const tabItems = [
-  { key: 'api', label: '接口配置', desc: '大模型与开放接口' },
-  { key: 'announcements', label: '公告管理', desc: '维护首页公告' },
-]
+const formRules = {
+  title: [{ required: true, message: '请输入公告标题', trigger: 'blur' }],
+  content: [{ required: true, message: '请输入公告内容', trigger: 'blur' }],
+}
 
 const pythonExample = computed(() => {
   const apiKey = configForm.value.open_api_key || 'your-open-api-key'
@@ -114,7 +130,7 @@ async function saveConfig() {
   error.value = ''
   try {
     configForm.value = await adminUpdateAPIConfig(configForm.value)
-    showToast({ message: '配置已保存', type: 'success' })
+    ElMessage.success('配置已保存')
   } catch (e) {
     error.value = getErrorMessage(e, '保存开放接口配置失败')
   } finally {
@@ -124,15 +140,22 @@ async function saveConfig() {
 
 async function resetAIPrompt() {
   try {
-    await showConfirmDialog({ title: '恢复默认提示词', message: '确定恢复系统内置的 AI 解析提示词吗？' })
-    configSaving.value = true
-    error.value = ''
+    await ElMessageBox.confirm(
+      '确定恢复系统内置的 AI 解析提示词吗？',
+      '恢复默认提示词',
+      { confirmButtonText: '确定恢复', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+
+  configSaving.value = true
+  error.value = ''
+  try {
     configForm.value = await adminResetAIPrompt()
-    showToast({ message: '已恢复默认提示词', type: 'success' })
+    ElMessage.success('已恢复默认提示词')
   } catch (e) {
-    if (e !== 'cancel') {
-      error.value = getErrorMessage(e, '恢复默认提示词失败')
-    }
+    error.value = getErrorMessage(e, '恢复默认提示词失败')
   } finally {
     configSaving.value = false
   }
@@ -147,11 +170,11 @@ async function fetchModels() {
   error.value = ''
   try {
     const resp = await adminGetAIModels()
-    modelOptions.value = (resp.models || []).map((model) => ({ text: model, value: model }))
+    modelOptions.value = (resp.models || []).map((model) => ({ label: model, value: model }))
     if (!configForm.value.ai_model && modelOptions.value.length > 0) {
       configForm.value.ai_model = modelOptions.value[0].value
     }
-    showToast({ message: '模型列表已更新', type: 'success' })
+    ElMessage.success('模型列表已更新')
   } catch (e) {
     error.value = getErrorMessage(e, '获取模型列表失败')
   } finally {
@@ -168,9 +191,19 @@ function generateOpenAPIKey() {
 async function copyPythonExample() {
   try {
     await navigator.clipboard.writeText(pythonExample.value)
-    showToast({ message: 'Python 示例已复制', type: 'success' })
+    ElMessage.success('Python 示例已复制')
   } catch {
-    showToast({ message: '复制失败，请手动选择代码复制', type: 'fail' })
+    ElMessage.error('复制失败，请手动选择代码复制')
+  }
+}
+
+async function copyApiKey() {
+  if (!configForm.value.open_api_key) return
+  try {
+    await navigator.clipboard.writeText(configForm.value.open_api_key)
+    ElMessage.success('授权 Key 已复制')
+  } catch {
+    ElMessage.error('复制失败')
   }
 }
 
@@ -193,6 +226,13 @@ function cancelForm() {
 }
 
 async function handleSave() {
+  if (!formRef.value) return
+  try {
+    await formRef.value.validate()
+  } catch {
+    return
+  }
+
   saving.value = true
   error.value = ''
   try {
@@ -201,7 +241,7 @@ async function handleSave() {
     } else {
       await adminCreateAnnouncement(form.value)
     }
-    showToast({ message: '保存成功', type: 'success' })
+    ElMessage.success('保存成功')
     cancelForm()
     await fetchList()
   } catch (e) {
@@ -211,17 +251,24 @@ async function handleSave() {
   }
 }
 
-async function handleDelete(id) {
+async function handleDelete(item) {
   try {
-    await showConfirmDialog({ title: '确认删除', message: '确定要删除这条公告吗？' })
-    error.value = ''
-    await adminDeleteAnnouncement(id)
-    showToast({ message: '删除成功', type: 'success' })
+    await ElMessageBox.confirm(
+      `确定要删除公告「${item.title}」吗？`,
+      '确认删除',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+
+  error.value = ''
+  try {
+    await adminDeleteAnnouncement(item.id)
+    ElMessage.success('删除成功')
     await fetchList()
   } catch (e) {
-    if (e !== 'cancel') {
-      error.value = getErrorMessage(e, '删除失败')
-    }
+    error.value = getErrorMessage(e, '删除失败')
   }
 }
 
@@ -237,631 +284,571 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="page-container">
-    <div class="page-content admin-content">
-      <!-- 顶部栏 -->
-      <div class="admin-header">
-        <div class="header-left">
-          <van-icon name="setting-o" size="24" color="var(--color-brand-500)" />
-          <h1 class="admin-title">后台管理</h1>
+  <div class="admin-page">
+    <header class="admin-topbar">
+      <div class="admin-topbar-inner">
+        <div class="topbar-left">
+          <div class="topbar-logo">
+            <el-icon :size="22"><Setting /></el-icon>
+          </div>
+          <div>
+            <h1 class="admin-title">后台管理</h1>
+            <p class="admin-subtitle">系统配置 · 公告维护</p>
+          </div>
         </div>
-        <div class="header-right">
-          <router-link to="/" class="back-link">返回首页</router-link>
-          <van-button plain size="small" type="danger" @click="handleLogout">退出登录</van-button>
+        <div class="topbar-right">
+          <el-button :icon="ArrowLeft" plain @click="router.push('/')">返回首页</el-button>
+          <el-button :icon="SwitchButton" type="danger" plain @click="handleLogout">退出登录</el-button>
         </div>
       </div>
+    </header>
 
-      <!-- 错误提示 -->
-      <van-notice-bar
+    <main class="admin-main">
+      <el-alert
         v-if="error"
-        left-icon="warning-o"
-        :text="error"
-        color="var(--color-error-fg)"
-        background="var(--color-error-bg)"
-        :scrollable="false"
-        closeable
-        class="error-bar"
+        :title="error"
+        type="error"
+        show-icon
+        closable
+        class="admin-error"
         @close="error = ''"
       />
 
-      <div class="admin-shell">
-        <aside class="admin-tabs app-card">
-          <button
-            v-for="tab in tabItems"
-            :key="tab.key"
-            type="button"
-            class="tab-button"
-            :class="{ active: activeTab === tab.key }"
-            @click="activeTab = tab.key"
+      <el-tabs v-model="activeTab" class="admin-tabs" type="border-card">
+        <el-tab-pane name="api">
+          <template #label>
+            <span class="tab-label"><el-icon><Connection /></el-icon>接口配置</span>
+          </template>
+
+          <el-form
+            label-position="top"
+            class="config-form"
+            v-loading="configLoading"
+            @submit.prevent="saveConfig"
           >
-            <span class="tab-label">{{ tab.label }}</span>
-            <span class="tab-desc">{{ tab.desc }}</span>
-          </button>
-        </aside>
-
-        <main class="admin-panel app-card">
-          <section v-show="activeTab === 'api'" class="tab-panel">
-            <div class="section-header">
-              <div>
-                <h2>大模型 API 配置</h2>
-                <p>支持 OpenAI 兼容接口，用于自然语言解析查询条件。</p>
-              </div>
-              <van-button size="small" plain type="primary" :loading="modelLoading" @click="fetchModels">获取模型</van-button>
-            </div>
-            <van-form @submit="saveConfig">
-              <div class="api-config-grid">
-                <div class="config-card">
-                  <div class="config-card-header">
-                    <h3>模型连接</h3>
-                    <p>OpenAI 兼容接口地址、Key 与模型。</p>
+            <div class="config-grid">
+              <el-card class="config-card" shadow="never">
+                <template #header>
+                  <div class="card-head">
+                    <div>
+                      <h3>模型连接</h3>
+                      <p class="card-desc">OpenAI 兼容接口地址、Key 与模型</p>
+                    </div>
+                    <el-button
+                      type="primary"
+                      plain
+                      :icon="RefreshRight"
+                      :loading="modelLoading"
+                      size="small"
+                      @click="fetchModels"
+                    >
+                      获取模型
+                    </el-button>
                   </div>
-                  <van-cell-group inset>
-                    <van-field v-model="configForm.ai_base_url" label="BaseURL" placeholder="https://api.openai.com 或兼容地址" />
-                    <van-field v-model="configForm.ai_key" label="Key" type="password" placeholder="请输入 API Key" />
-                    <van-field
-                      v-if="modelOptions.length === 0"
-                      v-model="configForm.ai_model"
-                      label="Model"
-                      placeholder="例如 gpt-4o-mini"
-                    />
-                    <van-field v-else label="Model">
-                      <template #input>
-                        <van-dropdown-menu class="model-menu">
-                          <van-dropdown-item v-model="configForm.ai_model" :options="modelOptions" />
-                        </van-dropdown-menu>
-                      </template>
-                    </van-field>
-                  </van-cell-group>
-                </div>
+                </template>
 
-                <div class="config-card prompt-card">
-                  <div class="config-card-header prompt-card-header">
+                <el-form-item label="BaseURL">
+                  <el-input
+                    v-model="configForm.ai_base_url"
+                    placeholder="https://api.openai.com 或兼容地址"
+                    clearable
+                  />
+                </el-form-item>
+                <el-form-item label="API Key">
+                  <el-input
+                    v-model="configForm.ai_key"
+                    type="password"
+                    placeholder="请输入 API Key"
+                    show-password
+                    clearable
+                  />
+                </el-form-item>
+                <el-form-item label="Model">
+                  <el-select
+                    v-if="modelOptions.length > 0"
+                    v-model="configForm.ai_model"
+                    placeholder="请选择模型"
+                    filterable
+                    allow-create
+                    default-first-option
+                    style="width: 100%"
+                  >
+                    <el-option
+                      v-for="opt in modelOptions"
+                      :key="opt.value"
+                      :label="opt.label"
+                      :value="opt.value"
+                    />
+                  </el-select>
+                  <el-input
+                    v-else
+                    v-model="configForm.ai_model"
+                    placeholder="例如 gpt-4o-mini"
+                    clearable
+                  />
+                </el-form-item>
+              </el-card>
+
+              <el-card class="config-card prompt-card" shadow="never">
+                <template #header>
+                  <div class="card-head">
                     <div>
                       <h3>AI 解析提示词</h3>
-                      <p>系统内置默认提示词，保存自定义内容后会覆盖默认值。</p>
+                      <p class="card-desc">系统内置默认提示词，保存自定义内容后会覆盖默认值</p>
                     </div>
-                    <van-tag :type="configForm.ai_prompt_overridden ? 'warning' : 'success'" round>
+                    <el-tag
+                      :type="configForm.ai_prompt_overridden ? 'warning' : 'success'"
+                      effect="light"
+                      round
+                    >
                       {{ configForm.ai_prompt_overridden ? '自定义覆盖' : '系统默认' }}
-                    </van-tag>
+                    </el-tag>
                   </div>
-                  <van-cell-group inset>
-                    <van-field
-                      v-model="configForm.ai_prompt"
-                      label="提示词"
-                      type="textarea"
-                      rows="10"
-                      autosize
-                      placeholder="请输入 AI 解析提示词"
-                      :rules="[{ required: true, message: '请输入 AI 解析提示词' }]"
-                    />
-                  </van-cell-group>
-                  <div class="prompt-actions">
-                    <van-button size="small" plain native-type="button" @click="fillDefaultAIPrompt">填入默认</van-button>
-                    <van-button size="small" plain type="primary" native-type="button" :loading="configSaving" @click="resetAIPrompt">
-                      恢复默认
-                    </van-button>
-                  </div>
+                </template>
+
+                <el-form-item label="提示词内容">
+                  <el-input
+                    v-model="configForm.ai_prompt"
+                    type="textarea"
+                    :rows="12"
+                    placeholder="请输入 AI 解析提示词"
+                    resize="vertical"
+                  />
+                </el-form-item>
+
+                <div class="prompt-actions">
+                  <el-button :icon="MagicStick" plain @click="fillDefaultAIPrompt">填入默认</el-button>
+                  <el-button
+                    type="primary"
+                    plain
+                    :icon="RefreshRight"
+                    :loading="configSaving"
+                    @click="resetAIPrompt"
+                  >
+                    恢复默认
+                  </el-button>
                 </div>
+              </el-card>
 
-                <div class="config-card">
-                  <div class="config-card-header">
-                    <h3>开放接口控制面板</h3>
-                    <p>外部调用使用授权 Key，不受前台高频限制影响。</p>
-                  </div>
-                  <van-cell-group inset>
-                    <van-cell title="启用开放接口">
-                      <template #right-icon>
-                        <van-switch v-model="configForm.open_api_enabled" size="20" />
-                      </template>
-                    </van-cell>
-                    <van-field v-model="configForm.open_api_key" label="授权 Key" placeholder="点击随机生成或手动输入">
-                      <template #button>
-                        <van-button size="small" type="primary" plain native-type="button" @click="generateOpenAPIKey">随机生成</van-button>
-                      </template>
-                    </van-field>
-                  </van-cell-group>
-
-                  <div class="api-docs">
-                    <p>直接查询：POST /api/v1/open/query</p>
-                    <p>AI 查询：POST /api/v1/open/ai-query</p>
-                    <p>请求头：X-API-Key: {{ configForm.open_api_key || 'your-key' }}</p>
-                  </div>
-                </div>
-
-                <div class="doc-example">
-                  <div class="doc-example-header">
+              <el-card class="config-card" shadow="never">
+                <template #header>
+                  <div class="card-head">
                     <div>
-                      <h3>Python 调用示例</h3>
-                      <p>用于参考文档，可直接替换域名与参数后调用开放接口。</p>
+                      <h3>开放接口控制面板</h3>
+                      <p class="card-desc">外部调用使用授权 Key，不受前台高频限制影响</p>
                     </div>
-                    <van-button size="small" type="primary" plain icon="description-o" native-type="button" @click="copyPythonExample">复制代码</van-button>
+                    <el-switch
+                      v-model="configForm.open_api_enabled"
+                      active-text="启用"
+                      inactive-text="停用"
+                      inline-prompt
+                    />
                   </div>
-                  <pre><code>{{ pythonExample }}</code></pre>
-                </div>
-              </div>
+                </template>
 
-              <div class="form-actions compact-actions">
-                <van-button type="primary" block round :loading="configSaving || configLoading" native-type="submit">保存配置</van-button>
-              </div>
-            </van-form>
-          </section>
+                <el-form-item label="授权 Key">
+                  <el-input
+                    v-model="configForm.open_api_key"
+                    placeholder="点击随机生成或手动输入"
+                    clearable
+                  >
+                    <template #prepend>
+                      <el-icon><Key /></el-icon>
+                    </template>
+                    <template #append>
+                      <el-button :icon="CopyDocument" @click="copyApiKey" />
+                      <el-button type="primary" @click="generateOpenAPIKey">随机生成</el-button>
+                    </template>
+                  </el-input>
+                </el-form-item>
 
-          <section v-show="activeTab === 'announcements'" class="tab-panel">
-            <div class="section-header">
-              <div>
-                <h2>公告管理</h2>
-                <p>新增、编辑或删除展示在首页的系统公告。</p>
-              </div>
-              <van-button type="primary" round icon="plus" @click="openCreate">新增公告</van-button>
-            </div>
+                <el-descriptions :column="1" border size="small" class="api-docs">
+                  <el-descriptions-item label="直接查询">
+                    <code>POST /api/v1/open/query</code>
+                  </el-descriptions-item>
+                  <el-descriptions-item label="AI 查询">
+                    <code>POST /api/v1/open/ai-query</code>
+                  </el-descriptions-item>
+                  <el-descriptions-item label="请求头">
+                    <code>X-API-Key: {{ configForm.open_api_key || 'your-key' }}</code>
+                  </el-descriptions-item>
+                </el-descriptions>
+              </el-card>
 
-            <!-- 公告列表 -->
-            <div v-if="loading" class="loading-wrapper">
-              <van-loading type="spinner" color="var(--color-brand-500)">加载中...</van-loading>
-            </div>
-
-            <van-empty v-else-if="announcements.length === 0" description="暂无公告" />
-
-            <div v-else class="announcement-list">
-              <van-swipe-cell v-for="item in announcements" :key="item.id">
-                <div class="admin-announcement-item" :class="{ important: item.important }">
-                  <div class="item-main">
-                    <div class="item-title-row">
-                      <span class="item-title">{{ item.title }}</span>
-                      <van-tag v-if="item.important" type="warning" round size="small">重要</van-tag>
+              <el-card class="config-card doc-example" shadow="never">
+                <template #header>
+                  <div class="card-head">
+                    <div>
+                      <h3><el-icon><Document /></el-icon> Python 调用示例</h3>
+                      <p class="card-desc">替换域名与参数后即可直接调用开放接口</p>
                     </div>
-                    <p class="item-content">{{ item.content }}</p>
-                    <p class="item-date">{{ item.created_at }}</p>
+                    <el-button
+                      type="primary"
+                      plain
+                      :icon="CopyDocument"
+                      size="small"
+                      @click="copyPythonExample"
+                    >
+                      复制代码
+                    </el-button>
                   </div>
-                  <div class="item-actions">
-                    <van-button plain size="mini" type="primary" @click="openEdit(item)">编辑</van-button>
-                    <van-button plain size="mini" type="danger" @click="handleDelete(item.id)">删除</van-button>
-                  </div>
+                </template>
+                <pre class="code-block"><code>{{ pythonExample }}</code></pre>
+              </el-card>
+            </div>
+
+            <div class="form-footer">
+              <el-button
+                type="primary"
+                size="large"
+                :loading="configSaving"
+                @click="saveConfig"
+              >
+                保存配置
+              </el-button>
+            </div>
+          </el-form>
+        </el-tab-pane>
+
+        <el-tab-pane name="announcements">
+          <template #label>
+            <span class="tab-label"><el-icon><Bell /></el-icon>公告管理</span>
+          </template>
+
+          <div class="section-toolbar">
+            <div>
+              <h3 class="section-title">公告列表</h3>
+              <p class="section-desc">新增、编辑或删除展示在首页的系统公告</p>
+            </div>
+            <el-button type="primary" :icon="Plus" @click="openCreate">新增公告</el-button>
+          </div>
+
+          <el-table
+            v-loading="loading"
+            :data="announcements"
+            stripe
+            border
+            empty-text="暂无公告"
+            class="announcement-table"
+          >
+            <el-table-column prop="title" label="标题" min-width="180">
+              <template #default="{ row }">
+                <div class="title-cell">
+                  <span>{{ row.title }}</span>
+                  <el-tag v-if="row.important" type="warning" size="small" round>重要</el-tag>
                 </div>
-                <template #right>
-                  <van-button square type="danger" text="删除" class="swipe-btn" @click="handleDelete(item.id)" />
-                </template>
-              </van-swipe-cell>
-            </div>
-          </section>
-        </main>
-      </div>
+              </template>
+            </el-table-column>
+            <el-table-column prop="content" label="内容" min-width="320" show-overflow-tooltip />
+            <el-table-column prop="created_at" label="创建时间" width="180" />
+            <el-table-column label="操作" width="160" fixed="right" align="center">
+              <template #default="{ row }">
+                <el-button :icon="Edit" link type="primary" @click="openEdit(row)">编辑</el-button>
+                <el-button :icon="Delete" link type="danger" @click="handleDelete(row)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
+      </el-tabs>
+    </main>
 
-      <!-- 编辑表单弹出层 -->
-      <van-popup v-model:show="showForm" position="bottom" round :style="{ maxHeight: '80%' }">
-        <div class="form-popup">
-          <div class="form-title">{{ editingId ? '编辑公告' : '新增公告' }}</div>
-          <van-form @submit="handleSave">
-            <van-cell-group inset>
-              <van-field
-                v-model="form.title"
-                label="标题"
-                placeholder="请输入公告标题"
-                :rules="[{ required: true, message: '请输入标题' }]"
-              />
-              <van-field
-                v-model="form.content"
-                label="内容"
-                type="textarea"
-                rows="4"
-                placeholder="请输入公告内容"
-                :rules="[{ required: true, message: '请输入内容' }]"
-              />
-              <van-cell title="标记为重要公告">
-                <template #right-icon>
-                  <van-switch v-model="form.important" size="20" />
-                </template>
-              </van-cell>
-            </van-cell-group>
+    <el-dialog
+      v-model="showForm"
+      :title="editingId ? '编辑公告' : '新增公告'"
+      width="520px"
+      :close-on-click-modal="false"
+      destroy-on-close
+      @close="cancelForm"
+    >
+      <el-form
+        ref="formRef"
+        :model="form"
+        :rules="formRules"
+        label-position="top"
+      >
+        <el-form-item label="标题" prop="title">
+          <el-input v-model="form.title" placeholder="请输入公告标题" maxlength="80" show-word-limit />
+        </el-form-item>
+        <el-form-item label="内容" prop="content">
+          <el-input
+            v-model="form.content"
+            type="textarea"
+            :rows="5"
+            placeholder="请输入公告内容"
+            maxlength="500"
+            show-word-limit
+            resize="vertical"
+          />
+        </el-form-item>
+        <el-form-item label="标记为重要公告">
+          <el-switch v-model="form.important" active-text="重要" inactive-text="普通" inline-prompt />
+        </el-form-item>
+      </el-form>
 
-            <div class="form-actions">
-              <van-button type="primary" block round :loading="saving" loading-text="保存中..." native-type="submit">
-                保存
-              </van-button>
-              <van-button block round @click="cancelForm">取消</van-button>
-            </div>
-          </van-form>
-        </div>
-      </van-popup>
-
-    </div>
+      <template #footer>
+        <el-button @click="cancelForm">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="handleSave">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
-.admin-content {
-  max-width: 1440px;
+.admin-page {
+  min-height: 100vh;
+  background: var(--color-surface-page);
 }
 
-.admin-header {
+.admin-topbar {
+  background: var(--color-surface-card);
+  border-bottom: 1px solid var(--color-border-subtle);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.admin-topbar-inner {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 14px 24px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 20px;
+  gap: 16px;
 }
 
-.header-left {
+.topbar-left {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 14px;
+}
+
+.topbar-logo {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: var(--color-brand-100);
+  color: var(--color-brand-500);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .admin-title {
-  font-size: 20px;
+  font-size: 18px;
   font-weight: 700;
   color: var(--color-text-primary);
   margin: 0;
+  line-height: 1.2;
 }
 
-.header-right {
+.admin-subtitle {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  margin: 2px 0 0;
+}
+
+.topbar-right {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
 }
 
-.back-link {
-  font-size: 13px;
-  color: var(--color-text-tertiary);
-  text-decoration: none;
+.admin-main {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 20px 24px 40px;
 }
 
-.error-bar {
+.admin-error {
   margin-bottom: 16px;
-  border-radius: 10px;
 }
 
-.admin-shell {
-  display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
-  gap: 20px;
-  align-items: flex-start;
-}
-
-.admin-tabs {
-  position: sticky;
-  top: 18px;
-  padding: 10px;
-}
-
-.tab-button {
-  width: 100%;
-  border: 0;
-  border-radius: 14px;
-  padding: 14px 16px;
-  background: transparent;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  text-align: left;
-  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
-}
-
-.tab-button + .tab-button {
-  margin-top: 8px;
-}
-
-.tab-button.active {
-  background: linear-gradient(135deg, rgba(136, 79, 34, 0.13), rgba(136, 79, 34, 0.05));
-  color: var(--color-brand-500);
-  box-shadow: inset 3px 0 0 var(--color-brand-500);
-}
-
-.tab-label,
-.tab-desc {
-  display: block;
+.admin-tabs :deep(.el-tabs__item) {
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .tab-label {
-  font-size: 15px;
-  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
-.tab-desc {
-  margin-top: 4px;
-  font-size: 12px;
-  color: var(--color-text-tertiary);
+.config-form {
+  padding: 4px 0 0;
 }
 
-.admin-panel {
-  min-width: 0;
-  padding: 18px;
-}
-
-.tab-panel {
-  min-width: 0;
-}
-
-.section-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 0 16px;
-}
-
-.section-header h2 {
-  margin: 0 0 4px;
-  font-size: 16px;
-  color: var(--color-text-primary);
-}
-
-.section-header p {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--color-text-tertiary);
-}
-
-.api-config-grid {
+.config-grid {
   display: grid;
-  grid-template-columns: minmax(320px, 0.82fr) minmax(420px, 1.18fr);
+  grid-template-columns: minmax(320px, 0.85fr) minmax(420px, 1.15fr);
   gap: 16px;
   align-items: stretch;
 }
 
 .config-card {
-  min-width: 0;
-  padding: 16px;
   border: 1px solid var(--color-border-subtle);
-  border-radius: 16px;
-  background: var(--color-surface-card);
+  border-radius: 12px;
+  height: 100%;
 }
 
-.config-card-header {
-  margin-bottom: 12px;
+.config-card :deep(.el-card__header) {
+  padding: 14px 18px;
+  background: var(--color-surface-section);
+  border-bottom: 1px solid var(--color-border-subtle);
 }
 
-.config-card-header h3 {
+.config-card :deep(.el-card__body) {
+  padding: 18px;
+}
+
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.card-head h3 {
   margin: 0 0 4px;
   font-size: 15px;
+  font-weight: 700;
   color: var(--color-text-primary);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
-.config-card-header p {
+.card-desc {
   margin: 0;
-  color: var(--color-text-tertiary);
   font-size: 12px;
   line-height: 1.5;
+  color: var(--color-text-tertiary);
 }
 
 .prompt-card {
   grid-row: span 2;
 }
 
-.prompt-card-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
 .prompt-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding: 10px 0 0;
-}
-
-.model-menu {
-  width: 100%;
-}
-
-.model-menu :deep(.van-dropdown-menu__bar) {
-  height: 28px;
-  box-shadow: none;
+  margin-top: 4px;
 }
 
 .api-docs {
-  margin: 12px 0 0;
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: var(--color-surface-muted);
+  margin-top: 8px;
+}
+
+.api-docs :deep(.el-descriptions__label) {
+  width: 96px;
+  background: var(--color-surface-section);
   color: var(--color-text-secondary);
+  font-weight: 600;
+}
+
+.api-docs code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
-  line-height: 1.6;
-  overflow-wrap: anywhere;
+  color: var(--color-text-primary);
+  word-break: break-all;
 }
 
-.api-docs p {
+.doc-example :deep(.el-card__header) {
+  background: linear-gradient(135deg, rgba(136, 79, 34, 0.18), rgba(136, 79, 34, 0.04));
+}
+
+.doc-example :deep(.el-card__body) {
+  padding: 0;
+}
+
+.code-block {
   margin: 0;
-}
-
-.doc-example {
-  min-width: 0;
-  margin: 0;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: 14px;
-  background: #15110E;
-  overflow: hidden;
-}
-
-.doc-example-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 14px 16px;
-  background: linear-gradient(135deg, rgba(136, 79, 34, 0.28), rgba(255, 255, 255, 0.04));
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.doc-example h3 {
-  margin: 0 0 4px;
-  color: #FFF7ED;
-  font-size: 15px;
-}
-
-.doc-example p {
-  margin: 0;
-  color: rgba(255, 247, 237, 0.68);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.doc-example pre {
-  margin: 0;
-  padding: 16px;
+  padding: 16px 18px;
   overflow: auto;
+  background: #15110E;
   color: #FDEBD3;
   font-size: 12px;
   line-height: 1.7;
   tab-size: 4;
-  max-height: 360px;
+  max-height: 380px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
-.doc-example code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+.form-footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border-subtle);
 }
 
-.compact-actions {
-  padding: 16px 0 0;
+.section-toolbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
 }
 
-.form-popup {
-  padding: 20px 16px;
-}
-
-.form-title {
-  font-size: 18px;
+.section-title {
+  margin: 0 0 4px;
+  font-size: 16px;
   font-weight: 700;
   color: var(--color-text-primary);
-  margin-bottom: 16px;
-  text-align: center;
 }
 
-.form-actions {
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.section-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
 }
 
-.loading-wrapper {
-  display: flex;
-  justify-content: center;
-  padding: 48px 0;
+.announcement-table {
+  border-radius: 10px;
+  overflow: hidden;
 }
 
-.announcement-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 12px;
-}
-
-.admin-announcement-item {
-  background: var(--color-surface-card);
-  border-radius: 12px;
-  border: 1px solid var(--color-border-subtle);
-  padding: 14px 16px;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.admin-announcement-item.important {
-  border-color: #F3CF8D;
-  background: var(--color-warning-bg);
-}
-
-.item-main {
-  flex: 1;
-  min-width: 0;
-}
-
-.item-title-row {
-  display: flex;
+.title-cell {
+  display: inline-flex;
   align-items: center;
   gap: 8px;
 }
 
-.item-title {
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--color-text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+@media (max-width: 960px) {
+  .config-grid {
+    grid-template-columns: 1fr;
+  }
 
-.item-content {
-  font-size: 13px;
-  color: var(--color-text-secondary);
-  margin: 4px 0;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.item-date {
-  font-size: 11px;
-  color: var(--color-text-tertiary);
-  margin: 4px 0 0;
-}
-
-.item-actions {
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
-.swipe-btn {
-  height: 100%;
-}
-
-:deep(.van-cell-group--inset) {
-  margin: 0;
+  .prompt-card {
+    grid-row: auto;
+  }
 }
 
 @media (max-width: 640px) {
-  .admin-header,
-  .section-header,
-  .doc-example-header,
-  .prompt-card-header {
+  .admin-topbar-inner,
+  .admin-main {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .admin-topbar-inner {
     flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
   }
 
-  .admin-shell {
-    display: block;
-  }
-
-  .admin-panel {
-    padding: 16px 0;
-  }
-
-  .api-config-grid,
-  .announcement-list {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .config-card {
-    padding: 14px 0;
-    border-width: 1px 0;
-    border-radius: 0;
-  }
-
-  .api-docs,
-  .doc-example {
-    margin-right: 16px;
-    margin-left: 16px;
-  }
-
-  .admin-tabs {
-    position: static;
-    display: flex;
-    gap: 8px;
-    margin-bottom: 14px;
-    overflow-x: auto;
-  }
-
-  .tab-button {
-    min-width: 148px;
-  }
-
-  .header-right {
+  .topbar-right {
     width: 100%;
-    justify-content: space-between;
+    justify-content: flex-end;
+  }
+
+  .section-toolbar {
+    flex-direction: column;
+    align-items: stretch;
   }
 }
 </style>
+
+

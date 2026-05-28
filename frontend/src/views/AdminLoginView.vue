@@ -1,27 +1,35 @@
 <script setup>
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import { Lock, User } from '@element-plus/icons-vue'
 import { adminLogin, getErrorMessage } from '@/api'
-import { showToast } from 'vant'
 
 const router = useRouter()
-const username = ref('')
-const password = ref('')
+const formRef = ref(null)
+const formData = ref({ username: '', password: '' })
 const error = ref('')
 const loading = ref(false)
 
+const rules = {
+  username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
+  password: [{ required: true, message: '请输入密码', trigger: 'blur' }],
+}
+
 async function handleLogin() {
-  error.value = ''
-  if (!username.value || !password.value) {
-    error.value = '请输入用户名和密码'
+  if (!formRef.value) return
+  try {
+    await formRef.value.validate()
+  } catch {
     return
   }
 
+  error.value = ''
   loading.value = true
   try {
-    const resp = await adminLogin(username.value, password.value)
+    const resp = await adminLogin(formData.value.username, formData.value.password)
     localStorage.setItem('admin_token', resp.token)
-    showToast({ message: '登录成功', type: 'success' })
+    ElMessage.success('登录成功')
     router.push('/admin')
   } catch (e) {
     error.value = getErrorMessage(e, '登录失败，请检查用户名和密码')
@@ -34,57 +42,69 @@ async function handleLogin() {
 <template>
   <div class="login-page">
     <div class="login-wrapper">
-      <div class="app-card login-card">
+      <el-card class="login-card" shadow="hover">
         <div class="login-header">
-          <van-icon name="shield-o" size="36" color="var(--color-brand-500)" />
+          <div class="login-logo">
+            <el-icon :size="32" color="#884F22"><Lock /></el-icon>
+          </div>
           <h1 class="login-title">管理后台</h1>
-          <p class="login-subtitle">请登录以管理系统公告</p>
+          <p class="login-subtitle">请登录以管理系统配置与公告</p>
         </div>
 
-        <van-form @submit="handleLogin">
-          <van-cell-group inset>
-            <van-field
-              v-model="username"
-              name="username"
-              label="用户名"
+        <el-form
+          ref="formRef"
+          :model="formData"
+          :rules="rules"
+          label-position="top"
+          size="large"
+          @submit.prevent="handleLogin"
+        >
+          <el-form-item label="用户名" prop="username">
+            <el-input
+              v-model="formData.username"
               placeholder="请输入用户名"
               autocomplete="username"
-              :rules="[{ required: true, message: '请输入用户名' }]"
+              :prefix-icon="User"
+              clearable
             />
-            <van-field
-              v-model="password"
+          </el-form-item>
+
+          <el-form-item label="密码" prop="password">
+            <el-input
+              v-model="formData.password"
               type="password"
-              name="password"
-              label="密码"
               placeholder="请输入密码"
               autocomplete="current-password"
-              :rules="[{ required: true, message: '请输入密码' }]"
+              :prefix-icon="Lock"
+              show-password
+              @keyup.enter="handleLogin"
             />
-          </van-cell-group>
+          </el-form-item>
 
-          <div v-if="error" class="error-msg">
-            <van-notice-bar left-icon="warning-o" :text="error" color="var(--color-error-fg)" background="var(--color-error-bg)" :scrollable="false" />
-          </div>
+          <el-alert
+            v-if="error"
+            :title="error"
+            type="error"
+            show-icon
+            :closable="false"
+            class="login-error"
+          />
 
-          <div class="login-actions">
-            <van-button
-              type="primary"
-              block
-              round
-              size="large"
-              :loading="loading"
-              loading-text="登录中..."
-              native-type="submit"
-            >
-              登录
-            </van-button>
-          </div>
-        </van-form>
+          <el-button
+            type="primary"
+            :loading="loading"
+            class="login-submit"
+            size="large"
+            @click="handleLogin"
+          >
+            {{ loading ? '登录中...' : '登录' }}
+          </el-button>
+        </el-form>
 
         <div class="login-footer">
           <router-link to="/" class="back-link">返回首页</router-link>
         </div>
-      </div>
+      </el-card>
     </div>
   </div>
 </template>
@@ -96,64 +116,72 @@ async function handleLogin() {
   align-items: center;
   justify-content: center;
   padding: 16px;
-  background: var(--color-surface-page);
+  background: linear-gradient(135deg, #F8F5F2 0%, #F0E5D8 100%);
 }
 
 .login-wrapper {
   width: 100%;
-  max-width: 400px;
+  max-width: 420px;
 }
 
 .login-card {
-  padding: 32px 24px;
+  border-radius: 16px;
+  border: 1px solid var(--color-border-subtle);
+}
+
+.login-card :deep(.el-card__body) {
+  padding: 36px 28px 28px;
 }
 
 .login-header {
   text-align: center;
-  margin-bottom: 24px;
+  margin-bottom: 28px;
+}
+
+.login-logo {
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+  background: var(--color-brand-100);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 14px;
 }
 
 .login-title {
-  font-size: 20px;
+  font-size: 22px;
   font-weight: 700;
   color: var(--color-text-primary);
-  margin: 12px 0 4px;
+  margin: 0 0 6px;
 }
 
 .login-subtitle {
-  font-size: 14px;
+  font-size: 13px;
   color: var(--color-text-tertiary);
   margin: 0;
 }
 
-.error-msg {
-  margin: 12px 16px 0;
+.login-error {
+  margin-bottom: 16px;
 }
 
-.error-msg :deep(.van-notice-bar) {
-  border-radius: 8px;
-}
-
-.login-actions {
-  padding: 20px 16px 0;
+.login-submit {
+  width: 100%;
 }
 
 .login-footer {
   text-align: center;
-  margin-top: 16px;
+  margin-top: 18px;
 }
 
 .back-link {
-  font-size: 14px;
+  font-size: 13px;
   color: var(--color-text-tertiary);
   text-decoration: none;
 }
 
-.back-link:active {
+.back-link:hover {
   color: var(--color-brand-500);
-}
-
-:deep(.van-cell-group--inset) {
-  margin: 0;
 }
 </style>

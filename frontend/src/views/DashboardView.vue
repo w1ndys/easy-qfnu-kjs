@@ -1,5 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch, nextTick, shallowRef } from 'vue'
+import { useRouter } from 'vue-router'
+import { ArrowLeft, Refresh, DataBoard } from '@element-plus/icons-vue'
 import * as echarts from 'echarts/core'
 import { BarChart, LineChart, PieChart } from 'echarts/charts'
 import {
@@ -9,8 +11,6 @@ import {
   LegendComponent,
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
-import AppHeader from '@/components/AppHeader.vue'
-import AppFooter from '@/components/AppFooter.vue'
 import { getDashboard } from '@/api'
 
 echarts.use([
@@ -18,6 +18,8 @@ echarts.use([
   TitleComponent, TooltipComponent, GridComponent, LegendComponent,
   CanvasRenderer,
 ])
+
+const router = useRouter()
 
 const COLORS = {
   primary: '#884F22',
@@ -57,7 +59,6 @@ const timeRangeLabel = computed(() =>
     : timeRangeOptions.find((o) => o.value === timeRange.value)?.label || ''
 )
 
-// ECharts refs
 const trendChartRef = ref(null)
 const keywordChartRef = ref(null)
 const nodeChartRef = ref(null)
@@ -205,55 +206,69 @@ const overviewCards = computed(() => [
   { label: '有结果率', value: resultRate.value, color: 'var(--color-success-fg)', bg: 'var(--color-success-bg)' },
   { label: '高峰时段', value: peakHour.value, color: 'var(--color-warning-fg)', bg: 'var(--color-warning-bg)' },
 ])
+
+function goBack() { router.back() }
 </script>
 
 <template>
-  <div class="page-container">
-    <AppHeader title="数据大屏" showBack />
-
-    <div class="page-content dashboard-content">
-      <!-- 时间范围选择 -->
-      <div class="app-card time-range-card">
-        <div class="time-tabs">
-          <div
-            v-for="opt in timeRangeOptions"
-            :key="opt.value"
-            class="time-tab"
-            :class="{ active: timeRange === opt.value }"
-            @click="timeRange = opt.value"
-          >
-            {{ opt.label }}
+  <div class="dashboard-page">
+    <header class="dashboard-topbar">
+      <div class="topbar-inner">
+        <div class="topbar-left">
+          <el-button :icon="ArrowLeft" link @click="goBack">返回</el-button>
+          <div class="topbar-title">
+            <div class="title-icon">
+              <el-icon :size="20"><DataBoard /></el-icon>
+            </div>
+            <div>
+              <h1>数据大屏</h1>
+              <p>{{ timeRangeLabel }}查询统计</p>
+            </div>
           </div>
         </div>
-        <div class="custom-days">
-          <span>最近</span>
-          <van-field
-            v-model.number="customDays"
-            type="digit"
-            :disabled="timeRange !== 'custom'"
-            :border="false"
-            class="days-input"
-            @focus="timeRange = 'custom'"
-          />
-          <span>天</span>
+        <el-button :icon="Refresh" :loading="loading" plain @click="fetchData">刷新</el-button>
+      </div>
+    </header>
+
+    <main class="dashboard-main">
+      <el-card class="filter-card" shadow="never">
+        <div class="filter-row">
+          <el-radio-group v-model="timeRange">
+            <el-radio-button
+              v-for="opt in timeRangeOptions"
+              :key="opt.value"
+              :value="opt.value"
+            >
+              {{ opt.label }}
+            </el-radio-button>
+          </el-radio-group>
+          <div class="custom-days">
+            <span>最近</span>
+            <el-input-number
+              v-model="customDays"
+              :min="1"
+              :max="365"
+              :disabled="timeRange !== 'custom'"
+              size="default"
+              @focus="timeRange = 'custom'"
+            />
+            <span>天</span>
+          </div>
         </div>
-      </div>
+      </el-card>
 
-      <!-- Loading -->
-      <div v-if="loading" class="app-card loading-card">
-        <van-loading type="spinner" color="var(--color-brand-500)" size="32">加载中...</van-loading>
-      </div>
+      <el-empty v-if="error" :description="error" class="state-card">
+        <el-button type="primary" @click="fetchData">重试</el-button>
+      </el-empty>
 
-      <!-- Error -->
-      <div v-else-if="error" class="app-card error-card">
-        <p class="error-text">{{ error }}</p>
-        <van-button type="primary" size="small" round @click="fetchData">重试</van-button>
-      </div>
-
-      <template v-else-if="data">
-        <!-- 数据总览 -->
-        <div class="app-card">
-          <div class="card-title">数据总览 <span class="card-subtitle">{{ timeRangeLabel }}</span></div>
+      <template v-else>
+        <el-card v-loading="loading" class="overview-card" shadow="never">
+          <template #header>
+            <div class="card-head">
+              <span class="card-title">数据总览</span>
+              <span class="card-subtitle">{{ timeRangeLabel }}</span>
+            </div>
+          </template>
           <div class="overview-grid">
             <div
               v-for="item in overviewCards"
@@ -266,182 +281,219 @@ const overviewCards = computed(() => [
             </div>
           </div>
 
-          <van-row gutter="12" class="sub-stats">
-            <van-col span="8">
+          <el-row :gutter="12" class="sub-stats">
+            <el-col :span="8">
               <div class="sub-stat-item">
                 <div class="sub-stat-value brand">{{ overview.today_count || 0 }}</div>
                 <div class="sub-stat-label">今日</div>
               </div>
-            </van-col>
-            <van-col span="8">
+            </el-col>
+            <el-col :span="8">
               <div class="sub-stat-item">
                 <div class="sub-stat-value success">{{ overview.week_count || 0 }}</div>
                 <div class="sub-stat-label">本周</div>
               </div>
-            </van-col>
-            <van-col span="8">
+            </el-col>
+            <el-col :span="8">
               <div class="sub-stat-item">
                 <div class="sub-stat-value info">{{ overview.month_count || 0 }}</div>
                 <div class="sub-stat-label">本月</div>
               </div>
-            </van-col>
-          </van-row>
-        </div>
+            </el-col>
+          </el-row>
+        </el-card>
 
-        <!-- 查询趋势 -->
-        <div class="app-card">
-          <div class="card-title">查询次数趋势</div>
+        <el-card class="chart-card" shadow="never">
+          <template #header>
+            <span class="card-title">查询次数趋势</span>
+          </template>
           <div ref="trendChartRef" class="chart-container" style="height: 280px;"></div>
-        </div>
+        </el-card>
 
-        <!-- 搜索词排行 -->
-        <div class="app-card">
-          <div class="card-title">搜索词排行榜</div>
-          <div v-if="data.top_keywords && data.top_keywords.length > 0">
-            <div ref="keywordChartRef" class="chart-container" style="height: 300px;"></div>
-          </div>
-          <van-empty v-else description="暂无搜索数据" />
-        </div>
+        <el-card class="chart-card" shadow="never">
+          <template #header>
+            <span class="card-title">搜索词排行榜</span>
+          </template>
+          <div v-if="data && data.top_keywords && data.top_keywords.length > 0" ref="keywordChartRef" class="chart-container" style="height: 300px;"></div>
+          <el-empty v-else description="暂无搜索数据" :image-size="80" />
+        </el-card>
 
-        <!-- 节次分布 + 结果分布 -->
-        <div class="chart-row">
-          <div class="app-card chart-half">
-            <div class="card-title">节次分布</div>
-            <div v-if="data.node_dist && data.node_dist.length > 0">
-              <div ref="nodeChartRef" class="chart-container" style="height: 260px;"></div>
+        <el-row :gutter="16" class="chart-row">
+          <el-col :xs="24" :md="12">
+            <el-card class="chart-card" shadow="never">
+              <template #header>
+                <span class="card-title">节次分布</span>
+              </template>
+              <div v-if="data && data.node_dist && data.node_dist.length > 0" ref="nodeChartRef" class="chart-container" style="height: 260px;"></div>
+              <el-empty v-else description="暂无节次数据" :image-size="80" />
+            </el-card>
+          </el-col>
+          <el-col :xs="24" :md="12">
+            <el-card class="chart-card" shadow="never">
+              <template #header>
+                <span class="card-title">结果数量分布</span>
+              </template>
+              <div v-if="data && data.result_stats">
+                <div ref="resultChartRef" class="chart-container" style="height: 260px;"></div>
+                <el-row :gutter="8" class="result-summary">
+                  <el-col :span="8">
+                    <div class="summary-value brand">{{ data.result_stats.avg_count?.toFixed(1) || '0' }}</div>
+                    <div class="summary-label">平均结果数</div>
+                  </el-col>
+                  <el-col :span="8">
+                    <div class="summary-value success">{{ data.result_stats.max_count || 0 }}</div>
+                    <div class="summary-label">最多结果</div>
+                  </el-col>
+                  <el-col :span="8">
+                    <div class="summary-value info">{{ data.result_stats.non_zero_count || 0 }}</div>
+                    <div class="summary-label">有效查询</div>
+                  </el-col>
+                </el-row>
+              </div>
+              <el-empty v-else description="暂无结果数据" :image-size="80" />
+            </el-card>
+          </el-col>
+        </el-row>
+
+        <el-card class="chart-card" shadow="never">
+          <template #header>
+            <div class="card-head">
+              <span class="card-title">高峰时段分析</span>
+              <span class="card-subtitle">24小时查询分布</span>
             </div>
-            <van-empty v-else description="暂无节次数据" />
-          </div>
-
-          <div class="app-card chart-half">
-            <div class="card-title">结果数量分布</div>
-            <div v-if="data.result_stats">
-              <div ref="resultChartRef" class="chart-container" style="height: 260px;"></div>
-              <van-row gutter="8" class="result-summary">
-                <van-col span="8">
-                  <div class="summary-value brand">{{ data.result_stats.avg_count?.toFixed(1) || '0' }}</div>
-                  <div class="summary-label">平均结果数</div>
-                </van-col>
-                <van-col span="8">
-                  <div class="summary-value success">{{ data.result_stats.max_count || 0 }}</div>
-                  <div class="summary-label">最多结果</div>
-                </van-col>
-                <van-col span="8">
-                  <div class="summary-value info">{{ data.result_stats.non_zero_count || 0 }}</div>
-                  <div class="summary-label">有效查询</div>
-                </van-col>
-              </van-row>
-            </div>
-            <van-empty v-else description="暂无结果数据" />
-          </div>
-        </div>
-
-        <!-- 高峰时段 -->
-        <div class="app-card">
-          <div class="card-title">高峰时段分析 <span class="card-subtitle">24小时查询分布</span></div>
+          </template>
           <div ref="hourlyChartRef" class="chart-container" style="height: 260px;"></div>
-          <div v-if="data.hourly_dist" class="peak-legend">
+          <div v-if="data && data.hourly_dist" class="peak-legend">
             <span class="peak-item"><span class="peak-dot" style="background: #10B981;"></span>低峰</span>
             <span class="peak-item"><span class="peak-dot" style="background: #F59E0B;"></span>中峰</span>
             <span class="peak-item"><span class="peak-dot" style="background: #F43F5E;"></span>高峰</span>
           </div>
-        </div>
+        </el-card>
       </template>
 
-      <AppFooter />
-    </div>
+      <p class="dashboard-footer">Powered by <span class="brand-text">曲奇味卷卷</span></p>
+    </main>
   </div>
 </template>
 
 <style scoped>
-.dashboard-content {
-  max-width: 1280px;
+.dashboard-page {
+  min-height: 100vh;
+  background: var(--color-surface-page);
 }
 
-.time-range-card {
+.dashboard-topbar {
+  background: var(--color-surface-card);
+  border-bottom: 1px solid var(--color-border-subtle);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(8px);
+}
+
+.topbar-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.topbar-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.title-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--color-brand-100);
+  color: var(--color-brand-500);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.topbar-title h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+}
+
+.topbar-title p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+.dashboard-main {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 20px 24px 40px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 16px;
 }
 
-@media (min-width: 768px) {
-  .time-range-card {
-    flex-direction: row;
-    align-items: center;
-  }
+.filter-card,
+.overview-card,
+.chart-card {
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 14px;
 }
 
-.time-tabs {
+.filter-card :deep(.el-card__body) {
+  padding: 14px 18px;
+}
+
+.filter-row {
   display: flex;
-  background: var(--color-surface-section);
-  border-radius: 12px;
-  padding: 4px;
-  flex: 1;
-}
-
-.time-tab {
-  flex: 1;
-  text-align: center;
-  padding: 10px 16px;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--color-text-tertiary);
-  border-radius: 8px;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.time-tab.active {
-  background: var(--color-surface-card);
-  color: var(--color-brand-500);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .custom-days {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--color-text-primary);
+  font-size: 13px;
+  color: var(--color-text-secondary);
 }
 
-.days-input {
-  width: 80px;
+.state-card {
+  padding: 48px 0;
 }
 
-.days-input :deep(.van-field) {
-  border-radius: 8px;
-  border: 1px solid var(--color-border-subtle);
-  background: var(--color-surface-card);
-}
-
-.loading-card, .error-card {
+.card-head {
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 48px 16px;
-}
-
-.error-text {
-  color: var(--color-error-fg);
-  font-weight: 600;
-  margin-bottom: 16px;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .card-title {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 700;
   color: var(--color-text-primary);
-  margin-bottom: 16px;
 }
 
 .card-subtitle {
   font-size: 12px;
   font-weight: 500;
   color: var(--color-text-tertiary);
-  margin-left: 8px;
 }
 
 .overview-grid {
@@ -511,15 +563,11 @@ const overviewCards = computed(() => [
 }
 
 .chart-row {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 16px;
+  margin: 0 !important;
 }
 
-@media (min-width: 768px) {
-  .chart-row {
-    grid-template-columns: repeat(2, 1fr);
-  }
+.chart-row .el-col {
+  margin-bottom: 16px;
 }
 
 .result-summary {
@@ -562,4 +610,34 @@ const overviewCards = computed(() => [
   height: 12px;
   border-radius: 3px;
 }
+
+.dashboard-footer {
+  text-align: center;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  margin: 8px 0 0;
+}
+
+.brand-text {
+  color: var(--color-brand-500);
+  font-weight: 600;
+}
+
+@media (max-width: 640px) {
+  .topbar-inner,
+  .dashboard-main {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .filter-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .custom-days {
+    justify-content: center;
+  }
+}
 </style>
+
