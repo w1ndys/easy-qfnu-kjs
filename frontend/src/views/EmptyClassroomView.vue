@@ -15,7 +15,7 @@ import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import QRCodeCard from '@/components/QRCodeCard.vue'
 import StatusWarning from '@/components/StatusWarning.vue'
 
-const { statusLoading, inTeachingCalendar, hasPermission, currentWeek, currentTerm } = useSystemStatus()
+const { statusLoading, inTeachingCalendar, hasPermission, currentWeek, currentTerm, upstreamHealthy, upstreamMessage } = useSystemStatus()
 const { history, addToHistory, clearHistory } = useSearchHistory()
 const { topQueries } = useTopBuildings()
 const {
@@ -203,6 +203,13 @@ async function aiSearch() {
     <AppHeader title="空教室查询" showBack />
 
     <div class="page-content">
+      <StatusWarning
+        v-if="!upstreamHealthy && !statusLoading"
+        type="error"
+        title="学校服务异常"
+        :message="upstreamMessage || '学校统一身份认证服务暂时不可用，查询结果可能不准确，请稍后重试。'"
+      />
+
       <StatusWarning
         v-if="!hasPermission && !statusLoading"
         type="error"
