@@ -15,7 +15,7 @@ type UpstreamStatus struct {
 
 var (
 	upstreamMu     sync.RWMutex
-	upstreamStatus = UpstreamStatus{Healthy: true}
+	upstreamStatus = UpstreamStatus{}
 )
 
 // MarkUpstreamHealthy 在登录链路成功完成时调用，清除告警态。

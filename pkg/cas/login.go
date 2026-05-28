@@ -100,8 +100,8 @@ func (c *Client) checkNeedCaptcha(ctx context.Context, username string) error {
 
 		select {
 		case <-ctx.Done():
-			lastErr = ctx.Err()
-			break
+			MarkUpstreamUnhealthy(fmt.Sprintf("学校统一身份认证服务异常：%v", ctx.Err()))
+			return ctx.Err()
 		case <-time.After(delay):
 		}
 
