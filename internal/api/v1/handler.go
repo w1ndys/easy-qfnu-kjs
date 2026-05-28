@@ -9,6 +9,7 @@ import (
 
 	"github.com/W1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/W1ndys/easy-qfnu-kjs/internal/service"
+	"github.com/W1ndys/easy-qfnu-kjs/pkg/cas"
 	"github.com/gin-gonic/gin"
 )
 
@@ -33,6 +34,15 @@ func hashUA(ua string) string {
 
 // GetStatus 返回系统状态，包括是否在教学周历内
 func (h *Handler) GetStatus(c *gin.Context) {
+	upstream := cas.GetUpstreamStatus()
+	upstreamPayload := gin.H{
+		"healthy": upstream.Healthy,
+		"message": upstream.Message,
+	}
+	if !upstream.UpdatedAt.IsZero() {
+		upstreamPayload["updated_at"] = upstream.UpdatedAt
+	}
+
 	cal := service.GetCalendarService()
 	if cal == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -40,6 +50,7 @@ func (h *Handler) GetStatus(c *gin.Context) {
 			"in_teaching_calendar": false,
 			"current_week":         0,
 			"current_term":         "",
+			"upstream":             upstreamPayload,
 		})
 		return
 	}
@@ -50,6 +61,7 @@ func (h *Handler) GetStatus(c *gin.Context) {
 		"current_week":         cal.GetBaseWeek(),
 		"current_term":         cal.GetCurrentYearStr(),
 		"has_permission":       cal.HasPermission(),
+		"upstream":             upstreamPayload,
 	})
 }
 
