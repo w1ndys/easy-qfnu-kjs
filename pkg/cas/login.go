@@ -14,6 +14,14 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/W1ndys/easy-qfnu-kjs/pkg/auth"
+	"github.com/W1ndys/easy-qfnu-kjs/pkg/logger"
+)
+
+// 验证码检查接口的重试参数：失败时按指数退避重试，给上游瞬时抖动留出恢复时间。
+const (
+	captchaCheckMaxAttempts  = 3
+	captchaCheckInitialDelay = 1 * time.Second
+	captchaCheckMaxDelay     = 5 * time.Second
 )
 
 const (
@@ -62,27 +70,70 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 		return err
 	}
 
+	MarkUpstreamHealthy()
 	return nil
 }
 
 // checkNeedCaptcha 检查账号是否需要验证码
 func (c *Client) checkNeedCaptcha(ctx context.Context, username string) error {
+	var lastErr error
+	delay := captchaCheckInitialDelay
+
+	for attempt := 1; attempt <= captchaCheckMaxAttempts; attempt++ {
+		needCaptcha, err := c.doCheckNeedCaptcha(ctx, username)
+		if err == nil {
+			if needCaptcha {
+				return errors.New("当前账号需输入验证码，请先在浏览器手动登录一次以消除验证状态")
+			}
+			MarkUpstreamHealthy()
+			return nil
+		}
+
+		lastErr = err
+
+		// 仅对可重试的瞬时错误（网络异常 / 5xx）做指数退避；其他错误直接失败。
+		if !isRetryableUpstreamError(err) || attempt == captchaCheckMaxAttempts {
+			break
+		}
+
+		logger.Warn("验证码检查接口异常（第 %d/%d 次）：%v，%s 后重试...", attempt, captchaCheckMaxAttempts, err, delay)
+
+		select {
+		case <-ctx.Done():
+			lastErr = ctx.Err()
+			break
+		case <-time.After(delay):
+		}
+
+		delay *= 2
+		if delay > captchaCheckMaxDelay {
+			delay = captchaCheckMaxDelay
+		}
+	}
+
+	MarkUpstreamUnhealthy(fmt.Sprintf("学校统一身份认证服务异常：%v", lastErr))
+	return lastErr
+}
+
+// doCheckNeedCaptcha 执行单次验证码状态检查请求。
+// 返回 (是否需要验证码, 错误)；只有上游真的可用时 error 才为 nil。
+func (c *Client) doCheckNeedCaptcha(ctx context.Context, username string) (bool, error) {
 	timestamp := time.Now().UnixMilli()
 	checkURL := fmt.Sprintf("https://ids.qfnu.edu.cn/authserver/checkNeedCaptcha.htl?username=%s&_=%d", username, timestamp)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
 	if err != nil {
-		return fmt.Errorf("创建验证码检查请求失败: %w", err)
+		return false, fmt.Errorf("创建验证码检查请求失败: %w", err)
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("检查验证码状态失败: %w", err)
+		return false, fmt.Errorf("检查验证码状态失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("验证码检查接口异常: %d", resp.StatusCode)
+		return false, fmt.Errorf("验证码检查接口异常: %d", resp.StatusCode)
 	}
 
 	var result struct {
@@ -90,14 +141,29 @@ func (c *Client) checkNeedCaptcha(ctx context.Context, username string) error {
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("解析验证码检查响应失败: %w", err)
+		return false, fmt.Errorf("解析验证码检查响应失败: %w", err)
 	}
 
-	if result.IsNeed {
-		return errors.New("当前账号需输入验证码，请先在浏览器手动登录一次以消除验证状态")
-	}
+	return result.IsNeed, nil
+}
 
-	return nil
+// isRetryableUpstreamError 判断错误是否属于上游瞬时故障，可以通过重试缓解。
+// 包括：网络错误（resp 为 nil 时被包装为 "检查验证码状态失败"）、以及 5xx 状态码。
+func isRetryableUpstreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "检查验证码状态失败") {
+		return true
+	}
+	// 命中 5xx：500 / 502 / 503 / 504 等。
+	for _, code := range []string{": 500", ": 502", ": 503", ": 504"} {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchLoginParams 获取登录页面所需的动态参数
