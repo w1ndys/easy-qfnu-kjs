@@ -1,5 +1,5 @@
 <script setup>
-import { watch } from 'vue'
+import { ref, watch } from 'vue'
 import { useDateSelection } from '@/composables/useDateSelection'
 
 const props = defineProps({
@@ -23,6 +23,12 @@ const {
   updateCustomOffset,
 } = useDateSelection(props.modelValue)
 
+const customOffsetStr = ref(String(customOffset.value))
+
+watch(customOffset, (val) => {
+  customOffsetStr.value = String(val)
+})
+
 watch(
   () => props.modelValue,
   (nextValue) => {
@@ -36,8 +42,11 @@ watch(dateOffset, (nextValue) => {
   emit('update:modelValue', nextValue)
 })
 
-function handleCustomOffsetInput() {
-  updateCustomOffset(customOffset.value)
+function handleCustomOffsetInput(value) {
+  if (value === '' || value === undefined) {
+    return
+  }
+  updateCustomOffset(Number(value))
 }
 
 function getQuickDateIndex() {
@@ -79,7 +88,7 @@ function onTabChange(index) {
 
     <div v-if="useCustomDate" class="custom-date">
       <van-field
-        v-model.number="customOffset"
+        v-model="customOffsetStr"
         type="digit"
         placeholder="输入天数"
         :border="false"

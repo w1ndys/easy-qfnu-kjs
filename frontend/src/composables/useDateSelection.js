@@ -40,7 +40,13 @@ export function useDateSelection(initialOffset = 0) {
   }
 
   function updateCustomOffset(value = customOffset.value) {
-    customOffset.value = clamp(Number(value) || 0, MIN_OFFSET, MAX_OFFSET)
+    const numValue = Number(value)
+    if (isNaN(numValue)) {
+      customOffset.value = MIN_OFFSET
+      dateOffset.value = MIN_OFFSET
+      return
+    }
+    customOffset.value = clamp(numValue, MIN_OFFSET, MAX_OFFSET)
     dateOffset.value = customOffset.value
   }
 
