@@ -5,7 +5,7 @@ silent: true
 
 vars:
   COMPOSE: docker compose
-  HOST: '{{default "mylinux" .HOST}}'
+  HOST: '{{default "n100" .HOST}}'
   PORT: '{{default "22" .PORT}}'
   USER: '{{default "root" .USER}}'
   DIR: '{{default "/opt/easy-qfnu-kjs" .DIR}}'
@@ -22,7 +22,7 @@ tasks:
         printf "  task backend-dev     启动后端开发服务\n"
         printf "  task frontend-dev    启动前端开发服务\n"
         printf "\n运维命令:\n"
-        printf "  task deploy          一键部署 (默认: HOST=mylinux PORT=22 USER=root DIR=/opt/easy-qfnu-kjs)\n"
+        printf "  task deploy          一键部署 (默认: HOST=n100 PORT=22 USER=root DIR=/opt/easy-qfnu-kjs)\n"
         printf "  task deploy HOST=1.2.3.4 PORT=22 USER=root DIR=/srv/app   覆盖默认参数\n"
 
   env-init:
