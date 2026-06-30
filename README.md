@@ -33,6 +33,7 @@ Docker 构建阶段已内置 Go 和 npm 国内镜像配置：
 |--------|------|--------|
 | `QFNU_USERNAME` 或 `QFNU_USER` | 学号 | 无 |
 | `QFNU_PASSWORD` 或 `QFNU_PASS` | 密码 | 无 |
+| `OCR_URL` | OCR 服务基础地址，后端调用 `${OCR_URL}/ocr` 识别验证码 | 无 |
 | `PORT` | 后端容器监听端口 | `8080` |
 | `GIN_MODE` | Gin 运行模式 | `release` |
 
