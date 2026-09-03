@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/w1ndys/easy-qfnu-kjs/schemas/config.schema.v1.json",
+  "title": "采集白名单配置",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "groups"],
+  "properties": {
+    "version": { "const": 1 },
+    "groups": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/group"
+      }
+    }
+  },
+  "$defs": {
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "enabled",
+        "include_prefixes",
+        "include_exact_names",
+        "exclude_prefixes",
+        "exclude_exact_names"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "enabled": { "type": "boolean" },
+        "order": { "type": "integer", "minimum": 0 },
+        "include_prefixes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "include_exact_names": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "exclude_prefixes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "exclude_exact_names": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    }
+  }
+}
