@@ -165,6 +165,7 @@ function handleFullDayStatus(
 }
 
 function handle(req: Request): Response {
+  console.error('[probe] handle-enter', req.method, req.url);
   // Vercel 部分环境传入相对路径 URL，补 base 保证可解析。
   const url = new URL(req.url, 'https://vercel.app');
   const segments = url.pathname.split('/').filter(Boolean); // ['api','v1',resource]
@@ -184,7 +185,9 @@ function handle(req: Request): Response {
   }
 
   try {
+    console.error('[probe] before-manifest');
     const manifest = getManifest(); // ApiError（数据损坏/索引不一致）直接向上抛
+    console.error('[probe] manifest', manifest ? manifest.term : null);
     const ctx = manifest
       ? computeContext(manifest.term, manifest.anchor, new Date(requestNow()))
       : null;

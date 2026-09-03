@@ -618,6 +618,7 @@ function handleFullDayStatus(manifest, ctx, searchParams) {
   );
 }
 function handle(req) {
+  console.error("[probe] handle-enter", req.method, req.url);
   const url = new URL(req.url, "https://vercel.app");
   const segments = url.pathname.split("/").filter(Boolean);
   const instance = url.pathname + url.search;
@@ -634,7 +635,9 @@ function handle(req) {
     });
   }
   try {
+    console.error("[probe] before-manifest");
     const manifest = getManifest();
+    console.error("[probe] manifest", manifest ? manifest.term : null);
     const ctx = manifest ? computeContext(manifest.term, manifest.anchor, new Date(requestNow())) : null;
     switch (resource) {
       case "manifest":
