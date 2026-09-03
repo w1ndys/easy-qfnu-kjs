@@ -9,8 +9,8 @@ web/dist/
 *.local
 
 # --- go / collector ---
-cmd/collector/collector
-collector
+# 根目录编译产物（避免裸 "collector" 误忽略 cmd/collector、internal/collector 目录）
+/collector
 logs/
 *.log
 
