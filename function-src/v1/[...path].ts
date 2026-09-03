@@ -165,7 +165,8 @@ function handleFullDayStatus(
 }
 
 function handle(req: Request): Response {
-  const url = new URL(req.url);
+  // Vercel 部分环境传入相对路径 URL，补 base 保证可解析。
+  const url = new URL(req.url, 'https://vercel.app');
   const segments = url.pathname.split('/').filter(Boolean); // ['api','v1',resource]
   const instance = url.pathname + url.search;
 
