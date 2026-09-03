@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "id": "zong-he-jiao-xue-lou",
+      "name": "综合教学楼",
+      "enabled": true,
+      "order": 1,
+      "include_prefixes": ["综合教学楼"],
+      "include_exact_names": [],
+      "exclude_prefixes": [],
+      "exclude_exact_names": []
+    },
+    {
+      "id": "wen-shi-lou",
+      "name": "文史楼",
+      "enabled": true,
+      "order": 2,
+      "include_prefixes": ["文史楼"],
+      "include_exact_names": [],
+      "exclude_prefixes": [],
+      "exclude_exact_names": []
+    },
+    {
+      "id": "lao-wen-shi-lou",
+      "name": "老文史楼",
+      "enabled": true,
+      "order": 3,
+      "include_prefixes": ["老文史楼"],
+      "include_exact_names": [],
+      "exclude_prefixes": [],
+      "exclude_exact_names": []
+    },
+    {
+      "id": "ja",
+      "name": "JA",
+      "enabled": true,
+      "order": 4,
+      "include_prefixes": ["JA"],
+      "include_exact_names": [],
+      "exclude_prefixes": [],
+      "exclude_exact_names": []
+    }
+  ]
+}
