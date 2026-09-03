@@ -7,19 +7,19 @@
 //   GET /api/v1/full-day-status     全天状态查询
 //
 // 未知路径 → 404；非 GET → 405；错误一律 RFC 9457 application/problem+json（附稳定扩展 code）。
-import { roomFreeInRange } from '../../api-lib/availability';
-import { getManifest, getWeekFile } from '../../api-lib/data';
-import { ApiError, CODES, errorToResponse, problemResponse } from '../../api-lib/errors';
-import { keywordMatchesName } from '../../api-lib/keyword';
-import { parseNodeSpan, parseQueryBase, type QueryBase } from '../../api-lib/params';
-import { computeContext, requestNow, type ContextResult } from '../../api-lib/time';
-import type { Manifest, SnapshotRoom, SnapshotWeekFile } from '../../api-lib/types';
+import { roomFreeInRange } from '../../api-lib/availability.ts';
+import { getManifest, getWeekFile } from '../../api-lib/data.ts';
+import { ApiError, CODES, errorToResponse, problemResponse } from '../../api-lib/errors.ts';
+import { keywordMatchesName } from '../../api-lib/keyword.ts';
+import { parseNodeSpan, parseQueryBase, type QueryBase } from '../../api-lib/params.ts';
+import { computeContext, requestNow, type ContextResult } from '../../api-lib/time.ts';
+import type { Manifest, SnapshotRoom, SnapshotWeekFile } from '../../api-lib/types.ts';
 import {
   buildFullDayList,
   buildManifestView,
   buildRoomList,
   buildSnapshotView,
-} from '../../api-lib/views';
+} from '../../api-lib/views.ts';
 
 // 数据接口成功响应缓存（Q96）：CDN 300s，回源后 600s 内可继续用旧副本。
 const CACHE_DATA = 'public, s-maxage=300, stale-while-revalidate=600';

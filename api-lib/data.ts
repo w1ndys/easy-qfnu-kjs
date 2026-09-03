@@ -17,13 +17,13 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { ApiError, CODES } from './errors';
+import { ApiError, CODES } from './errors.ts';
 import {
   releaseId as staticReleaseId,
   term as staticTerm,
   weeks as staticWeeks,
-} from './generated-index';
-import type { DataIndex, Manifest, SnapshotWeekFile } from './types';
+} from './generated-index.ts';
+import type { DataIndex, Manifest, SnapshotWeekFile } from './types.ts';
 
 interface DataCache {
   root: string;

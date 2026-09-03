@@ -1,10 +1,14 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2023"],
+    "lib": [
+      "ES2023"
+    ],
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "noEmit": true,
     "isolatedModules": true,
@@ -15,8 +19,14 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "paths": {
-      "vitest": ["./node_modules/vitest"]
-    }
+      "vitest": [
+        "./node_modules/vitest"
+      ]
+    },
+    "allowImportingTsExtensions": true
   },
-  "include": ["v1/**/*.ts", "../api-lib/**/*.ts"]
+  "include": [
+    "v1/**/*.ts",
+    "../api-lib/**/*.ts"
+  ]
 }

@@ -6,11 +6,19 @@
   "functions": {
     "api/v1/[...path].ts": {
       "maxDuration": 30,
-      "regions": ["hkg1"],
-      "includeFiles": "data/**"
+      "regions": [
+        "hkg1"
+      ],
+      "includeFiles": [
+        "data/**",
+        "api-lib/**"
+      ]
     }
   },
   "rewrites": [
-    { "source": "/((?!api/).*)", "destination": "/index.html" }
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/index.html"
+    }
   ]
 }

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { call, clearFixture, get, problemOf, useFixture } from './helpers';
+import { call, clearFixture, get, problemOf, useFixture } from './helpers.ts';
 
 // fixture root-a：教学周内（anchor 2026-09-01 周二 = 第 2 周，total 4；已发布 1–3 周）。
 const NOW_A = '2026-09-03T00:00:00+08:00'; // 周四 09-03

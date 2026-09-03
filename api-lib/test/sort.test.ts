@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { naturalCompare } from '../sort';
+import { naturalCompare } from '../sort.ts';
 
 describe('naturalCompare（§11.3：按名称自然排序，同名按 jsbh）', () => {
   it('数字段按数值比较', () => {

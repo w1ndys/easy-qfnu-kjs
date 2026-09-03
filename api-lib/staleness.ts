@@ -4,7 +4,7 @@
 //   - 近期周（当前周..当前周+4，含当前周）距最近成功采集超过 36 小时 → stale；
 //   - 其余周超过 8 天 → stale；
 //   - 教学日历内但没有任何已发布快照的周 → missing。
-import type { ManifestWeekEntry } from './types';
+import type { ManifestWeekEntry } from './types.ts';
 
 export type WeekStatus = 'fresh' | 'stale' | 'missing';
 

@@ -7,7 +7,7 @@ import {
   parseCivilDate,
   shanghaiCivilDate,
   weekdayOf,
-} from '../time';
+} from '../time.ts';
 
 const TERM = '2026-2027-1';
 
