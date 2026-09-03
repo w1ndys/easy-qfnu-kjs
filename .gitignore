@@ -1,0 +1,24 @@
+# --- secrets ---
+.env
+.env.*
+!.env.example
+
+# --- node / web ---
+node_modules/
+web/dist/
+*.local
+
+# --- go / collector ---
+cmd/collector/collector
+collector
+logs/
+*.log
+
+# --- ide / os ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- staging (候选快照暂存，若在仓库内) ---
+.tmp-staging/
