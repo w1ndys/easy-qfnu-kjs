@@ -1,18 +1,15 @@
 {
-  "buildCommand": "cd web && npm ci && npm run build",
-  "installCommand": "cd web && npm ci",
+  "buildCommand": "node scripts/build-function.mjs && cd web && npm run build",
+  "installCommand": "npm ci && cd web && npm ci",
   "outputDirectory": "web/dist",
   "framework": null,
   "functions": {
-    "api/v1/[...path].ts": {
+    "api/v1/[...path].js": {
       "maxDuration": 30,
       "regions": [
         "hkg1"
       ],
-      "includeFiles": [
-        "data/**",
-        "api-lib/**"
-      ]
+      "includeFiles": "data/**"
     }
   },
   "rewrites": [

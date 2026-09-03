@@ -25,3 +25,5 @@ logs/
 .vercel
 .env*
 !.env.example
+# Vercel 函数构建产物（构建期生成）
+api/v1/[...path].js

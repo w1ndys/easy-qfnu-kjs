@@ -1,0 +1,11 @@
+{
+  "name": "easy-qfnu-kjs-root",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:function": "node scripts/build-function.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
