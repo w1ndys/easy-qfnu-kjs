@@ -6,7 +6,9 @@
 ## 1. 登录
 
 - CAS 统一认证：登录页取 `salt`/`execution`，AES/CBC/PKCS7 加密密码，提交后带 ticket 跳转 SSO。
-- 实现：`pkg/cas`（复制自旧仓库）。验证码经 `OCR_URL` 自动识别。
+- 实现：`pkg/cas`（自旧仓库迁移）。验证码用本地离线识别：默认调用
+  `scripts/ocr_ddddocr.py`（Python `ddddocr`），可用 `OCR_CMD` 指向任意本地命令；
+  不做任何网络 OCR 服务。
 
 ## 2. 学期与当前周
 
