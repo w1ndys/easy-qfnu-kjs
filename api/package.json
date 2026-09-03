@@ -1,0 +1,20 @@
+{
+  "name": "easy-qfnu-kjs-api",
+  "private": true,
+  "version": "0.1.0",
+  "description": "easy-qfnu-kjs Vercel Serverless API（manifest / context / empty-classrooms / full-day-status）",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
