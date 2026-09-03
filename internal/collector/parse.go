@@ -199,21 +199,48 @@ func parseRowCells(tds *goquery.Selection, row *ParsedRow) error {
 	return nil
 }
 
-// mapStatusText 状态文本 → ID；空文本视为空闲；未知文本返回错误。
+// mapStatusText 状态文本 → ID；空文本视为空闲。
+// 同一格可能出现多个已知符号（如 "◆Ｊ"），代表多重占用 → 归并为复合占用；
+// 任一符号未知时返回错误，禁止发布。
+// 优先整词匹配（"空闲""完全空闲"是多字符号），无空白分隔的多符号文本按字符合并。
 func mapStatusText(text string) (int, error) {
-	if text == "" {
+	tokens := strings.Fields(text)
+	if len(tokens) == 0 {
 		return statusEmptyID, nil
 	}
-	if id, ok := statusGlyphToID[text]; ok {
-		return id, nil
-	}
-	// 兼容行内可能夹带的不可见字符。
-	for _, line := range strings.Fields(text) {
-		if id, ok := statusGlyphToID[line]; ok {
-			return id, nil
+	ids := make([]int, 0, len(tokens))
+	for _, tok := range tokens {
+		if id, ok := statusGlyphToID[tok]; ok {
+			ids = append(ids, id)
+			continue
 		}
+		// 无空白分隔的复合符号：整词未收录时按字符拆分判断。
+		runes := []rune(tok)
+		allKnown := len(runes) > 1
+		for _, r := range runes {
+			if _, ok := statusGlyphToID[string(r)]; !ok {
+				allKnown = false
+				break
+			}
+		}
+		if allKnown {
+			ids = append(ids, statusCompositeID)
+			continue
+		}
+		return 0, fmt.Errorf("未收录的状态符号 %q", truncateRunes(tok, 4))
 	}
-	return 0, fmt.Errorf("未收录的状态符号")
+	if len(ids) == 1 {
+		return ids[0], nil
+	}
+	return statusCompositeID, nil
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // StatusesForDay 把单行某天（day=0..6）的 5 大节状态展开为 01—12 小节映射

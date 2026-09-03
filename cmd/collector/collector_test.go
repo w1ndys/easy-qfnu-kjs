@@ -287,3 +287,30 @@ func TestOCRLocalCommandTimeout(t *testing.T) {
 		t.Fatal("超时应报错")
 	}
 }
+
+func TestParseWeekCompositeStatus(t *testing.T) {
+	// 同一格出现 ◆＋Ｊ 两个符号（上游双 <font>）→ 归并为复合占用 10，不阻断解析。
+	rows, err := collector.ParseWeekHTML(readFixture(t, "week_composite.html"))
+	if err != nil {
+		t.Fatalf("复合状态不应导致解析失败: %v", err)
+	}
+	var found bool
+	for _, row := range rows {
+		for d := range 7 {
+			for b := range 5 {
+				if row.Blocks[d][b] == 10 {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Error("fixture 应包含复合占用 10 的状态格")
+	}
+	if len(rows) == 0 {
+		t.Fatal("应解析出至少一行")
+	}
+	if rows[0].Blocks[0][0] != 10 {
+		t.Errorf("0899 首格应为复合占用 10, got %d", rows[0].Blocks[0][0])
+	}
+}

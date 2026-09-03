@@ -61,6 +61,10 @@ var statusGlyphToID = map[string]int{
 
 var statusEmptyID = 5 // 空单元格 = 空闲
 
+// statusCompositeID 表示同一格出现多个已知状态符号（如 <font>◆</font><font>Ｊ</font>），
+// 上游语义为多重占用，绝不等于空闲。仅在全部符号均已知时才归并为此 ID。
+const statusCompositeID = 10
+
 // statusDefs 是 manifest.statuses 的稳定字典。
 var statusDefs = []struct {
 	ID        int
@@ -76,6 +80,7 @@ var statusDefs = []struct {
 	{7, "临时调课", false},
 	{8, "完全空闲", true},
 	{9, "跨模式占用", false},
+	{10, "复合占用", false},
 }
 
 const (
