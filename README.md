@@ -28,8 +28,9 @@
 ## 快速开始
 
 ```bash
-cp .env.example .env     # 填写 QFNU_USERNAME / QFNU_PASSWORD
-pip install ddddocr      # 验证码本地识别（OCR_CMD 默认指向 scripts/ocr_ddddocr.py）
+cp .env.example .env     # 填写 QFNU_USERNAME / QFNU_PASSWORD；OCR_CMD 已指向 uv 全局环境
+uv venv ~/.local/share/easy-qfnu-ocr-venv --python 3.12
+uv pip install --python ~/.local/share/easy-qfnu-ocr-venv/bin/python ddddocr
 go run ./cmd/collector run --dry-run
 ```
 
