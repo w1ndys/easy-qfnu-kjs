@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "release_id": "rel-20260903-041000-holiday",
+  "term": "2026-2027-1",
+  "generated_at": "2026-09-03T04:10:00+08:00",
+  "anchor": {
+    "date": "2026-08-03",
+    "week": 0,
+    "total_weeks": 4,
+    "timezone": "Asia/Shanghai",
+    "in_teaching_calendar": false
+  },
+  "groups": [
+    {
+      "id": "zong-he-jiao-xue-lou",
+      "name": "综合教学楼",
+      "order": 10,
+      "room_count": 6
+    },
+    {
+      "id": "ti-yu-guan",
+      "name": "体育馆",
+      "order": 20,
+      "room_count": 2
+    }
+  ],
+  "nodes": [
+    {
+      "code": "01",
+      "source_block": "0102"
+    },
+    {
+      "code": "02",
+      "source_block": "0102"
+    },
+    {
+      "code": "03",
+      "source_block": "030405"
+    },
+    {
+      "code": "04",
+      "source_block": "030405"
+    },
+    {
+      "code": "05",
+      "source_block": "030405"
+    },
+    {
+      "code": "06",
+      "source_block": "0607"
+    },
+    {
+      "code": "07",
+      "source_block": "0607"
+    },
+    {
+      "code": "08",
+      "source_block": "0809"
+    },
+    {
+      "code": "09",
+      "source_block": "0809"
+    },
+    {
+      "code": "10",
+      "source_block": "101112"
+    },
+    {
+      "code": "11",
+      "source_block": "101112"
+    },
+    {
+      "code": "12",
+      "source_block": "101112"
+    }
+  ],
+  "statuses": {
+    "1": {
+      "name": "使用中",
+      "available": false
+    },
+    "2": {
+      "name": "未开放",
+      "available": false
+    },
+    "3": {
+      "name": "设备维护",
+      "available": false
+    },
+    "4": {
+      "name": "考试",
+      "available": false
+    },
+    "5": {
+      "name": "空闲",
+      "available": true
+    },
+    "6": {
+      "name": "临时占用",
+      "available": false
+    },
+    "7": {
+      "name": "不可用",
+      "available": false
+    },
+    "8": {
+      "name": "空闲（可预约）",
+      "available": true
+    },
+    "9": {
+      "name": "未知",
+      "available": false
+    }
+  },
+  "weeks": {
+    "1": {
+      "week": 1,
+      "snapshot_id": "snap-2026-08-24-week-01",
+      "sha256": "0e6d9c97e92e35595bc02f79f1e95b6434021291eb1000616370a337a784d626",
+      "generated_at": "2026-08-24T04:10:00+08:00",
+      "last_success_at": "2026-08-24T04:10:00+08:00"
+    },
+    "2": {
+      "week": 2,
+      "snapshot_id": "snap-2026-09-02-week-02",
+      "sha256": "68c7441d641d19e38922fd2ca4f82de38cf920ac65995cda75f7ecd496732a7f",
+      "generated_at": "2026-09-02T04:10:00+08:00",
+      "last_success_at": "2026-09-02T04:10:00+08:00"
+    },
+    "3": {
+      "week": 3,
+      "snapshot_id": "snap-2026-09-02-week-03",
+      "sha256": "9d3d335ca6e26fe0331e3a3934539d46d236ea0956e75cfb7d57b83bd41e0cf0",
+      "generated_at": "2026-09-02T04:10:00+08:00",
+      "last_success_at": "2026-09-02T04:10:00+08:00"
+    }
+  }
+}
