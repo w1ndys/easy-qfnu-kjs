@@ -1,0 +1,229 @@
+package collector
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/PuerkitoBio/goquery"
+)
+
+const (
+	numDays   = 7
+	numBlocks = 5
+	// 每行单元格数 = 1 个教室列 + 7 天 × 5 大节状态格。
+	expectedRowCells = 1 + numDays*numBlocks
+)
+
+// ParsedRow 单间教室一行的解析结果。Blocks[day][block] 是状态 ID：
+// day=0..6 对应星期一..星期日，block=0..4 对应 {0102,030405,0607,0809,101112}。
+type ParsedRow struct {
+	Jsbh   string
+	Name   string // 规范化后的房间名
+	Blocks [numDays][numBlocks]int
+}
+
+// ParseWeekHTML 解析 jsjy_query2 返回的整周表格 HTML。
+//
+// 结构契约（docs/upstream.md）：
+//   - 存在 table#dataList；表头 td 携带 tdvalue，按天重复 5 大节；
+//   - 数据行共 1+35 个 td：首列为教室（checkbox + 房名），随后按
+//     天（xq=1..7）× 大节顺序排列状态格；
+//   - 状态文本 → ID；空文本 = 5（空闲）；未知文本 → 结构失败（禁止发布）。
+//
+// 调用方必须先排除登录页/非法访问页特征；这里会再次防御性检测。
+func ParseWeekHTML(body string) ([]ParsedRow, error) {
+	if strings.Contains(body, MarkLoginPage) {
+		return nil, newGlobal(CodeLoginPage, "响应命中登录页特征，无法解析周表")
+	}
+	if strings.Contains(body, MarkIllegalAccess) {
+		return nil, newGlobal(CodeIllegalAccess, "响应命中非法访问特征，无法解析周表")
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(body))
+	if err != nil {
+		return nil, newGlobal(CodeStructure, "解析 HTML 失败: %v", err)
+	}
+
+	table := doc.Find("table#dataList").First()
+	if table.Length() == 0 {
+		return nil, newGlobal(CodeStructure, "响应中缺少 table#dataList，无法解析周表")
+	}
+
+	// --- 表头大节块 ---
+	var blocks []string
+	table.Find("td[tdvalue]").Each(func(_ int, s *goquery.Selection) {
+		if v, ok := s.Attr("tdvalue"); ok {
+			blocks = append(blocks, v)
+		}
+	})
+	if err := validateHeaderBlocks(blocks); err != nil {
+		return nil, err
+	}
+
+	// --- 数据行（tbody；HTML5 解析器会补全省略的 tbody）---
+	var rows []ParsedRow
+	seenJsbh := map[string]bool{}
+
+	var parseErr error
+	dataRows := table.Find("tbody > tr")
+	if dataRows.Length() == 0 {
+		// 兜底：无 tbody 时取不属于 thead 的行。
+		dataRows = table.Find("tr").FilterFunction(func(_ int, s *goquery.Selection) bool {
+			return s.ParentsFiltered("thead").Length() == 0
+		})
+	}
+	dataRows.Each(func(_ int, tr *goquery.Selection) {
+		if parseErr != nil {
+			return
+		}
+		if tr.Find("th").Length() > 0 || tr.Find("td[tdvalue]").Length() > 0 {
+			return // 表头行（th 或 tdvalue 行）
+		}
+		tds := tr.Find("td")
+		if tds.Length() == 0 {
+			return
+		}
+		if tds.Length() != expectedRowCells {
+			parseErr = newGlobal(CodeStructure,
+				"数据行单元格数异常：期望 %d 实际 %d", expectedRowCells, tds.Length())
+			return
+		}
+
+		jsbh := extractJsbh(tr, tds)
+		if jsbh == "" {
+			parseErr = newGlobal(CodeStructure, "数据行缺少 jsbh（行属性与 checkbox value 均为空）")
+			return
+		}
+		if seenJsbh[jsbh] {
+			parseErr = newGlobal(CodeStructure, "同一响应中 jsbh 重复: %s", jsbh)
+			return
+		}
+		seenJsbh[jsbh] = true
+
+		name := NormalizeRoomName(strings.TrimSpace(tds.First().Text()))
+		if name == "" {
+			parseErr = newGlobal(CodeStructure, "jsbh=%s 的房间名称为空", jsbh)
+			return
+		}
+
+		row := ParsedRow{Jsbh: jsbh, Name: name}
+		if err := parseRowCells(tds, &row); err != nil {
+			parseErr = err
+			return
+		}
+		rows = append(rows, row)
+	})
+	if parseErr != nil {
+		return nil, parseErr
+	}
+	if len(rows) == 0 {
+		return nil, newGlobal(CodeStructure, "dataList 中没有解析到任何教室数据行")
+	}
+	return rows, nil
+}
+
+// validateHeaderBlocks 校验表头 tdvalue 集合恰为 7×5 且按天按序等于 5 大节。
+func validateHeaderBlocks(blocks []string) error {
+	if len(blocks) != numDays*numBlocks {
+		return newGlobal(CodeStructure,
+			"表头 tdvalue 块数量异常：期望 %d 实际 %d（块=%s）",
+			numDays*numBlocks, len(blocks), summarizeBlocks(blocks))
+	}
+	for d := range numDays {
+		group := blocks[d*numBlocks : (d+1)*numBlocks]
+		for b, want := range canonicalBlocks {
+			if group[b] != want {
+				return newGlobal(CodeStructure,
+					"表头节次块集合变化：第 %d 天第 %d 块 %q ≠ 期望 %q（完整块=%s）；作息调整需人工确认",
+					d+1, b+1, group[b], want, summarizeBlocks(blocks))
+			}
+		}
+	}
+	return nil
+}
+
+func summarizeBlocks(blocks []string) string {
+	if len(blocks) == 0 {
+		return "(空)"
+	}
+	seen := make([]string, 0, len(blocks))
+	seenMap := map[string]bool{}
+	for _, b := range blocks {
+		if !seenMap[b] {
+			seenMap[b] = true
+			seen = append(seen, b)
+		}
+	}
+	return strings.Join(seen, ",")
+}
+
+// extractJsbh 优先取 <tr jsbh=...>，否则取行内 checkbox 的 value。
+func extractJsbh(tr *goquery.Selection, tds *goquery.Selection) string {
+	if v, ok := tr.Attr("jsbh"); ok {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	if v, ok := tr.Find("input[type=checkbox]").First().Attr("value"); ok {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	// 兜底：首列内任意带 value 的 input（checkbox 命名可能变化）。
+	if v, ok := tds.First().Find("input[value]").First().Attr("value"); ok {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// parseRowCells 把第 1 列之后的 35 个状态格填入 row.Blocks。
+func parseRowCells(tds *goquery.Selection, row *ParsedRow) error {
+	idx := 1
+	for d := range numDays {
+		for b := range numBlocks {
+			if idx >= tds.Length() {
+				return newGlobal(CodeStructure, "数据行状态格不足 35 个")
+			}
+			text := strings.TrimSpace(tds.Eq(idx).Text())
+			id, err := mapStatusText(text)
+			if err != nil {
+				return newGlobal(CodeStructure, "jsbh=%s 出现未知状态文本 %s: %v",
+					row.Jsbh, quoteShort(text, 16), err)
+			}
+			row.Blocks[d][b] = id
+			idx++
+		}
+	}
+	return nil
+}
+
+// mapStatusText 状态文本 → ID；空文本视为空闲；未知文本返回错误。
+func mapStatusText(text string) (int, error) {
+	if text == "" {
+		return statusEmptyID, nil
+	}
+	if id, ok := statusGlyphToID[text]; ok {
+		return id, nil
+	}
+	// 兼容行内可能夹带的不可见字符。
+	for _, line := range strings.Fields(text) {
+		if id, ok := statusGlyphToID[line]; ok {
+			return id, nil
+		}
+	}
+	return 0, fmt.Errorf("未收录的状态符号")
+}
+
+// StatusesForDay 把单行某天（day=0..6）的 5 大节状态展开为 01—12 小节映射
+// （块内小节状态一致，业务不变量）。
+func (row *ParsedRow) StatusesForDay(day int) map[string]int {
+	out := map[string]int{}
+	for b, block := range canonicalBlocks {
+		for _, code := range blockChildCodes[block] {
+			out[code] = row.Blocks[day][b]
+		}
+	}
+	return out
+}
