@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // 生成构建期静态 TypeScript 数据索引（决策文件 §13）：扫描 data/manifest.json 与
-// data/terms/<term>/weeks/week-*.json，写出 api/lib/generated-index.ts，导出
+// data/terms/<term>/weeks/week-*.json，写出 api-lib/generated-index.ts，导出
 // term / releaseId / weeks（{ week: { week, snapshotId, sha256, path } }），供
 // Serverless 函数启动时映射“当前学期周次 → 周快照文件”，避免把全部 JSON 静态内联。
 //
 // 用法：node scripts/generate-data-index.mjs [--root <仓库根>] [--out <输出文件>]
 //   --root 默认 process.cwd()；数据目录固定取 <root>/data。
-//   --out  默认 <root>/api/lib/generated-index.ts。
+//   --out  默认 <root>/api-lib/generated-index.ts。
 // 行为：manifest.json 缺失 → 写空索引并退出 0（构建不因“暂无数据”失败）；
 //       manifest 损坏 / schema 版本不受支持 / 周文件与 manifest 不一致 → 非零退出。
 import { createHash } from 'node:crypto';
@@ -25,7 +25,7 @@ function parseArgs(argv) {
       process.exit(2);
     }
   }
-  if (out === null) out = path.join(root, 'api', 'lib', 'generated-index.ts');
+  if (out === null) out = path.join(root, 'api-lib', 'generated-index.ts');
   return { root, out };
 }
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { weekStatus } from '../lib/staleness';
-import type { ManifestWeekEntry } from '../lib/types';
+import { weekStatus } from '../staleness';
+import type { ManifestWeekEntry } from '../types';
 
 const NOW = Date.parse('2026-09-03T00:00:00+08:00');
 

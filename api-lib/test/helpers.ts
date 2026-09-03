@@ -2,7 +2,7 @@
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import handler from '../v1/[...path]';
+import handler from '../../api/v1/[...path]';
 
 export const FIXTURES = fileURLToPath(new URL('./fixtures', import.meta.url));
 

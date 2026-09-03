@@ -65,7 +65,7 @@ export interface SnapshotWeekFile {
   days: Record<string, { rooms: SnapshotRoom[] }>;
 }
 
-/** api/lib/generated-index.ts（或测试覆盖 JSON）导出的构建期数据索引。 */
+/** api-lib/generated-index.ts（或测试覆盖 JSON）导出的构建期数据索引。 */
 export interface DataIndex {
   term: string;
   releaseId: string;

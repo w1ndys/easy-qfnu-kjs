@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "vitest run",
+    "test": "vitest run --root .. api-lib/test",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit"
   },

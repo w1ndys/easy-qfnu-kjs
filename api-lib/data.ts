@@ -2,7 +2,7 @@
 //
 // 数据契约：
 //   - 构建时由 scripts/generate-data-index.mjs 扫描 data/manifest.json 与
-//     data/terms/<term>/weeks/week-*.json，生成 api/lib/generated-index.ts（term/releaseId/weeks，
+//     data/terms/<term>/weeks/week-*.json，生成 api-lib/generated-index.ts（term/releaseId/weeks，
 //     每项 { week, snapshotId, sha256, path }）；
 //   - 函数包通过 vercel.json 的 functions.includeFiles 携带 data/**；
 //   - 运行时用 fs.readFileSync 按索引懒加载需要的 JSON，不做静态内联，也不在请求时访问 GitHub。
@@ -41,7 +41,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 function resolveRoot(): string {
   const envRoot = process.env.EASY_KJS_ROOT;
   if (envRoot) return path.resolve(envRoot);
-  // 向上查找数据根（源码布局：api/lib -> .. -> .. = 仓库根；Vercel 打包同样保留 data/ 相对位置）。
+  // 向上查找数据根（源码布局：api-lib -> .. = 仓库根；Vercel 打包同样保留 data/ 相对位置）。
   let dir = HERE;
   for (;;) {
     if (existsSync(path.join(dir, 'data'))) return dir;
