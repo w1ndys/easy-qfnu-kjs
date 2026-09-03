@@ -22,3 +22,6 @@ logs/
 
 # --- staging (候选快照暂存，若在仓库内) ---
 .tmp-staging/
+.vercel
+.env*
+!.env.example
