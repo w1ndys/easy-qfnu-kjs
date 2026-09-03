@@ -1,0 +1,230 @@
+/* ===== Vant 4 主题变量覆盖（品牌棕 #884F22 系列；v1 不做暗色模式） ===== */
+/* 双 :root 提升特异性：组件库自身在 :root 上声明变量且晚于本文件加载，
+   必须用更高优先级才能在按需引入（样式顺序不可控）下稳定覆盖主题。 */
+:root:root {
+  /* 品牌色 */
+  --van-primary-color: #884f22;
+  --van-primary-color-light: #f3e5d8;
+  --van-primary-color-dark: #5f3517;
+
+  /* 语义色 */
+  --van-success-color: #156b52;
+  --van-warning-color: #9a5a00;
+  --van-danger-color: #b42318;
+
+  /* 文字色 */
+  --van-text-color: #1f1b18;
+  --van-text-color-2: #4c433d;
+  --van-text-color-3: #8a7c70;
+
+  /* 背景与边框 */
+  --van-background: #f8f5f2;
+  --van-background-2: #ffffff;
+  --van-background-3: #f3efeb;
+  --van-border-color: #e5ded7;
+
+  /* 圆角 */
+  --van-radius-sm: 8px;
+  --van-radius-md: 12px;
+  --van-radius-lg: 16px;
+
+  /* ===== 项目级自定义变量 ===== */
+  --color-brand-500: #884f22;
+  --color-brand-600: #76441e;
+  --color-brand-700: #5f3517;
+  --color-brand-100: #f3e5d8;
+  --color-brand-200: #e7cfba;
+  --color-surface-page: #f8f5f2;
+  --color-surface-card: #ffffff;
+  --color-surface-section: #f3efeb;
+  --color-surface-raised: #fffdfc;
+  --color-text-primary: #1f1b18;
+  --color-text-secondary: #4c433d;
+  --color-text-tertiary: #8a7c70;
+  --color-border-subtle: #e5ded7;
+  --color-border-strong: #d1c7be;
+  --color-success-bg: #eaf8f3;
+  --color-success-fg: #156b52;
+  --color-success-border: #a7dec7;
+  --color-warning-bg: #fff6e8;
+  --color-warning-fg: #9a5a00;
+  --color-warning-border: #f3cf8d;
+  --color-error-bg: #fdeeee;
+  --color-error-fg: #b42318;
+  --color-error-border: #f5b3ae;
+  --color-info-bg: #ecf3ff;
+  --color-info-fg: #1d4ed8;
+  --color-info-border: #b7cbff;
+}
+
+/* ===== 全局基础 ===== */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  font-family: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', 'Segoe UI',
+    Arial, sans-serif;
+  background-color: var(--color-surface-page);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
+/* ===== 页面容器 ===== */
+.page-container {
+  min-height: 100vh;
+  background-color: var(--color-surface-page);
+  padding-bottom: calc(24px + env(safe-area-inset-bottom));
+}
+
+.page-content {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+@media (min-width: 768px) {
+  .page-content {
+    padding: 24px;
+  }
+}
+
+/* ===== 卡片 ===== */
+.app-card {
+  background: var(--color-surface-card);
+  border-radius: var(--van-radius-lg);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: 0 1px 2px rgba(31, 27, 24, 0.06), 0 4px 12px rgba(31, 27, 24, 0.04);
+  padding: 16px;
+}
+
+@media (min-width: 768px) {
+  .app-card {
+    padding: 20px;
+  }
+}
+
+.section-gap {
+  margin-bottom: 16px;
+}
+
+/* ===== 表单区块 ===== */
+.form-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-bottom: 8px;
+}
+
+/* ===== 结果提示条 ===== */
+.notice-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+/* ===== 状态徽标（全天状态表单元格/图例共用） ===== */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 5px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  border: 1px solid;
+  line-height: 1;
+}
+
+/* ===== 状态表（横向滚动） ===== */
+.status-table-container {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.status-table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.status-table thead th {
+  background: var(--color-surface-section);
+  padding: 10px 6px;
+  font-weight: 700;
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.status-table thead th:first-child {
+  text-align: left;
+  padding-left: 12px;
+  position: sticky;
+  left: 0;
+  z-index: 12;
+  background: var(--color-surface-section);
+}
+
+.status-table tbody td {
+  padding: 6px 3px;
+  text-align: center;
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.status-table tbody td:first-child {
+  text-align: left;
+  padding: 8px 12px;
+  font-weight: 600;
+  position: sticky;
+  left: 0;
+  z-index: 11;
+  background: var(--color-surface-card);
+  box-shadow: 3px 0 8px rgba(31, 27, 24, 0.05);
+  max-width: 220px;
+}
+
+/* ===== 工具类 ===== */
+.text-brand {
+  color: var(--color-brand-500);
+}
+
+.text-secondary {
+  color: var(--color-text-secondary);
+}
+
+.text-tertiary {
+  color: var(--color-text-tertiary);
+}
+
+/* ===== 减少动画 ===== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
