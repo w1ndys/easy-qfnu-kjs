@@ -532,9 +532,9 @@ function handleManifest() {
   const now = requestNow();
   const ctx = computeContext(manifest.term, manifest.anchor, new Date(now));
   console.error("[probe] ctx-after", JSON.stringify(ctx));
-  const body = JSON.stringify(buildManifestView(manifest, ctx.week, now));
-  console.error("[probe] view-after", body.length);
-  return json(body, CACHE_DATA);
+  const view = buildManifestView(manifest, ctx.week, now);
+  console.error("[probe] view-after", JSON.stringify(view).length);
+  return json(view, CACHE_DATA);
 }
 function handleContext() {
   const manifest = getManifest();
@@ -678,9 +678,11 @@ function handle(req) {
     return errorToResponse(err, instance);
   }
 }
-async function handler(req) {
-  return handle(req);
-}
+var path_default = {
+  fetch(req) {
+    return handle(req);
+  }
+};
 export {
-  handler as default
+  path_default as default
 };

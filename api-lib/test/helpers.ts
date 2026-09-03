@@ -1,4 +1,4 @@
-// 集成测试公共工具：直接调用 Vercel handler（fetch 风格）。
+// 集成测试公共工具：通过 Vercel `fetch` Web Standard 入口调用 handler。
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -27,7 +27,7 @@ export async function call(
   method: string,
   pathAndQuery: string,
 ): Promise<Response> {
-  return handler(new Request(`https://api.example.test${pathAndQuery}`, { method }));
+  return handler.fetch(new Request(`https://api.example.test${pathAndQuery}`, { method }));
 }
 
 export async function get(pathAndQuery: string): Promise<Response> {

@@ -53,9 +53,9 @@ function handleManifest(): Response {
   const now = requestNow();
   const ctx = computeContext(manifest.term, manifest.anchor, new Date(now));
   console.error('[probe] ctx-after', JSON.stringify(ctx));
-  const body = JSON.stringify(buildManifestView(manifest, ctx.week, now));
-  console.error('[probe] view-after', body.length);
-  return json(body, CACHE_DATA);
+  const view = buildManifestView(manifest, ctx.week, now);
+  console.error('[probe] view-after', JSON.stringify(view).length);
+  return json(view, CACHE_DATA);
 }
 
 function handleContext(): Response {
@@ -231,7 +231,9 @@ function handle(req: Request): Response {
   }
 }
 
-/** Vercel Node.js Web Handler 入口（fetch 风格）。 */
-export default async function handler(req: Request): Promise<Response> {
-  return handle(req);
-}
+/** Vercel Node.js `fetch` Web Standard 入口；对象导出用于与经典 `(req, res)` handler 区分。 */
+export default {
+  fetch(req: Request): Response {
+    return handle(req);
+  },
+};
