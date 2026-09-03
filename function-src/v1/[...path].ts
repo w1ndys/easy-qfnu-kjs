@@ -44,18 +44,13 @@ function json(data: unknown, cacheControl: string): Response {
 }
 
 function handleManifest(): Response {
-  console.error('[probe] manifest-handler');
   const manifest = getManifest(); // 无数据/损坏分别以 503/异常处理
   if (!manifest) {
     return problemResponse(503, CODES.noSnapshot, '尚未发布任何快照数据', '/api/v1/manifest');
   }
-  console.error('[probe] ctx-before');
   const now = requestNow();
   const ctx = computeContext(manifest.term, manifest.anchor, new Date(now));
-  console.error('[probe] ctx-after', JSON.stringify(ctx));
-  const view = buildManifestView(manifest, ctx.week, now);
-  console.error('[probe] view-after', JSON.stringify(view).length);
-  return json(view, CACHE_DATA);
+  return json(buildManifestView(manifest, ctx.week, now), CACHE_DATA);
 }
 
 function handleContext(): Response {
@@ -170,7 +165,6 @@ function handleFullDayStatus(
 }
 
 function handle(req: Request): Response {
-  console.error('[probe] handle-enter', req.method, req.url);
   // Vercel 部分环境传入相对路径 URL，补 base 保证可解析。
   const url = new URL(req.url, 'https://vercel.app');
   const segments = url.pathname.split('/').filter(Boolean); // ['api','v1',resource]
@@ -190,9 +184,7 @@ function handle(req: Request): Response {
   }
 
   try {
-    console.error('[probe] before-manifest');
     const manifest = getManifest(); // ApiError（数据损坏/索引不一致）直接向上抛
-    console.error('[probe] manifest', manifest ? manifest.term : null);
     const ctx = manifest
       ? computeContext(manifest.term, manifest.anchor, new Date(requestNow()))
       : null;

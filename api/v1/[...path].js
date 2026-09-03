@@ -528,18 +528,13 @@ function json(data, cacheControl) {
   });
 }
 function handleManifest() {
-  console.error("[probe] manifest-handler");
   const manifest = getManifest();
   if (!manifest) {
     return problemResponse(503, CODES.noSnapshot, "\u5C1A\u672A\u53D1\u5E03\u4EFB\u4F55\u5FEB\u7167\u6570\u636E", "/api/v1/manifest");
   }
-  console.error("[probe] ctx-before");
   const now = requestNow();
   const ctx = computeContext(manifest.term, manifest.anchor, new Date(now));
-  console.error("[probe] ctx-after", JSON.stringify(ctx));
-  const view = buildManifestView(manifest, ctx.week, now);
-  console.error("[probe] view-after", JSON.stringify(view).length);
-  return json(view, CACHE_DATA);
+  return json(buildManifestView(manifest, ctx.week, now), CACHE_DATA);
 }
 function handleContext() {
   const manifest = getManifest();
@@ -628,7 +623,6 @@ function handleFullDayStatus(manifest, ctx, searchParams) {
   );
 }
 function handle(req) {
-  console.error("[probe] handle-enter", req.method, req.url);
   const url = new URL(req.url, "https://vercel.app");
   const segments = url.pathname.split("/").filter(Boolean);
   const instance = url.pathname + url.search;
@@ -645,9 +639,7 @@ function handle(req) {
     });
   }
   try {
-    console.error("[probe] before-manifest");
     const manifest = getManifest();
-    console.error("[probe] manifest", manifest ? manifest.term : null);
     const ctx = manifest ? computeContext(manifest.term, manifest.anchor, new Date(requestNow())) : null;
     switch (resource) {
       case "manifest":
