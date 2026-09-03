@@ -44,13 +44,18 @@ function json(data: unknown, cacheControl: string): Response {
 }
 
 function handleManifest(): Response {
+  console.error('[probe] manifest-handler');
   const manifest = getManifest(); // 无数据/损坏分别以 503/异常处理
   if (!manifest) {
     return problemResponse(503, CODES.noSnapshot, '尚未发布任何快照数据', '/api/v1/manifest');
   }
+  console.error('[probe] ctx-before');
   const now = requestNow();
   const ctx = computeContext(manifest.term, manifest.anchor, new Date(now));
-  return json(buildManifestView(manifest, ctx.week, now), CACHE_DATA);
+  console.error('[probe] ctx-after', JSON.stringify(ctx));
+  const body = JSON.stringify(buildManifestView(manifest, ctx.week, now));
+  console.error('[probe] view-after', body.length);
+  return json(body, CACHE_DATA);
 }
 
 function handleContext(): Response {
