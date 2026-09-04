@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "release_id": "20260904T002919+0800",
+  "release_id": "20260904T153353+0800",
   "term": "2025-2026-3",
-  "generated_at": "2026-09-04T00:29:19+08:00",
+  "generated_at": "2026-09-04T15:33:53+08:00",
   "anchor": {
     "date": "2026-09-04",
     "week": 2,
@@ -138,24 +138,24 @@
     },
     "2": {
       "week": 2,
-      "snapshot_id": "20260904T002919+0800-week-02",
-      "sha256": "2eec6c73436986d4ca19f1a276b8632a0ec14b9eac9050ea5259768cb25051f7",
-      "generated_at": "2026-09-04T00:29:19+08:00",
-      "last_success_at": "2026-09-04T00:29:19+08:00"
+      "snapshot_id": "20260904T153353+0800-week-02",
+      "sha256": "31b9057385a7d2ae60dca396505a91c5d874f4c50699feb6ed974c23a778bbe7",
+      "generated_at": "2026-09-04T15:33:53+08:00",
+      "last_success_at": "2026-09-04T15:33:53+08:00"
     },
     "3": {
       "week": 3,
-      "snapshot_id": "20260904T002919+0800-week-03",
-      "sha256": "f21dba1b3624a10d7d22278a440e9f43aed6637aa2426a01d125bf8f291f37c2",
-      "generated_at": "2026-09-04T00:29:19+08:00",
-      "last_success_at": "2026-09-04T00:29:19+08:00"
+      "snapshot_id": "20260904T153353+0800-week-03",
+      "sha256": "ca99b5ae5ea38ae0ed74bf1e89a1ec10899c5019be2446a71ce26a9d1b56b786",
+      "generated_at": "2026-09-04T15:33:53+08:00",
+      "last_success_at": "2026-09-04T15:33:53+08:00"
     },
     "4": {
       "week": 4,
-      "snapshot_id": "20260904T002919+0800-week-04",
-      "sha256": "9832d137a711940fa2a04341fbaf867c39b6676cbe11fb5c6e20338fa1286cd4",
-      "generated_at": "2026-09-04T00:29:19+08:00",
-      "last_success_at": "2026-09-04T00:29:19+08:00"
+      "snapshot_id": "20260904T153353+0800-week-04",
+      "sha256": "2be70f3590aa5887020ac567ccd8a43ef896480cffc51513b7c81b21ac8428bf",
+      "generated_at": "2026-09-04T15:33:53+08:00",
+      "last_success_at": "2026-09-04T15:33:53+08:00"
     }
   }
 }
