@@ -2,10 +2,10 @@
 // group_id 必填；keyword 可选（NFKC/去首尾空格/ASCII 大小写不敏感/≤32 字符/普通子串）；
 // week/day 省略时使用当前 context（非教学周省略 week → 400 not_in_teaching）；
 // start_node/end_node 默认 01/12，格式 ^(0[1-9]|1[0-2])$ 且 start <= end。
-import { ApiError, CODES } from './errors.ts';
-import { keywordLength, normalizeKeyword } from './keyword.ts';
-import type { ContextResult } from './time.ts';
-import type { Manifest } from './types.ts';
+import { ApiError, CODES } from './errors.js';
+import { keywordLength, normalizeKeyword } from './keyword.js';
+import type { ContextResult } from './time.js';
+import type { Manifest } from './types.js';
 
 const NODE_RE = /^(0[1-9]|1[0-2])$/;
 const WEEK_RE = /^\d{1,2}$/;

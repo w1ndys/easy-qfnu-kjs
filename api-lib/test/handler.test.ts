@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { call, clearFixture, get, problemOf, useFixture } from './helpers.ts';
+import { call, clearFixture, get, problemOf, useFixture } from './helpers.js';
 
 // fixture root-a：教学周内（anchor 2026-09-01 周二 = 第 2 周，total 4；已发布 1–3 周）。
 const NOW_A = '2026-09-03T00:00:00+08:00'; // 周四 09-03
@@ -407,6 +407,15 @@ describe('非教学周', () => {
 
 describe('数据完整性', () => {
   afterAll(clearFixture);
+
+  it('无构建期索引时按 manifest 推导周文件路径', async () => {
+    useFixture('root-a', NOW_A);
+    const body = await jsonOf(
+      await get(`/api/v1/empty-classrooms?group_id=${G1}&week=2&day=1&start_node=01&end_node=04`),
+    );
+    expect(body.count).toBe(5);
+    expect((body.snapshot as JsonObj).snapshot_id).toBe('snap-2026-09-02-week-02');
+  });
 
   it('周文件 SHA-256 与索引不一致 → 503 internal', async () => {
     useFixture('root-a', NOW_A, 'bad-index.json');

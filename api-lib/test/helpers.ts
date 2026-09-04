@@ -2,11 +2,11 @@
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import handler from '../../function-src/v1/[...path].ts';
+import handler from '../../api/v1/[...path].js';
 
 export const FIXTURES = fileURLToPath(new URL('./fixtures', import.meta.url));
 
-/** 指向某个 fixture 根目录（含 data/ 与索引 JSON），并冻结“当前”时刻。 */
+/** 指向某个 fixture 根目录；indexFile 仅用于覆盖测试索引以模拟完整性错误。 */
 export function useFixture(fixtureDir: string, nowIso: string, indexFile?: string): void {
   process.env.EASY_KJS_ROOT = path.join(FIXTURES, fixtureDir);
   if (indexFile) {

@@ -26,7 +26,7 @@
     "allowImportingTsExtensions": true
   },
   "include": [
-    "../function-src/**/*.ts",
+    "v1/**/*.ts",
     "../api-lib/**/*.ts"
   ]
 }

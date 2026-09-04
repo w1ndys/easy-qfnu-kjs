@@ -4,7 +4,7 @@ import {
   keywordLength,
   keywordMatchesName,
   normalizeKeyword,
-} from '../keyword.ts';
+} from '../keyword.js';
 
 describe('keyword 规范化与子串匹配（§11.1）', () => {
   it('NFKC + 去首尾空格（含全角空格与全角字母数字）', () => {

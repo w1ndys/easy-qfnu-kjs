@@ -8,6 +8,11 @@ node_modules/
 web/dist/
 *.local
 
+# --- generated build/source artifacts ---
+/api/v1/\[...path\].js
+/api-lib/generated-index.ts
+/web/src/components.d.ts
+
 # --- go / collector ---
 # 根目录编译产物（避免裸 "collector" 误忽略 cmd/collector、internal/collector 目录）
 /collector

@@ -1,7 +1,7 @@
 // 响应视图组装（纯逻辑，供 handler 与单元测试复用）。
-import { naturalCompare } from './sort.ts';
-import { weekStatus } from './staleness.ts';
-import type { Manifest, ManifestWeekEntry, SnapshotRoom, SnapshotWeekFile } from './types.ts';
+import { naturalCompare } from './sort.js';
+import { weekStatus } from './staleness.js';
+import type { Manifest, ManifestWeekEntry, SnapshotRoom, SnapshotWeekFile } from './types.js';
 
 export interface ManifestWeekView {
   week: number;

@@ -1,5 +1,5 @@
 // Vercel Serverless 单函数（Node.js Runtime）：承载 /api/v1/* 四个只读 GET 资源路由
-//（决策文件 §8 / §11）。打包共享同一份当前学期数据索引（vercel.json functions.includeFiles = data/**）。
+//（决策文件 §8 / §11）。运行时从 manifest 懒加载周快照（vercel.json functions.includeFiles = data/**）。
 //
 //   GET /api/v1/manifest            公开数据清单（分组/节点/状态字典/逐周新鲜度）
 //   GET /api/v1/context             按 Asia/Shanghai 与 anchor 计算的当前日期/星期/教学周
@@ -7,19 +7,19 @@
 //   GET /api/v1/full-day-status     全天状态查询
 //
 // 未知路径 → 404；非 GET → 405；错误一律 RFC 9457 application/problem+json（附稳定扩展 code）。
-import { roomFreeInRange } from '../../api-lib/availability.ts';
-import { getManifest, getWeekFile } from '../../api-lib/data.ts';
-import { ApiError, CODES, errorToResponse, problemResponse } from '../../api-lib/errors.ts';
-import { keywordMatchesName } from '../../api-lib/keyword.ts';
-import { parseNodeSpan, parseQueryBase, type QueryBase } from '../../api-lib/params.ts';
-import { computeContext, requestNow, type ContextResult } from '../../api-lib/time.ts';
-import type { Manifest, SnapshotRoom, SnapshotWeekFile } from '../../api-lib/types.ts';
+import { roomFreeInRange } from '../../api-lib/availability.js';
+import { getManifest, getWeekFile } from '../../api-lib/data.js';
+import { ApiError, CODES, errorToResponse, problemResponse } from '../../api-lib/errors.js';
+import { keywordMatchesName } from '../../api-lib/keyword.js';
+import { parseNodeSpan, parseQueryBase, type QueryBase } from '../../api-lib/params.js';
+import { computeContext, requestNow, type ContextResult } from '../../api-lib/time.js';
+import type { Manifest, SnapshotRoom, SnapshotWeekFile } from '../../api-lib/types.js';
 import {
   buildFullDayList,
   buildManifestView,
   buildRoomList,
   buildSnapshotView,
-} from '../../api-lib/views.ts';
+} from '../../api-lib/views.js';
 
 // 数据接口成功响应缓存（Q96）：CDN 300s，回源后 600s 内可继续用旧副本。
 const CACHE_DATA = 'public, s-maxage=300, stale-while-revalidate=600';

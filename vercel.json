@@ -1,10 +1,10 @@
 {
-  "buildCommand": "node scripts/build-function.mjs && cd web && npm run build",
-  "installCommand": "npm ci && cd web && npm ci",
+  "buildCommand": "node scripts/validate-data.mjs && cd web && npm run build",
+  "installCommand": "cd web && npm ci",
   "outputDirectory": "web/dist",
   "framework": null,
   "functions": {
-    "api/v1/[...path].js": {
+    "api/v1/[...path].ts": {
       "maxDuration": 30,
       "regions": [
         "hkg1"
