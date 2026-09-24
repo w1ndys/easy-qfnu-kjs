@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/W1ndys/easy-qfnu-kjs/pkg/logger"
+	"github.com/W1ndys/easy-qfnu-kjs/internal/logger"
 )
 
 const (
@@ -114,10 +114,15 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	// 读取响应 Body
 	respBodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		resp.Body.Close()
+		if cerr := resp.Body.Close(); cerr != nil {
+			logger.Warn("关闭响应体失败: %v", cerr)
+		}
 		return nil, fmt.Errorf("读取响应体失败: %w", err)
 	}
-	resp.Body.Close() // 先关闭，后面我们会重新赋值一个新的 Body
+	// 字节已经读完。关闭失败只记录，后面会换上新的 Body。
+	if cerr := resp.Body.Close(); cerr != nil {
+		logger.Warn("关闭响应体失败: %v", cerr)
+	}
 
 	// 检查是否包含 "用户登录"
 	// 注意：这里简单地检查字符串。如果页面结构复杂，可能需要更严谨的检查，但通常足够了
@@ -200,4 +205,10 @@ func (c *Client) cloneRequest(req *http.Request, bodyBytes []byte) (*http.Reques
 	}
 
 	return newReq, nil
+}
+
+func closeBody(body io.Closer) {
+	if err := body.Close(); err != nil {
+		logger.Warn("关闭响应体失败: %v", err)
+	}
 }

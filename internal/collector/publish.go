@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/W1ndys/easy-qfnu-kjs/pkg/logger"
+	"github.com/W1ndys/easy-qfnu-kjs/internal/logger"
 )
 
 // PublishResult 发布结果（用于验收与告警文案）。
@@ -31,88 +31,114 @@ func Publish(ctx context.Context, opts Options, cand *Candidate) (*PublishResult
 		return nil, newGlobal(CodeNoCandidate, "没有可发布的候选数据")
 	}
 	term := cand.Manifest.Term
-	baseline := loadLocalManifest(opts)
-	switchTerm := baseline != nil && baseline.Term != "" && baseline.Term != term
-	oldTerm := ""
-	if switchTerm {
-		oldTerm = baseline.Term
-	}
+	oldTerm, switchTerm := publishSwitch(opts, term)
 	configRel := repoRelative(opts, opts.ConfigPath)
-
-	// 1. 更新基线（Q139）。
-	if err := ensurePublishBase(opts); err != nil {
+	if err := preparePublishTree(opts, cand, term, oldTerm, configRel); err != nil {
 		return nil, err
 	}
+	return commitAndPush(opts, cand, term, switchTerm)
+}
 
-	// 2. 复制前洁净检查：只允许 config 的人工改动；data/ 必须干净。
+func publishSwitch(opts Options, term string) (string, bool) {
+	baseline := loadLocalManifest(opts)
+	if baseline == nil || baseline.Term == "" || baseline.Term == term {
+		return "", false
+	}
+	return baseline.Term, true
+}
+
+func preparePublishTree(opts Options, cand *Candidate, term, oldTerm, configRel string) error {
+	if err := ensurePublishBase(opts); err != nil {
+		return err
+	}
+	if err := rejectUnexpectedChanges(opts, configRel); err != nil {
+		return err
+	}
+	if err := copyCandidateToData(opts, cand, term, oldTerm); err != nil {
+		return err
+	}
 	paths, err := gitPorcelain(opts)
 	if err != nil {
-		return nil, newGlobal(CodePublishState, "读取工作区状态失败: %v", err)
+		return newGlobal(CodePublishState, "读取工作区状态失败: %v", err)
+	}
+	return assertPlannedChanges(paths, term, oldTerm, configRel)
+}
+
+func rejectUnexpectedChanges(opts Options, configRel string) error {
+	paths, err := gitPorcelain(opts)
+	if err != nil {
+		return newGlobal(CodePublishState, "读取工作区状态失败: %v", err)
 	}
 	for _, p := range paths {
 		if p == configRel {
 			continue
 		}
-		return nil, newGlobal(CodeRepoDirty, "工作区存在预期外改动 %q（发布前只允许 config/rooms.json 人工改动）", p)
+		return newGlobal(CodeRepoDirty, "工作区存在预期外改动 %q（发布前只允许 config/rooms.json 人工改动）", p)
 	}
+	return nil
+}
 
-	// 3. 复制候选 → data/；学期切换删除旧学期目录。
-	if err := copyCandidateToData(opts, cand, term, oldTerm); err != nil {
-		return nil, err
-	}
-
-	// 4. 复制后复核：相对工作区只允许计划内 data/ 变更 + config。
-	paths, err = gitPorcelain(opts)
+func commitAndPush(opts Options, cand *Candidate, term string, switchTerm bool) (*PublishResult, error) {
+	sha, msg, err := commitDataChange(opts, term, cand.Manifest.ReleaseID, switchTerm)
 	if err != nil {
-		return nil, newGlobal(CodePublishState, "读取工作区状态失败: %v", err)
-	}
-	if err := assertPlannedChanges(paths, term, oldTerm, configRel); err != nil {
 		return nil, err
 	}
+	if err := pushIfStillFastForward(opts); err != nil {
+		return nil, err
+	}
+	logger.Info("发布推送成功：%s %s", msg, sha)
+	return &PublishResult{
+		CommitSHA: sha,
+		ReleaseID: cand.Manifest.ReleaseID,
+		Term:      term,
+		Switch:    switchTerm,
+		Message:   msg,
+	}, nil
+}
 
-	// 5. 暂存 data/ 并提交。
+func commitDataChange(opts Options, term, releaseID string, switchTerm bool) (string, string, error) {
 	if err := gitAddAllData(opts); err != nil {
-		return nil, newGlobal(CodePushFailed, "git add data/ 失败: %v", err)
+		return "", "", newGlobal(CodePushFailed, "git add data/ 失败: %v", err)
 	}
 	hasStaged, err := gitHasStagedChanges(opts)
 	if err != nil {
-		return nil, newGlobal(CodePushFailed, "检查暂存区失败: %v", err)
+		return "", "", newGlobal(CodePushFailed, "检查暂存区失败: %v", err)
 	}
 	if !hasStaged {
-		return nil, newGlobal(CodeNoCandidate, "暂存区没有变化（候选与已发布数据一致）")
+		return "", "", newGlobal(CodeNoCandidate, "暂存区没有变化（候选与已发布数据一致）")
 	}
-	msg := commitMessage(term, cand.Manifest.ReleaseID, switchTerm)
+	msg := commitMessage(term, releaseID, switchTerm)
 	if err := gitCommit(opts, msg); err != nil {
-		return nil, newGlobal(CodePushFailed, "git commit 失败: %v", err)
+		return "", "", newGlobal(CodePushFailed, "git commit 失败: %v", err)
 	}
 	sha, err := gitRevParse(opts, "HEAD")
 	if err != nil {
-		return nil, newGlobal(CodePushFailed, "读取 HEAD 失败: %v", err)
+		return "", "", newGlobal(CodePushFailed, "读取 HEAD 失败: %v", err)
 	}
+	return sha, msg, nil
+}
 
-	// 6. 推送前再次确认远端没有新提交（Q139：禁止 force-push / rebase）。
+func pushIfStillFastForward(opts Options) error {
 	if err := gitFetch(opts); err != nil {
-		return nil, newGlobal(CodePushFailed, "推送前 fetch 失败: %v", err)
+		return newGlobal(CodePushFailed, "推送前 fetch 失败: %v", err)
 	}
 	parentSHA, err := gitRevParse(opts, "HEAD~1")
 	if err != nil {
-		return nil, newGlobal(CodePushFailed, "读取提交父节点失败: %v", err)
+		return newGlobal(CodePushFailed, "读取提交父节点失败: %v", err)
 	}
 	originSHA, err := gitRevParse(opts, "origin/main")
 	if err != nil {
-		return nil, newGlobal(CodePushFailed, "读取 origin/main 失败: %v", err)
+		return newGlobal(CodePushFailed, "读取 origin/main 失败: %v", err)
 	}
+	// 父提交不是 origin/main 说明远端有新提交；禁止强推，本轮停下等下一轮。
 	if parentSHA != originSHA {
-		return nil, newGlobal(CodePushFailed,
+		return newGlobal(CodePushFailed,
 			"推送前远端出现新提交（origin/main=%s，本地父=%s）；本轮终止等待下一轮", originSHA, parentSHA)
 	}
 	if err := gitPush(opts); err != nil {
-		return nil, newGlobal(CodePushFailed, "git push 失败: %v", err)
+		return newGlobal(CodePushFailed, "git push 失败: %v", err)
 	}
-
-	logger.Info("发布推送成功：%s %s", msg, sha)
-	return &PublishResult{CommitSHA: sha, ReleaseID: cand.Manifest.ReleaseID,
-		Term: term, Switch: switchTerm, Message: msg}, nil
+	return nil
 }
 
 // ensurePublishBase 校验并同步发布基线（Q139）。

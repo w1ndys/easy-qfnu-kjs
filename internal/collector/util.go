@@ -70,20 +70,28 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
+		return cleanupTempFile(tmp, tmpName, err)
 	}
 	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
+		return cleanupTempFile(tmp, tmpName, err)
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		if rerr := os.Remove(tmpName); rerr != nil {
+			return fmt.Errorf("%w；删除临时文件也失败: %v", err, rerr)
+		}
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+func cleanupTempFile(f *os.File, path string, cause error) error {
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("%w；关闭临时文件也失败: %v", cause, err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("%w；删除临时文件也失败: %v", cause, err)
+	}
+	return cause
 }
 
 // marshalIndent 统一输出：两空格缩进 + 末尾换行，字段顺序由结构体保证。

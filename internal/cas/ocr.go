@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/W1ndys/easy-qfnu-kjs/internal/logger"
 )
 
 const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -64,15 +66,15 @@ func RecognizeCaptcha(ctx context.Context, image []byte) (string, error) {
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(image); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("写入验证码临时文件失败: %w", err)
+		return "", cleanupCaptchaFile(tmp, tmpPath, fmt.Errorf("写入验证码临时文件失败: %w", err))
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
+		if rerr := os.Remove(tmpPath); rerr != nil {
+			return "", fmt.Errorf("关闭验证码临时文件失败: %w；删除也失败: %v", err, rerr)
+		}
 		return "", fmt.Errorf("关闭验证码临时文件失败: %w", err)
 	}
-	defer os.Remove(tmpPath)
+	defer removeCaptchaFile(tmpPath)
 
 	runCtx := ctx
 	if _, ok := ctx.Deadline(); !ok {
@@ -103,4 +105,20 @@ func RecognizeCaptcha(ctx context.Context, image []byte) (string, error) {
 		return "", fmt.Errorf("OCR 命令（%s）输出为空，无法识别验证码", filepath.Base(fullArgs[0]))
 	}
 	return text, nil
+}
+
+func cleanupCaptchaFile(f *os.File, path string, cause error) error {
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("%w；关闭验证码临时文件也失败: %v", cause, err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("%w；删除验证码临时文件也失败: %v", cause, err)
+	}
+	return cause
+}
+
+func removeCaptchaFile(path string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		logger.Warn("删除验证码临时文件失败: %v", err)
+	}
 }

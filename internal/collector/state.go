@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/W1ndys/easy-qfnu-kjs/internal/logger"
 )
 
 // State 采集器本地状态（~/.local/state/easy-qfnu-kjs/collector-state.json）。
@@ -65,21 +67,29 @@ func AcquireLock(ctx context.Context, stateDir string, wait time.Duration) (rele
 	for {
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
 			return func() {
-				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-				_ = f.Close()
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+					logger.Warn("释放采集锁失败: %v", err)
+				}
+				closeLockFile(f)
 			}, nil
 		}
 		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
-			f.Close()
+			closeLockFile(f)
 			return nil, fmt.Errorf("获取锁失败: %w", err)
 		}
 		if time.Now().After(deadline) {
-			f.Close()
+			closeLockFile(f)
 			return nil, newGlobal(CodeLockTimeout, "等待采集锁超过 %s（另一采集任务可能仍在运行），本轮放弃", wait)
 		}
 		if !sleepCtx(ctx, 5*time.Second) {
-			f.Close()
+			closeLockFile(f)
 			return nil, newGlobal(CodeLockTimeout, "等待采集锁时上下文取消")
 		}
+	}
+}
+
+func closeLockFile(f *os.File) {
+	if err := f.Close(); err != nil {
+		logger.Warn("关闭锁文件失败: %v", err)
 	}
 }

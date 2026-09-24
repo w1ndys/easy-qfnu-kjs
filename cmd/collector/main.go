@@ -55,17 +55,35 @@ func main() {
 
 func run(argv []string) int {
 	loadDotEnv()
+	cmd, code := commandName(argv)
+	if cmd == "" {
+		return code
+	}
+	args, code := parseCollectorArgs(cmd, argv[1:])
+	if code != 0 {
+		return code
+	}
+	opts, code := buildCollectorOptions(args)
+	if code != 0 {
+		return code
+	}
+	return dispatchCollector(cmd, opts)
+}
 
+func commandName(argv []string) (string, int) {
 	if len(argv) == 0 {
 		fmt.Fprint(os.Stderr, usageText)
-		return 2
+		return "", 2
 	}
 	cmd := argv[0]
 	if cmd == "-h" || cmd == "--help" || cmd == "help" {
 		fmt.Print(usageText)
-		return 0
+		return "", 0
 	}
+	return cmd, 0
+}
 
+func parseCollectorArgs(cmd string, argv []string) (cliArgs, int) {
 	var a cliArgs
 	fs := flag.NewFlagSet("collector "+cmd, flag.ExitOnError)
 	fs.StringVar(&a.configPath, "config", "config/rooms.json", "白名单配置路径")
@@ -73,51 +91,31 @@ func run(argv []string) int {
 	fs.StringVar(&a.schemaDir, "schema-dir", "schemas", "JSON Schema 目录")
 	fs.StringVar(&a.repoDir, "repo-dir", "", "仓库根目录（默认当前工作目录）")
 	fs.BoolVar(&a.dryRun, "dry-run", false, "run 只执行 collect+validate")
-	if err := fs.Parse(argv[1:]); err != nil {
+	if err := fs.Parse(argv); err != nil {
 		fmt.Fprintf(os.Stderr, "参数解析失败: %v\n", err)
-		return 2
+		return a, 2
 	}
 	if fs.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "多余的参数: %v\n", fs.Args())
-		return 2
+		return a, 2
 	}
+	return a, 0
+}
 
-	repoDir := a.repoDir
-	if repoDir == "" {
-		abs, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "读取工作目录失败: %v\n", err)
-			return 1
-		}
-		repoDir = abs
-	} else {
-		abs, err := filepath.Abs(repoDir)
-		if err == nil {
-			repoDir = abs
-		}
+func buildCollectorOptions(a cliArgs) (collector.Options, int) {
+	repoDir, code := absRepoDir(a.repoDir)
+	if code != 0 {
+		return collector.Options{}, code
 	}
-	resolve := func(p string) string {
-		if filepath.IsAbs(p) {
-			return p
-		}
-		return filepath.Join(repoDir, p)
+	stateDir, code := collectorStateDir()
+	if code != 0 {
+		return collector.Options{}, code
 	}
-
-	stateDir := os.Getenv("COLLECTOR_STATE_DIR")
-	if stateDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "读取主目录失败: %v\n", err)
-			return 1
-		}
-		stateDir = filepath.Join(home, collector.StateDirDefaultRel)
-	}
-
-	opts := collector.Options{
+	return collector.Options{
 		RepoDir:     repoDir,
-		ConfigPath:  resolve(a.configPath),
-		DataDir:     resolve(a.dataDir),
-		SchemaDir:   resolve(a.schemaDir),
+		ConfigPath:  joinUnderRepo(repoDir, a.configPath),
+		DataDir:     joinUnderRepo(repoDir, a.dataDir),
+		SchemaDir:   joinUnderRepo(repoDir, a.schemaDir),
 		StateDir:    stateDir,
 		DryRun:      a.dryRun,
 		Username:    os.Getenv("QFNU_USERNAME"),
@@ -127,22 +125,50 @@ func run(argv []string) int {
 		WebhookURL:  os.Getenv("FEISHU_WEBHOOK_URL"),
 		WebhookSec:  os.Getenv("FEISHU_WEBHOOK_SECRET"),
 		HTTPTimeout: 120 * time.Second,
-	}
+	}, 0
+}
 
+func absRepoDir(repoDir string) (string, int) {
+	if repoDir == "" {
+		abs, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "读取工作目录失败: %v\n", err)
+			return "", 1
+		}
+		return abs, 0
+	}
+	abs, err := filepath.Abs(repoDir)
+	if err != nil {
+		return repoDir, 0
+	}
+	return abs, 0
+}
+
+func joinUnderRepo(repoDir, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(repoDir, path)
+}
+
+func collectorStateDir() (string, int) {
+	stateDir := os.Getenv("COLLECTOR_STATE_DIR")
+	if stateDir != "" {
+		return stateDir, 0
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取主目录失败: %v\n", err)
+		return "", 1
+	}
+	return filepath.Join(home, collector.StateDirDefaultRel), 0
+}
+
+func dispatchCollector(cmd string, opts collector.Options) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	var err error
-	switch cmd {
-	case "collect":
-		err = collector.CollectCommand(ctx, opts)
-	case "validate":
-		err = collector.ValidateCommand(ctx, opts)
-	case "publish":
-		err = collector.PublishCommand(ctx, opts)
-	case "run":
-		err = collector.RunCommand(ctx, opts)
-	default:
+	err := runCollectorCommand(ctx, cmd, opts)
+	if err == errUnknownCommand {
 		fmt.Fprintf(os.Stderr, "未知命令: %s\n\n%s", cmd, usageText)
 		return 2
 	}
@@ -151,6 +177,23 @@ func run(argv []string) int {
 		return 1
 	}
 	return 0
+}
+
+var errUnknownCommand = fmt.Errorf("未知命令")
+
+func runCollectorCommand(ctx context.Context, cmd string, opts collector.Options) error {
+	switch cmd {
+	case "collect":
+		return collector.CollectCommand(ctx, opts)
+	case "validate":
+		return collector.ValidateCommand(ctx, opts)
+	case "publish":
+		return collector.PublishCommand(ctx, opts)
+	case "run":
+		return collector.RunCommand(ctx, opts)
+	default:
+		return errUnknownCommand
+	}
 }
 
 // envOr 返回环境变量值；为空时返回默认值。

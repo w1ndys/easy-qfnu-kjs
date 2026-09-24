@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/W1ndys/easy-qfnu-kjs/pkg/logger"
+	"github.com/W1ndys/easy-qfnu-kjs/internal/logger"
 )
 
 // Alerter 飞书自定义机器人（加签模式）。WebhookURL 为空时禁用。
@@ -49,8 +49,8 @@ type feishuPayload struct {
 }
 
 type feishuResp struct {
-	Code any    `json:"code"`
-	Msg  string `json:"msg"`
+	Code json.RawMessage `json:"code"`
+	Msg  string          `json:"msg"`
 }
 
 // send 发送一条告警；最多尝试 3 次。
@@ -86,17 +86,13 @@ func (a *Alerter) send(ctx context.Context, text string) error {
 		}
 		var fr feishuResp
 		decodeErr := json.NewDecoder(resp.Body).Decode(&fr)
-		resp.Body.Close()
+		if cerr := resp.Body.Close(); cerr != nil {
+			logger.Warn("关闭飞书响应失败: %v", cerr)
+		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			lastErr = fmt.Errorf("飞书返回 HTTP %d", resp.StatusCode)
-		} else if decodeErr == nil && fr.Code != nil {
-			if codeInt, ok := asInt(fr.Code); ok && codeInt != 0 {
-				lastErr = fmt.Errorf("飞书返回错误码 %d: %s", codeInt, fr.Msg)
-			} else if s, ok := fr.Code.(string); ok && s != "" && s != "0" {
-				lastErr = fmt.Errorf("飞书返回错误码 %s: %s", s, fr.Msg)
-			} else {
-				return nil
-			}
+		} else if failed, label := feishuCodeFailed(fr.Code); decodeErr == nil && failed {
+			lastErr = fmt.Errorf("飞书返回错误码 %s: %s", label, fr.Msg)
 		} else {
 			return nil
 		}
@@ -105,17 +101,22 @@ func (a *Alerter) send(ctx context.Context, text string) error {
 	return fmt.Errorf("飞书告警 3 次尝试均失败: %v", lastErr)
 }
 
-func asInt(v any) (int, bool) {
-	switch n := v.(type) {
-	case float64:
-		return int(n), true
-	case int:
-		return n, true
-	case json.Number:
-		i, err := n.Int64()
-		return int(i), err == nil
+func feishuCodeFailed(raw json.RawMessage) (bool, string) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false, ""
 	}
-	return 0, false
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		if n == 0 {
+			return false, ""
+		}
+		return true, strconv.Itoa(n)
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil && s != "" && s != "0" {
+		return true, s
+	}
+	return false, ""
 }
 
 // Notifier 单轮告警去重（同类错误每轮只通知一次）。

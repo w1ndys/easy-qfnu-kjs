@@ -101,8 +101,11 @@ func (r *LogRotator) openLocked() error {
 // earlier content is overwritten.
 func (r *LogRotator) archiveLocked(day string) error {
 	if r.file != nil {
-		r.file.Close()
+		file := r.file
 		r.file = nil
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("关闭当前日志失败: %w", err)
+		}
 	}
 	src := filepath.Join(r.dir, activeName)
 	if _, err := os.Stat(src); err != nil {
@@ -158,7 +161,9 @@ func (r *LogRotator) cleanupLocked(today string) {
 	}
 	sort.Strings(names)
 	for _, p := range names {
-		_ = os.Remove(p)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "删除过期日志失败: %v\n", err)
+		}
 	}
 }
 

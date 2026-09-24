@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/W1ndys/easy-qfnu-kjs/pkg/cas"
-	"github.com/W1ndys/easy-qfnu-kjs/pkg/logger"
+	"github.com/W1ndys/easy-qfnu-kjs/internal/cas"
+	"github.com/W1ndys/easy-qfnu-kjs/internal/logger"
 )
 
 // WeekFailure 单周失败信息（同学期已有上一版数据时可写入 manifest）。
@@ -57,35 +57,47 @@ func Collect(ctx context.Context, cfg *Config, up *Upstream, opts Options) (*Can
 	if err := loginUpstream(ctx, up, opts.Username, opts.Password); err != nil {
 		return nil, err
 	}
-
-	term, err := up.fetchTerm(ctx)
+	term, cal, err := fetchTermCalendar(ctx, up)
 	if err != nil {
 		return nil, err
 	}
-	cal, err := up.fetchCalendar(ctx)
-	if err != nil {
-		return nil, err
-	}
+	// 不在教学周历内不是失败：调用方跳过发布，也不发告警。
 	if !cal.InCalendar {
 		logger.Info("当前不在教学周历内（学期=%s），本轮跳过采集发布", term)
 		return &Candidate{Term: term, InCalendar: false}, nil
 	}
+	return collectInCalendar(ctx, cfg, up, opts, term, cal)
+}
 
+func fetchTermCalendar(ctx context.Context, up *Upstream) (string, CalendarInfo, error) {
+	term, err := up.fetchTerm(ctx)
+	if err != nil {
+		return "", CalendarInfo{}, err
+	}
+	cal, err := up.fetchCalendar(ctx)
+	if err != nil {
+		return "", CalendarInfo{}, err
+	}
+	return term, cal, nil
+}
+
+type weekCollectState struct {
+	groupCounts map[string]int
+	haveCounts  bool
+	generated   string
+	compactTS   string
+}
+
+func collectInCalendar(ctx context.Context, cfg *Config, up *Upstream, opts Options, term string, cal CalendarInfo) (*Candidate, error) {
 	baseline := loadLocalManifest(opts)
 	switchTerm := baseline != nil && baseline.Term != "" && baseline.Term != term
-	freshInit := baseline == nil
-
-	targetWeeks := planWeeks(cal, switchTerm || freshInit)
+	// 没有基线或学期变了，必须采全学期；否则只采当前周和未来 4 周。
+	targetWeeks := planWeeks(cal, switchTerm || baseline == nil)
 	if len(targetWeeks) == 0 {
 		return nil, newGlobal(CodeCalendarParse, "目标周集合为空：当前周=%d 总周数=%d", cal.CurrentWeek, cal.TotalWeeks)
 	}
-
 	now := nowBJ()
-	generated := formatRFC3339BJ(now)
-	compactTS := formatCompactBJ(now)
-
 	cand := &Candidate{
-		Dir:         "", // 目录在首个成功周产生时创建
 		Term:        term,
 		TotalWeeks:  cal.TotalWeeks,
 		CurrentWeek: cal.CurrentWeek,
@@ -95,67 +107,100 @@ func Collect(ctx context.Context, cfg *Config, up *Upstream, opts Options) (*Can
 		OldTerm:     oldTermOf(baseline),
 		GroupCounts: map[string]int{},
 	}
-
-	// 逐周顺序请求；周间随机 0.5—2s。
-	groupCounts := map[string]int{}
-	haveCounts := false
-	for i, week := range targetWeeks {
-		if i > 0 && !sleepCtx(ctx, weekJitterDelay()) {
-			return nil, newGlobal(CodeRequestFailed, "上下文取消（周间等待）")
-		}
-		rows, qerr := up.queryWeek(ctx, term, week)
-		if qerr != nil {
-			if isWeekScope(qerr) {
-				logger.Warn("第 %d 周请求失败（周级，保留旧数据）: %v", week, qerr)
-				cand.Failures = append(cand.Failures, WeekFailure{
-					Week: week, Code: errorCodeOf(qerr), AttemptAt: generated,
-					HadPrevious: hasPreviousWeekFile(opts, term, week),
-				})
-				continue
-			}
-			return nil, qerr // 登录页/非法访问/结构失败等全局异常
-		}
-
-		cores, counts, err := ResolveSnapshotRooms(cfg, rows)
-		if err != nil {
-			return nil, err
-		}
-		if !haveCounts {
-			groupCounts = counts
-			haveCounts = true
-		}
-		snap := buildWeekSnapshot(term, week, generated, compactTS, rows, cores)
-		if err := validateWeekSnapshotLocally(cfg, snap); err != nil {
-			return nil, err
-		}
-		jsonBytes, err := marshalIndent(snap)
-		if err != nil {
-			return nil, newGlobal(CodeInternal, "序列化第 %d 周快照失败: %v", week, err)
-		}
-		if cand.Dir == "" {
-			dir, err := os.MkdirTemp("", "easy-qfnu-kjs-collect-*")
-			if err != nil {
-				return nil, newGlobal(CodeInternal, "创建候选目录失败: %v", err)
-			}
-			cand.Dir = dir
-		}
-		if err := cand.writeWeekFile(term, week, jsonBytes); err != nil {
-			return nil, err
-		}
-		cand.SuccessWeeks = append(cand.SuccessWeeks, week)
+	state := &weekCollectState{
+		groupCounts: map[string]int{},
+		generated:   formatRFC3339BJ(now),
+		compactTS:   formatCompactBJ(now),
 	}
+	if err := collectTargetWeeks(ctx, cfg, up, opts, cand, targetWeeks, state); err != nil {
+		return nil, err
+	}
+	return finishCollect(opts, cand, baseline, cal, now, state)
+}
 
+func collectTargetWeeks(ctx context.Context, cfg *Config, up *Upstream, opts Options, cand *Candidate, weeks []int, state *weekCollectState) error {
+	for i, week := range weeks {
+		if i > 0 && !sleepCtx(ctx, weekJitterDelay()) {
+			return newGlobal(CodeRequestFailed, "上下文取消（周间等待）")
+		}
+		if err := collectOneWeek(ctx, cfg, up, opts, cand, week, state); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func collectOneWeek(ctx context.Context, cfg *Config, up *Upstream, opts Options, cand *Candidate, week int, state *weekCollectState) error {
+	rows, qerr := up.queryWeek(ctx, cand.Term, week)
+	if qerr != nil {
+		return recordWeekFailure(opts, cand, week, qerr, state.generated)
+	}
+	return writeCollectedWeek(cfg, cand, week, rows, state)
+}
+
+func recordWeekFailure(opts Options, cand *Candidate, week int, qerr error, generated string) error {
+	// 周级失败保留旧快照并继续；登录页、非法访问、结构失败会让整轮停止。
+	if !isWeekScope(qerr) {
+		return qerr
+	}
+	logger.Warn("第 %d 周请求失败（周级，保留旧数据）: %v", week, qerr)
+	cand.Failures = append(cand.Failures, WeekFailure{
+		Week: week, Code: errorCodeOf(qerr), AttemptAt: generated,
+		HadPrevious: hasPreviousWeekFile(opts, cand.Term, week),
+	})
+	return nil
+}
+
+func writeCollectedWeek(cfg *Config, cand *Candidate, week int, rows []ParsedRow, state *weekCollectState) error {
+	cores, counts, err := ResolveSnapshotRooms(cfg, rows)
+	if err != nil {
+		return err
+	}
+	if !state.haveCounts {
+		state.groupCounts = counts
+		state.haveCounts = true
+	}
+	snap := buildWeekSnapshot(cand.Term, week, state.generated, state.compactTS, rows, cores)
+	if err := validateWeekSnapshotLocally(cfg, snap); err != nil {
+		return err
+	}
+	jsonBytes, err := marshalIndent(snap)
+	if err != nil {
+		return newGlobal(CodeInternal, "序列化第 %d 周快照失败: %v", week, err)
+	}
+	if err := ensureCandidateDir(cand); err != nil {
+		return err
+	}
+	if err := cand.writeWeekFile(cand.Term, week, jsonBytes); err != nil {
+		return err
+	}
+	cand.SuccessWeeks = append(cand.SuccessWeeks, week)
+	return nil
+}
+
+func ensureCandidateDir(cand *Candidate) error {
+	if cand.Dir != "" {
+		return nil
+	}
+	dir, err := os.MkdirTemp("", "easy-qfnu-kjs-collect-*")
+	if err != nil {
+		return newGlobal(CodeInternal, "创建候选目录失败: %v", err)
+	}
+	cand.Dir = dir
+	return nil
+}
+
+func finishCollect(opts Options, cand *Candidate, baseline *Manifest, cal CalendarInfo, now time.Time, state *weekCollectState) (*Candidate, error) {
 	if len(cand.SuccessWeeks) == 0 {
 		return nil, newGlobal(CodeRequestFailed, "目标周次全部失败，无可发布数据")
 	}
-	// 学期切换：当前周必须成功（决策 §7/§9）。
-	if switchTerm && !containsWeek(cand.SuccessWeeks, cal.CurrentWeek) {
+	// 学期切换时当前周失败就不能换学期，否则会发布一套缺当前周的新数据。
+	if cand.SwitchTerm && !containsWeek(cand.SuccessWeeks, cal.CurrentWeek) {
 		return nil, newGlobal(CodeTermSwitchFailed,
-			"新学期 %s 切换要求当前周 %d 必须采集成功（本轮未成功），禁止切换", term, cal.CurrentWeek)
+			"新学期 %s 切换要求当前周 %d 必须采集成功（本轮未成功），禁止切换", cand.Term, cal.CurrentWeek)
 	}
-
-	cand.GroupCounts = groupCounts
-	if err := cand.buildManifest(opts, baseline, generated, compactTS, now, cfg, groupCounts); err != nil {
+	cand.GroupCounts = state.groupCounts
+	if err := cand.buildManifest(opts, baseline, state.generated, state.compactTS, now, cand.Config, state.groupCounts); err != nil {
 		return nil, err
 	}
 	logger.Info("候选生成完毕：目录=%s 学期=%s 成功周=%v 失败周=%d",

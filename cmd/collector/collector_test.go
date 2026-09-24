@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/W1ndys/easy-qfnu-kjs/internal/collector"
-	"github.com/W1ndys/easy-qfnu-kjs/pkg/cas"
+	"github.com/W1ndys/easy-qfnu-kjs/internal/cas"
 )
 
 func readFixture(t *testing.T, name string) string {

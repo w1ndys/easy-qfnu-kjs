@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/W1ndys/easy-qfnu-kjs/internal/logger"
 )
 
 var (
@@ -167,7 +169,7 @@ func (u *Upstream) doOnce(ctx context.Context, endpoint string, form url.Values)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp.Body)
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
@@ -204,4 +206,10 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // weekJitterDelay 返回 0.5—2 秒的随机间隔。
 func weekJitterDelay() time.Duration {
 	return time.Duration(500+rand.IntN(1501)) * time.Millisecond
+}
+
+func closeResponseBody(body io.Closer) {
+	if err := body.Close(); err != nil {
+		logger.Warn("关闭响应体失败: %v", err)
+	}
 }

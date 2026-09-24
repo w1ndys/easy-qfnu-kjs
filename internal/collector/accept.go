@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/W1ndys/easy-qfnu-kjs/pkg/logger"
+	"github.com/W1ndys/easy-qfnu-kjs/internal/logger"
 )
 
 const (
@@ -75,82 +75,124 @@ func waitGitHubChecks(ctx context.Context, opts Options, commitSHA string) error
 	if err != nil {
 		return newGlobal(CodeVerifyFailed, "推断 GitHub 仓库失败: %v", err)
 	}
-
-	badConclusions := map[string]bool{
-		"failure": true, "cancelled": true, "timed_out": true, "action_required": true,
+	poll := checkPoll{
+		ctx:       ctx,
+		base:      fmt.Sprintf("repos/%s/commits/%s", repo, commitSHA),
+		commitSHA: commitSHA,
+		bad: map[string]bool{
+			"failure": true, "cancelled": true, "timed_out": true, "action_required": true,
+		},
+		deadline: time.Now().Add(checkPollMax * checkPollInterval),
 	}
-	base := fmt.Sprintf("repos/%s/commits/%s", repo, commitSHA)
-
-	deadline := time.Now().Add(checkPollMax * checkPollInterval)
-	emptyRounds := 0
 	for round := 1; round <= checkPollMax; round++ {
-		if ctx.Err() != nil {
-			return newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
-		}
-		checksJSON, cerr := ghAPIGet(ctx, base+"/check-runs")
-		statusJSON, serr := ghAPIGet(ctx, base+"/status")
-		if cerr != nil || serr != nil {
-			logger.Warn("查询 GitHub 状态失败（第 %d 次）: %v / %v", round, cerr, serr)
-			if !sleepCtx(ctx, checkPollInterval) {
-				return newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
-			}
-			continue
-		}
-
-		var checks ghChecks
-		_ = json.Unmarshal(checksJSON, &checks)
-		var st ghStatus
-		_ = json.Unmarshal(statusJSON, &st)
-
-		total := checks.TotalCount + st.TotalCount
-		if total == 0 {
-			emptyRounds++
-			if emptyRounds >= 3 {
-				logger.Info("仓库未配置 check-runs/status（3 轮仍为空），视为无 CI 门禁通过")
-				return nil
-			}
-			if time.Now().After(deadline) {
-				return newGlobal(CodeVerifyFailed, "GitHub 状态查询超时（无任何状态上报）")
-			}
-			if !sleepCtx(ctx, checkPollInterval) {
-				return newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
-			}
-			continue
-		}
-
-		failed := false
-		pending := false
-		for _, cr := range checks.CheckRuns {
-			switch {
-			case cr.Status != "completed":
-				pending = true
-			case badConclusions[cr.Conclusion]:
-				failed = true
-			case cr.Conclusion != "success" && cr.Conclusion != "neutral" && cr.Conclusion != "skipped":
-				pending = true
-			}
-		}
-		if st.State == "failure" || st.State == "error" {
-			failed = true
-		} else if st.State == "pending" {
-			pending = true
-		}
-
-		if failed {
-			return newGlobal(CodeVerifyFailed, "GitHub 提交 %s 的 check-runs/status 出现失败结论", commitSHA)
-		}
-		if !pending {
-			logger.Info("GitHub 提交检查通过（checks=%d status=%s）", checks.TotalCount, st.State)
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return newGlobal(CodeVerifyFailed, "等待 GitHub check-runs 通过超时（10 分钟）")
-		}
-		if !sleepCtx(ctx, checkPollInterval) {
-			return newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
+		done, err := poll.once(round)
+		if err != nil || done {
+			return err
 		}
 	}
 	return newGlobal(CodeVerifyFailed, "等待 GitHub check-runs 通过超时（10 分钟）")
+}
+
+type checkPoll struct {
+	ctx       context.Context
+	base      string
+	commitSHA string
+	bad       map[string]bool
+	deadline  time.Time
+	empty     int
+}
+
+func (p *checkPoll) once(round int) (bool, error) {
+	if p.ctx.Err() != nil {
+		return false, newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
+	}
+	checks, status, err := p.fetch(round)
+	if err != nil {
+		return false, err
+	}
+	if checks == nil {
+		return false, nil
+	}
+	return p.decide(checks, status)
+}
+
+func (p *checkPoll) fetch(round int) (*ghChecks, *ghStatus, error) {
+	checksJSON, cerr := ghAPIGet(p.ctx, p.base+"/check-runs")
+	statusJSON, serr := ghAPIGet(p.ctx, p.base+"/status")
+	if cerr != nil || serr != nil {
+		logger.Warn("查询 GitHub 状态失败（第 %d 次）: %v / %v", round, cerr, serr)
+		if !sleepCtx(p.ctx, checkPollInterval) {
+			return nil, nil, newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
+		}
+		return nil, nil, nil
+	}
+	var checks ghChecks
+	_ = json.Unmarshal(checksJSON, &checks)
+	var status ghStatus
+	_ = json.Unmarshal(statusJSON, &status)
+	return &checks, &status, nil
+}
+
+func (p *checkPoll) decide(checks *ghChecks, status *ghStatus) (bool, error) {
+	if checks.TotalCount+status.TotalCount == 0 {
+		return p.emptyRound()
+	}
+	failed, pending := checkConclusions(checks, status, p.bad)
+	if failed {
+		return false, newGlobal(CodeVerifyFailed, "GitHub 提交 %s 的 check-runs/status 出现失败结论", p.commitSHA)
+	}
+	if !pending {
+		logger.Info("GitHub 提交检查通过（checks=%d status=%s）", checks.TotalCount, status.State)
+		return true, nil
+	}
+	if time.Now().After(p.deadline) {
+		return false, newGlobal(CodeVerifyFailed, "等待 GitHub check-runs 通过超时（10 分钟）")
+	}
+	if !sleepCtx(p.ctx, checkPollInterval) {
+		return false, newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
+	}
+	return false, nil
+}
+
+func (p *checkPoll) emptyRound() (bool, error) {
+	p.empty++
+	// 连续 3 轮没有任何状态，说明仓库没配 CI，不能一直等到超时。
+	if p.empty >= 3 {
+		logger.Info("仓库未配置 check-runs/status（3 轮仍为空），视为无 CI 门禁通过")
+		return true, nil
+	}
+	if time.Now().After(p.deadline) {
+		return false, newGlobal(CodeVerifyFailed, "GitHub 状态查询超时（无任何状态上报）")
+	}
+	if !sleepCtx(p.ctx, checkPollInterval) {
+		return false, newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
+	}
+	return false, nil
+}
+
+func checkConclusions(checks *ghChecks, status *ghStatus, bad map[string]bool) (bool, bool) {
+	failed := false
+	pending := false
+	for _, cr := range checks.CheckRuns {
+		if cr.Status != "completed" {
+			pending = true
+			continue
+		}
+		if bad[cr.Conclusion] {
+			failed = true
+			continue
+		}
+		if cr.Conclusion != "success" && cr.Conclusion != "neutral" && cr.Conclusion != "skipped" {
+			pending = true
+		}
+	}
+	switch status.State {
+	case "failure", "error":
+		failed = true
+	case "pending":
+		pending = true
+	}
+	return failed, pending
 }
 
 // liveManifest 生产环境返回的 manifest 关键字段。
@@ -235,7 +277,7 @@ func httpGet(ctx context.Context, client *http.Client, url string) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d（%s）", resp.StatusCode, url)
 	}

@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/W1ndys/easy-qfnu-kjs/pkg/logger"
+	"github.com/W1ndys/easy-qfnu-kjs/internal/logger"
 )
 
 const (
@@ -83,7 +83,11 @@ func (c *Client) initQiangzhiSession(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("访问教务系统首页失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			logger.Warn("关闭教务首页响应失败: %v", cerr)
+		}
+	}()
 
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("教务系统首页状态异常: %d", resp.StatusCode)
@@ -126,7 +130,7 @@ func (c *Client) fetchCaptcha(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("获取验证码失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("验证码接口状态异常: %d", resp.StatusCode)
@@ -154,7 +158,7 @@ func (c *Client) fetchLoginSession(ctx context.Context) (string, string, error) 
 	if err != nil {
 		return "", "", fmt.Errorf("获取登录参数失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("登录参数接口状态异常: %d", resp.StatusCode)
@@ -190,7 +194,7 @@ func (c *Client) submitQiangzhiLogin(ctx context.Context, captchaCode, encoded s
 	if err != nil {
 		return fmt.Errorf("提交登录失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp.Body)
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -225,7 +229,7 @@ func (c *Client) verifyLogin(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("访问主页失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("主页状态异常: %d", resp.StatusCode)

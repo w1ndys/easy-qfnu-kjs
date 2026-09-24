@@ -36,14 +36,43 @@ func loadLocalManifest(opts Options) *Manifest {
 // baseline 是上一成功版本（可为 nil）。学期切换或全新学期时周表从零构建；
 // 同学期刷新则合并上一版未刷新的周条目与失败周条目（保留旧快照引用 + 记录错误码）。
 func (c *Candidate) buildManifest(opts Options, baseline *Manifest, generated, compactTS string, now time.Time, cfg *Config, groupCounts map[string]int) error {
+	weeks, err := c.manifestWeeks(opts, baseline, generated, compactTS)
+	if err != nil {
+		return err
+	}
+	m := &Manifest{
+		SchemaVersion: SchemaVersion,
+		ReleaseID:     compactTS,
+		Term:          c.Term,
+		GeneratedAt:   generated,
+		Anchor:        c.manifestAnchor(now),
+		Groups:        manifestGroups(cfg, groupCounts),
+		Nodes:         manifestNodes(),
+		Statuses:      manifestStatuses(),
+		Weeks:         weeks,
+	}
+	c.Manifest = m
+	return writeCandidateManifest(c.Dir, m)
+}
+
+func (c *Candidate) manifestWeeks(opts Options, baseline *Manifest, generated, compactTS string) (map[string]*WeekEntry, error) {
 	weeks := map[string]*WeekEntry{}
+	// 同学期刷新才沿用旧周；换学期时旧周不能混进新 manifest。
 	if !c.SwitchTerm && baseline != nil && baseline.Term == c.Term {
 		for k, v := range baseline.Weeks {
 			weeks[k] = cloneWeekEntry(v)
 		}
 	}
+	if err := c.putSuccessWeeks(weeks, generated, compactTS); err != nil {
+		return nil, err
+	}
+	if err := c.putFailedWeeks(opts, baseline, weeks); err != nil {
+		return nil, err
+	}
+	return weeks, nil
+}
 
-	// 成功周：新快照引用。
+func (c *Candidate) putSuccessWeeks(weeks map[string]*WeekEntry, generated, compactTS string) error {
 	for _, w := range c.SuccessWeeks {
 		file := filepath.Join(c.Dir, dataRelPath(c.Term, w))
 		sha, err := sha256FileHex(file)
@@ -58,9 +87,10 @@ func (c *Candidate) buildManifest(opts Options, baseline *Manifest, generated, c
 			LastSuccessAt: generated,
 		}
 	}
+	return nil
+}
 
-	// 失败周：仅同学期、且上一版有该周条目时，保留旧快照并记录错误码；
-	// 同时把旧周文件复制进候选目录，保证候选整体自洽。
+func (c *Candidate) putFailedWeeks(opts Options, baseline *Manifest, weeks map[string]*WeekEntry) error {
 	for _, f := range c.Failures {
 		if c.SwitchTerm {
 			continue
@@ -79,7 +109,20 @@ func (c *Candidate) buildManifest(opts Options, baseline *Manifest, generated, c
 			return err
 		}
 	}
+	return nil
+}
 
+func (c *Candidate) manifestAnchor(now time.Time) Anchor {
+	return Anchor{
+		Date:               beijingDate(now),
+		Week:               c.CurrentWeek,
+		TotalWeeks:         c.TotalWeeks,
+		Timezone:           DefaultTimezone,
+		InTeachingCalendar: c.InCalendar,
+	}
+}
+
+func manifestGroups(cfg *Config, groupCounts map[string]int) []ManifestGroup {
 	groups := make([]ManifestGroup, 0, len(cfg.EnabledGroups()))
 	for _, g := range cfg.EnabledGroups() {
 		groups = append(groups, ManifestGroup{
@@ -89,31 +132,15 @@ func (c *Candidate) buildManifest(opts Options, baseline *Manifest, generated, c
 			RoomCount: groupCounts[g.ID],
 		})
 	}
+	return groups
+}
 
-	m := &Manifest{
-		SchemaVersion: SchemaVersion,
-		ReleaseID:     compactTS,
-		Term:          c.Term,
-		GeneratedAt:   generated,
-		Anchor: Anchor{
-			Date:               beijingDate(now),
-			Week:               c.CurrentWeek,
-			TotalWeeks:         c.TotalWeeks,
-			Timezone:           DefaultTimezone,
-			InTeachingCalendar: c.InCalendar,
-		},
-		Groups:   groups,
-		Nodes:    manifestNodes(),
-		Statuses: manifestStatuses(),
-		Weeks:    weeks,
-	}
-	c.Manifest = m
-
+func writeCandidateManifest(dir string, m *Manifest) error {
 	raw, err := marshalIndent(m)
 	if err != nil {
 		return newGlobal(CodeInternal, "序列化 manifest 失败: %v", err)
 	}
-	if err := writeFileAtomic(filepath.Join(c.Dir, ManifestFileName), raw, 0644); err != nil {
+	if err := writeFileAtomic(filepath.Join(dir, ManifestFileName), raw, 0644); err != nil {
 		return newGlobal(CodeInternal, "写入候选 manifest 失败: %v", err)
 	}
 	return nil

@@ -32,86 +32,68 @@ type ParsedRow struct {
 //
 // 调用方必须先排除登录页/非法访问页特征；这里会再次防御性检测。
 func ParseWeekHTML(body string) ([]ParsedRow, error) {
+	if err := rejectBlockedPage(body); err != nil {
+		return nil, err
+	}
+	table, err := findWeekTable(body)
+	if err != nil {
+		return nil, err
+	}
+	if err := readHeaderBlocks(table); err != nil {
+		return nil, err
+	}
+	return parseTableRows(table)
+}
+
+func rejectBlockedPage(body string) error {
 	if strings.Contains(body, MarkLoginPage) {
-		return nil, newGlobal(CodeLoginPage, "响应命中登录页特征，无法解析周表")
+		return newGlobal(CodeLoginPage, "响应命中登录页特征，无法解析周表")
 	}
 	if strings.Contains(body, MarkIllegalAccess) {
-		return nil, newGlobal(CodeIllegalAccess, "响应命中非法访问特征，无法解析周表")
+		return newGlobal(CodeIllegalAccess, "响应命中非法访问特征，无法解析周表")
 	}
+	return nil
+}
 
+func findWeekTable(body string) (*goquery.Selection, error) {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(body))
 	if err != nil {
 		return nil, newGlobal(CodeStructure, "解析 HTML 失败: %v", err)
 	}
-
 	table := doc.Find("table#dataList").First()
 	if table.Length() == 0 {
 		return nil, newGlobal(CodeStructure, "响应中缺少 table#dataList，无法解析周表")
 	}
+	return table, nil
+}
 
-	// --- 表头大节块 ---
+func readHeaderBlocks(table *goquery.Selection) error {
 	var blocks []string
 	table.Find("td[tdvalue]").Each(func(_ int, s *goquery.Selection) {
 		if v, ok := s.Attr("tdvalue"); ok {
 			blocks = append(blocks, v)
 		}
 	})
-	if err := validateHeaderBlocks(blocks); err != nil {
-		return nil, err
-	}
+	return validateHeaderBlocks(blocks)
+}
 
-	// --- 数据行（tbody；HTML5 解析器会补全省略的 tbody）---
+func parseTableRows(table *goquery.Selection) ([]ParsedRow, error) {
+	dataRows := weekDataRows(table)
 	var rows []ParsedRow
 	seenJsbh := map[string]bool{}
-
 	var parseErr error
-	dataRows := table.Find("tbody > tr")
-	if dataRows.Length() == 0 {
-		// 兜底：无 tbody 时取不属于 thead 的行。
-		dataRows = table.Find("tr").FilterFunction(func(_ int, s *goquery.Selection) bool {
-			return s.ParentsFiltered("thead").Length() == 0
-		})
-	}
 	dataRows.Each(func(_ int, tr *goquery.Selection) {
 		if parseErr != nil {
 			return
 		}
-		if tr.Find("th").Length() > 0 || tr.Find("td[tdvalue]").Length() > 0 {
-			return // 表头行（th 或 tdvalue 行）
-		}
-		tds := tr.Find("td")
-		if tds.Length() == 0 {
-			return
-		}
-		if tds.Length() != expectedRowCells {
-			parseErr = newGlobal(CodeStructure,
-				"数据行单元格数异常：期望 %d 实际 %d", expectedRowCells, tds.Length())
-			return
-		}
-
-		jsbh := extractJsbh(tr, tds)
-		if jsbh == "" {
-			parseErr = newGlobal(CodeStructure, "数据行缺少 jsbh（行属性与 checkbox value 均为空）")
-			return
-		}
-		if seenJsbh[jsbh] {
-			parseErr = newGlobal(CodeStructure, "同一响应中 jsbh 重复: %s", jsbh)
-			return
-		}
-		seenJsbh[jsbh] = true
-
-		name := NormalizeRoomName(strings.TrimSpace(tds.First().Text()))
-		if name == "" {
-			parseErr = newGlobal(CodeStructure, "jsbh=%s 的房间名称为空", jsbh)
-			return
-		}
-
-		row := ParsedRow{Jsbh: jsbh, Name: name}
-		if err := parseRowCells(tds, &row); err != nil {
+		row, skip, err := parseTableRow(tr, seenJsbh)
+		if err != nil {
 			parseErr = err
 			return
 		}
-		rows = append(rows, row)
+		if !skip {
+			rows = append(rows, row)
+		}
 	})
 	if parseErr != nil {
 		return nil, parseErr
@@ -120,6 +102,59 @@ func ParseWeekHTML(body string) ([]ParsedRow, error) {
 		return nil, newGlobal(CodeStructure, "dataList 中没有解析到任何教室数据行")
 	}
 	return rows, nil
+}
+
+func weekDataRows(table *goquery.Selection) *goquery.Selection {
+	dataRows := table.Find("tbody > tr")
+	if dataRows.Length() > 0 {
+		return dataRows
+	}
+	// HTML5 解析器通常会补 tbody；没有时再排除 thead 里的行。
+	return table.Find("tr").FilterFunction(func(_ int, s *goquery.Selection) bool {
+		return s.ParentsFiltered("thead").Length() == 0
+	})
+}
+
+func parseTableRow(tr *goquery.Selection, seenJsbh map[string]bool) (ParsedRow, bool, error) {
+	if tr.Find("th").Length() > 0 || tr.Find("td[tdvalue]").Length() > 0 {
+		return ParsedRow{}, true, nil
+	}
+	tds := tr.Find("td")
+	if tds.Length() == 0 {
+		return ParsedRow{}, true, nil
+	}
+	if tds.Length() != expectedRowCells {
+		return ParsedRow{}, false, newGlobal(CodeStructure,
+			"数据行单元格数异常：期望 %d 实际 %d", expectedRowCells, tds.Length())
+	}
+	row, err := rowFromCells(tr, tds, seenJsbh)
+	if err != nil {
+		return ParsedRow{}, false, err
+	}
+	if row.Jsbh == "" {
+		return ParsedRow{}, true, nil
+	}
+	return row, false, nil
+}
+
+func rowFromCells(tr *goquery.Selection, tds *goquery.Selection, seenJsbh map[string]bool) (ParsedRow, error) {
+	jsbh := extractJsbh(tr, tds)
+	if jsbh == "" {
+		return ParsedRow{}, newGlobal(CodeStructure, "数据行缺少 jsbh（行属性与 checkbox value 均为空）")
+	}
+	if seenJsbh[jsbh] {
+		return ParsedRow{}, newGlobal(CodeStructure, "同一响应中 jsbh 重复: %s", jsbh)
+	}
+	seenJsbh[jsbh] = true
+	name := NormalizeRoomName(strings.TrimSpace(tds.First().Text()))
+	if name == "" {
+		return ParsedRow{}, newGlobal(CodeStructure, "jsbh=%s 的房间名称为空", jsbh)
+	}
+	row := ParsedRow{Jsbh: jsbh, Name: name}
+	if err := parseRowCells(tds, &row); err != nil {
+		return ParsedRow{}, err
+	}
+	return row, nil
 }
 
 // validateHeaderBlocks 校验表头 tdvalue 集合恰为 7×5 且按天按序等于 5 大节。
