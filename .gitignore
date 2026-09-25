@@ -5,8 +5,9 @@
 
 # --- node / web ---
 node_modules/
-web/dist/
+frontend/dist/
 *.local
+var/
 
 # --- generated build/source artifacts ---
 /api/v1/\[...path\].js
