@@ -14,19 +14,20 @@ import (
 
 // Options 采集器运行参数（由 cmd/collector 组装）。
 type Options struct {
-	RepoDir     string // 仓库根（默认当前工作目录）
-	ConfigPath  string
-	DataDir     string
-	SchemaDir   string
-	StateDir    string
-	DryRun      bool
-	Username    string
-	Password    string
-	PublishBase string
-	PublishRepo string
-	WebhookURL  string
-	WebhookSec  string
-	HTTPTimeout time.Duration
+	RepoDir      string
+	ConfigPath   string
+	DataDir      string
+	DatabaseURL  string
+	SchemaDir    string
+	StateDir     string
+	DryRun       bool
+	Username     string
+	Password     string
+	PublishBase  string
+	PublishRepo  string
+	WebhookURL   string
+	WebhookSec   string
+	HTTPTimeout  time.Duration
 }
 
 // LockWaitTimeout 采集锁最长等待时间（Q160）。
@@ -170,7 +171,7 @@ func (r *roundRun) publish(cand *Candidate, prev State) error {
 
 func (r *roundRun) finishDryRun(cand *Candidate) error {
 	logger.Info("dry-run：校验通过，跳过发布。候选目录（保留供检查）=%s", cand.Dir)
-	logger.Info("dry-run：若正式发布将提交 data: %s（release=%s）", cand.Term, cand.Manifest.ReleaseID)
+	logger.Info("dry-run：若正式发布将写入本机快照库 %s（release=%s）", cand.Term, cand.Manifest.ReleaseID)
 	r.state.ConsecutiveFailures = 0
 	r.state.LastRoundSuccess = true
 	r.state.LastRoundAt = formatRFC3339BJ(nowBJ())

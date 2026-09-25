@@ -48,7 +48,7 @@ journalctl --user -u easy-qfnu-collector.service -n 50
 go build -o collector ./cmd/collector
 ./collector collect           # 采集到仓库外暂存目录
 ./collector validate          # Schema/哈希/分组数量校验
-./collector publish           # 提交 main 并做发布验收
+./collector publish           # 写入本机快照库并验收 current
 ./collector run               # 完整流程
 ./collector run --dry-run     # collect + validate，不发布
 ```

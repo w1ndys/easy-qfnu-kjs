@@ -3,8 +3,8 @@
 曲阜师范大学空教室查询系统（新架构）。
 
 ```text
-本地 Go 采集器（教师账号）→ 每周全量快照 → 白名单分组过滤 → GitHub 私有仓库
-  → Vercel 自动部署（Serverless + Vue 3）→ 公开查询
+本地 Go 采集器（教师账号）→ 每周全量快照 → 白名单分组过滤 → PostgreSQL 17
+  → 查询服务读取当前 release（公网域名尚未切换）
 ```
 
 旧版 Docker 实现已归档：https://github.com/w1ndys/easy-qfnu-kjs-legacy
@@ -13,9 +13,9 @@
 
 - `cmd/collector/`：本地 Go 采集器（`collect` / `validate` / `publish` / `run`），
   通过 CAS + OCR 登录教务系统，按周采集全校教室状态，5 大节展开为 12 小节，
-  按 `config/rooms.json` 白名单过滤后生成周快照，提交 `main` 触发 Vercel 部署。
-- `data/`：生成的脱敏快照源数据（`manifest.json` + `terms/<term>/weeks/week-NN.json`），
-  不配置静态路由，浏览器不可直接访问。
+  按 `config/rooms.json` 白名单过滤后写入 PostgreSQL，不再推送到 GitHub。
+- PostgreSQL 17：当前 release 存在 `kjs.release`，教室小节存在 `kjs.room_slot`。表结构见 `internal/collector/pg_schema.sql`。
+- `data/`：数据库还没有当前 release 时，采集器用它做基线。
 - `frontend/`：Vue 3 + Vite + Vant 4 移动端前端（首页 / 空教室查询 / 全天状态 / 404）。
 - `config/rooms.json`：人工维护的采集白名单与查询分组。
 - `schemas/`：snapshot / manifest / config 的 JSON Schema（采集与构建双重校验契约）。

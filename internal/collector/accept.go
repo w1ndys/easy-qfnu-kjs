@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os/exec"
+	"net/url"
 	"strings"
 	"time"
 
@@ -20,15 +20,18 @@ const (
 	manifestPollMax   = 30 // 5 分钟
 )
 
-// AcceptPublish 发布验收（Q156）：
-//  1. 每 15s 查 GitHub commit check-runs 直到通过（上限 10 分钟）；
-//  2. 每 10s GET 生产 /api/v1/manifest 直到 release_id 匹配（上限 5 分钟）；
-//  3. 固定样例查询（第一启用分组 + 当前周 + 当天 + 01—12）要求 200。
-//
-// 任一环节超时/失败 → 返回错误（调用方告警，不自动回滚）。
+// AcceptPublish 确认本机快照库已经切到这次 release。
+// 公网域名还指着旧服务时不做 HTTP 验收，避免把旧站的 404 当成发布失败。
 func AcceptPublish(ctx context.Context, opts Options, res *PublishResult, httpClient *http.Client) error {
-	if err := waitGitHubChecks(ctx, opts, res.CommitSHA); err != nil {
+	if err := ctx.Err(); err != nil {
+		return newGlobal(CodeVerifyFailed, "发布验收上下文取消: %v", err)
+	}
+	if err := acceptLocalRelease(opts, res.ReleaseID); err != nil {
 		return err
+	}
+	if !localPublishBase(opts.PublishBase) {
+		logger.Info("跳过公网验收：%s 仍不是本机服务", opts.PublishBase)
+		return nil
 	}
 	live, err := waitManifestRelease(ctx, opts, res.ReleaseID, httpClient)
 	if err != nil {
@@ -37,162 +40,25 @@ func AcceptPublish(ctx context.Context, opts Options, res *PublishResult, httpCl
 	if err := sampleQuery(ctx, opts, live, httpClient); err != nil {
 		return err
 	}
-	logger.Info("发布验收通过：release=%s commit=%s", res.ReleaseID, res.CommitSHA)
+	logger.Info("发布验收通过：release=%s", res.ReleaseID)
 	return nil
 }
 
-// ghAPIGet 调用 gh api（需 gh 已认证）。
-func ghAPIGet(ctx context.Context, path string) ([]byte, error) {
-	if _, err := exec.LookPath("gh"); err != nil {
-		return nil, fmt.Errorf("gh CLI 不可用: %v", err)
+func acceptLocalRelease(opts Options, releaseID string) error {
+	m := loadLocalManifest(opts)
+	if m == nil || m.ReleaseID != releaseID {
+		return newGlobal(CodeVerifyFailed, "本机快照库没有切换到 release %s", releaseID)
 	}
-	cmd := exec.CommandContext(ctx, "gh", "api", path)
-	var out, errb bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("gh api %s 失败: %v (%s)", path, err, strings.TrimSpace(errb.String()))
-	}
-	return out.Bytes(), nil
+	return nil
 }
 
-type ghChecks struct {
-	TotalCount int `json:"total_count"`
-	CheckRuns  []struct {
-		Status     string `json:"status"`
-		Conclusion string `json:"conclusion"`
-	} `json:"check_runs"`
-}
-
-type ghStatus struct {
-	State      string `json:"state"`
-	TotalCount int    `json:"total_count"`
-}
-
-// waitGitHubChecks 轮询 GitHub 提交状态与 check-runs。
-func waitGitHubChecks(ctx context.Context, opts Options, commitSHA string) error {
-	repo, err := remoteOwnerRepo(opts)
+func localPublishBase(raw string) bool {
+	u, err := url.Parse(raw)
 	if err != nil {
-		return newGlobal(CodeVerifyFailed, "推断 GitHub 仓库失败: %v", err)
+		return false
 	}
-	poll := checkPoll{
-		ctx:       ctx,
-		base:      fmt.Sprintf("repos/%s/commits/%s", repo, commitSHA),
-		commitSHA: commitSHA,
-		bad: map[string]bool{
-			"failure": true, "cancelled": true, "timed_out": true, "action_required": true,
-		},
-		deadline: time.Now().Add(checkPollMax * checkPollInterval),
-	}
-	for round := 1; round <= checkPollMax; round++ {
-		done, err := poll.once(round)
-		if err != nil || done {
-			return err
-		}
-	}
-	return newGlobal(CodeVerifyFailed, "等待 GitHub check-runs 通过超时（10 分钟）")
-}
-
-type checkPoll struct {
-	ctx       context.Context
-	base      string
-	commitSHA string
-	bad       map[string]bool
-	deadline  time.Time
-	empty     int
-}
-
-func (p *checkPoll) once(round int) (bool, error) {
-	if p.ctx.Err() != nil {
-		return false, newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
-	}
-	checks, status, err := p.fetch(round)
-	if err != nil {
-		return false, err
-	}
-	if checks == nil {
-		return false, nil
-	}
-	return p.decide(checks, status)
-}
-
-func (p *checkPoll) fetch(round int) (*ghChecks, *ghStatus, error) {
-	checksJSON, cerr := ghAPIGet(p.ctx, p.base+"/check-runs")
-	statusJSON, serr := ghAPIGet(p.ctx, p.base+"/status")
-	if cerr != nil || serr != nil {
-		logger.Warn("查询 GitHub 状态失败（第 %d 次）: %v / %v", round, cerr, serr)
-		if !sleepCtx(p.ctx, checkPollInterval) {
-			return nil, nil, newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
-		}
-		return nil, nil, nil
-	}
-	var checks ghChecks
-	_ = json.Unmarshal(checksJSON, &checks)
-	var status ghStatus
-	_ = json.Unmarshal(statusJSON, &status)
-	return &checks, &status, nil
-}
-
-func (p *checkPoll) decide(checks *ghChecks, status *ghStatus) (bool, error) {
-	if checks.TotalCount+status.TotalCount == 0 {
-		return p.emptyRound()
-	}
-	failed, pending := checkConclusions(checks, status, p.bad)
-	if failed {
-		return false, newGlobal(CodeVerifyFailed, "GitHub 提交 %s 的 check-runs/status 出现失败结论", p.commitSHA)
-	}
-	if !pending {
-		logger.Info("GitHub 提交检查通过（checks=%d status=%s）", checks.TotalCount, status.State)
-		return true, nil
-	}
-	if time.Now().After(p.deadline) {
-		return false, newGlobal(CodeVerifyFailed, "等待 GitHub check-runs 通过超时（10 分钟）")
-	}
-	if !sleepCtx(p.ctx, checkPollInterval) {
-		return false, newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
-	}
-	return false, nil
-}
-
-func (p *checkPoll) emptyRound() (bool, error) {
-	p.empty++
-	// 连续 3 轮没有任何状态，说明仓库没配 CI，不能一直等到超时。
-	if p.empty >= 3 {
-		logger.Info("仓库未配置 check-runs/status（3 轮仍为空），视为无 CI 门禁通过")
-		return true, nil
-	}
-	if time.Now().After(p.deadline) {
-		return false, newGlobal(CodeVerifyFailed, "GitHub 状态查询超时（无任何状态上报）")
-	}
-	if !sleepCtx(p.ctx, checkPollInterval) {
-		return false, newGlobal(CodeVerifyFailed, "check-runs 验收上下文取消")
-	}
-	return false, nil
-}
-
-func checkConclusions(checks *ghChecks, status *ghStatus, bad map[string]bool) (bool, bool) {
-	failed := false
-	pending := false
-	for _, cr := range checks.CheckRuns {
-		if cr.Status != "completed" {
-			pending = true
-			continue
-		}
-		if bad[cr.Conclusion] {
-			failed = true
-			continue
-		}
-		if cr.Conclusion != "success" && cr.Conclusion != "neutral" && cr.Conclusion != "skipped" {
-			pending = true
-		}
-	}
-	switch status.State {
-	case "failure", "error":
-		failed = true
-	case "pending":
-		pending = true
-	}
-	return failed, pending
+	host := u.Hostname()
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 // liveManifest 生产环境返回的 manifest 关键字段。

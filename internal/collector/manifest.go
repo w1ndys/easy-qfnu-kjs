@@ -2,7 +2,6 @@ package collector
 
 import (
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"time"
 )
@@ -16,20 +15,18 @@ func parseManifest(data []byte) (*Manifest, error) {
 	return &m, nil
 }
 
-// loadLocalManifest 读取“上一成功版本”作为基线：
-// 优先 git show HEAD:data/manifest.json，其次本地 data/manifest.json；均不可用返回 nil。
+// loadLocalManifest 读取上一成功版本。
+// 先读本机快照库 current；还没有 current 时读仓库 data/。都不存在返回 nil。
 func loadLocalManifest(opts Options) *Manifest {
-	if b, err := gitShowFile(opts, ManifestFileName); err == nil {
-		if m, err := parseManifest(b); err == nil {
-			return m
-		}
+	b, _, err := readPublishedFile(opts, ManifestFileName)
+	if err != nil {
+		return nil
 	}
-	if b, err := os.ReadFile(filepath.Join(opts.DataDir, ManifestFileName)); err == nil {
-		if m, err := parseManifest(b); err == nil {
-			return m
-		}
+	m, err := parseManifest(b)
+	if err != nil {
+		return nil
 	}
-	return nil
+	return m
 }
 
 // buildManifest 生成 manifest 草稿并写入候选目录。
@@ -146,17 +143,13 @@ func writeCandidateManifest(dir string, m *Manifest) error {
 	return nil
 }
 
-// copyOldWeekFile 把 data/（或 git HEAD）中的旧周文件复制进候选目录。
+// copyOldWeekFile 把上一版周文件复制进候选目录。
+// 先找本机快照库，再找仓库 data/。两边都没有就失败，不能发布一份缺文件的候选。
 func (c *Candidate) copyOldWeekFile(opts Options, term string, week int) error {
 	rel := dataRelPath(term, week)
-	var data []byte
-	if b, err := os.ReadFile(weekFilePath(opts.DataDir, term, week)); err == nil {
-		data = b
-	} else if b, err := gitShowFile(opts, rel); err == nil {
-		data = b
-	} else {
-		return newGlobal(CodeInternal,
-			"失败周 %d 的上一版文件在 data/ 与 git HEAD 中均不存在（%s）", week, rel)
+	data, _, err := readPublishedFile(opts, rel)
+	if err != nil {
+		return newGlobal(CodeInternal, "失败周 %d 的上一版文件不存在（%s）", week, rel)
 	}
 	path := filepath.Join(c.Dir, rel)
 	if err := writeFileAtomic(path, data, 0644); err != nil {

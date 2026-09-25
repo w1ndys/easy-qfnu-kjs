@@ -404,19 +404,12 @@ func errorCodeOf(err error) string {
 	return CodeInternal
 }
 
-// hasPreviousWeekFile 判断 data/ 或 git HEAD 是否存在该周旧文件。
+// hasPreviousWeekFile 判断本机快照库或仓库 data/ 是否有该周旧文件。
 func hasPreviousWeekFile(opts Options, term string, week int) bool {
-	if _, err := os.Stat(weekFilePath(opts.DataDir, term, week)); err == nil {
-		return true
-	}
-	_, err := gitShowFile(opts, dataRelPath(term, week))
+	_, _, err := readPublishedFile(opts, dataRelPath(term, week))
 	return err == nil
 }
 
 func dataRelPath(term string, week int) string {
 	return filepath.Join(TermsDirName, term, WeeksDirName, weekFileName(week))
-}
-
-func weekFilePath(dataDir, term string, week int) string {
-	return filepath.Join(dataDir, dataRelPath(term, week))
 }

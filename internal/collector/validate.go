@@ -155,20 +155,18 @@ func roomCountChangedTooMuch(g ManifestGroup, old int) error {
 	return nil
 }
 
-// resolveWeekFileSHA 按 候选目录 → data/ → git HEAD 顺序查找周文件并计算哈希。
+// resolveWeekFileSHA 按候选目录、本机快照库、仓库 data/ 的顺序查找周文件并计算哈希。
 func resolveWeekFileSHA(opts Options, candDir, term string, week int) (sha, src string, err error) {
 	rel := dataRelPath(term, week)
-	candidates := []string{filepath.Join(candDir, rel), weekFilePath(opts.DataDir, term, week)}
-	for _, p := range candidates {
-		if b, rerr := os.ReadFile(p); rerr == nil {
-			return sha256Hex(b), p, nil
-		}
+	candPath := filepath.Join(candDir, rel)
+	if b, rerr := os.ReadFile(candPath); rerr == nil {
+		return sha256Hex(b), candPath, nil
 	}
-	if b, gerr := gitShowFile(opts, rel); gerr == nil {
-		return sha256Hex(b), "git HEAD:" + rel, nil
+	b, src, rerr := readPublishedFile(opts, rel)
+	if rerr != nil {
+		return "", "", newGlobal(CodeSchemaFailed, "manifest 引用的第 %d 周文件不存在（%s）", week, rel)
 	}
-	return "", "", newGlobal(CodeSchemaFailed,
-		"manifest 引用的第 %d 周文件在候选目录/data/HEAD 中均不存在（%s）", week, rel)
+	return sha256Hex(b), src, nil
 }
 
 // sameGroupStructure 比较两次加载的启用分组（id+order）是否一致。

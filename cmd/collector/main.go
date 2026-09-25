@@ -112,19 +112,20 @@ func buildCollectorOptions(a cliArgs) (collector.Options, int) {
 		return collector.Options{}, code
 	}
 	return collector.Options{
-		RepoDir:     repoDir,
-		ConfigPath:  joinUnderRepo(repoDir, a.configPath),
-		DataDir:     joinUnderRepo(repoDir, a.dataDir),
-		SchemaDir:   joinUnderRepo(repoDir, a.schemaDir),
-		StateDir:    stateDir,
-		DryRun:      a.dryRun,
-		Username:    os.Getenv("QFNU_USERNAME"),
-		Password:    os.Getenv("QFNU_PASSWORD"),
-		PublishBase: envOr("PUBLISH_BASE_URL", collector.DefaultPublishBase),
-		PublishRepo: os.Getenv("PUBLISH_REPO"),
-		WebhookURL:  os.Getenv("FEISHU_WEBHOOK_URL"),
-		WebhookSec:  os.Getenv("FEISHU_WEBHOOK_SECRET"),
-		HTTPTimeout: 120 * time.Second,
+		RepoDir:      repoDir,
+		ConfigPath:   joinUnderRepo(repoDir, a.configPath),
+		DataDir:      joinUnderRepo(repoDir, a.dataDir),
+		DatabaseURL:  os.Getenv("DATABASE_URL"),
+		SchemaDir:    joinUnderRepo(repoDir, a.schemaDir),
+		StateDir:     stateDir,
+		DryRun:       a.dryRun,
+		Username:     os.Getenv("QFNU_USERNAME"),
+		Password:     os.Getenv("QFNU_PASSWORD"),
+		PublishBase:  envOr("PUBLISH_BASE_URL", collector.DefaultPublishBase),
+		PublishRepo:  os.Getenv("PUBLISH_REPO"),
+		WebhookURL:   os.Getenv("FEISHU_WEBHOOK_URL"),
+		WebhookSec:   os.Getenv("FEISHU_WEBHOOK_SECRET"),
+		HTTPTimeout:  120 * time.Second,
 	}, 0
 }
 
