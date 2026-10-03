@@ -39,9 +39,9 @@ Issue #1 的「前端行为」段原先把实现栈写死为 Vue 3 + Vite + Vant
 - 第一版只有四个页面（首页、空教室、全天状态、404），两套组件库带来的第二套设计系统与双份样式维护换不来收益。
 - antd 的 Grid 断点在 375px 下做单列布局已经够用，不需要靠 antd-mobile 才能用。
 - 版本与目录分层对齐同型先例 `qfnu-course-grabber-v2`（同样是 Vue 迁 React + antd）：antd `^6.6.5`、react `^19.3.0`、react-router `^8.4.0`、vite `^8.3.0`、typescript `~6.0.2`。除 TypeScript 外都等于当时的 latest；TypeScript 停在 6.x 是为了避开工具链尚未跟齐的 7.x。
-- 请求层沿用 axios，不引入 TanStack Query。客户端错误码与约定在 `docs/contract/reference-v1/api/client.ts`（旧契约）；查询契约本身已按 v2 重定，见 `docs/contract/api.v2.md`。
-- 前端目录沿用上一版已按关注点拆好的命名（`api/`、`pages/`、`components/`、`hooks/`、`manifest/`、`rooms/`、`constants/`），不照搬先例的扁平结构；v1 契约文件已迁到 `docs/contract/reference-v1/api/`，只作考古。
-- 全天状态用 antd Table，默认按 12 小节出列并支持切换 5 个大节——这是 Issue #1 本来就写下的产品行为，不是新增需求。
+- 请求层沿用 axios，不引入 TanStack Query。查询契约已按 v2 重定，见 `docs/contract/api.v2.md`；旧客户端错误码只留在 git 历史。
+- 前端目录沿用上一版已按关注点拆好的命名（`api/`、`pages/`、`components/`、`hooks/`、`manifest/`、`rooms/`、`constants/`），不照搬先例的扁平结构；旧契约（v1）已删除，仅存于 git 历史。
+- 全天状态用 antd Table，按 12 小节出列，不做 5 大节折叠。
 - 响应字段随 v2 契约重定：状态是语义键（`free` / `class` / …），房间带 `release_id` 与 `dict_version`；原先"`manifest.weeks` 兼容数组"的口子随 v1 一起作废，见 `docs/contract/api.v2.md`。
 
 ## Trade-offs Accepted

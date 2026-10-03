@@ -6,7 +6,7 @@
 
 ## 1. 定时采集
 
-v2：采集时间由 WebUI 配置的 cron 表达式驱动（`kjs.settings.cron_expr`）；下面的 systemd timer 是上一版实现。
+v2：采集时间由 WebUI 配置的 cron 表达式驱动（`settings.cron_expr`）；下面的 systemd timer 是上一版实现。
 
 ```ini
 # ~/.config/systemd/user/easy-qfnu-collector.service
@@ -70,7 +70,7 @@ v2：发布验收改为在库内读回最新一次发布并抽查，不再走 HT
 
 ## 4. 飞书告警
 
-v2：飞书 webhook 与签名在 WebUI 管理面板配置（`kjs.settings.feishu_webhook_url` / `feishu_secret`）；下面是上一版的环境变量写法：
+v2：飞书 webhook 与签名在 WebUI 管理面板配置（`settings.feishu_webhook_url` / `feishu_secret`）；下面是上一版的环境变量写法：
 
 - `FEISHU_WEBHOOK_URL`、`FEISHU_WEBHOOK_SECRET`（自定义机器人加签模式）。
 

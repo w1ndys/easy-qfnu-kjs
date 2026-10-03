@@ -17,8 +17,8 @@
 |---|---|
 | 采集器 | 登录教务系统，按周采集全校教室状态，清洗并写入数据库，执行发布 |
 | 查询服务 | 提供只读 HTTP API，从数据库读取当前数据并回答查询 |
-| WebUI 管理面板 | 管理员配置与状态查看；业务设置写入数据库配置 |
-| PostgreSQL | 数据存储（结构待重新设计） |
+| WebUI 管理面板 | 管理员配置、状态查看、版本对比与回退；业务设置写入数据库配置 |
+| PostgreSQL | canonical 存储：清洗后的数据逐格入库 |
 | ddddocr-fastapi | 验证码识别服务（生产环境已用 Docker 部署），由采集器通过 HTTP 调用 |
 
 ## 3. 数据采集
@@ -67,7 +67,7 @@
 | 5 expand | 5 大节展开为 12 小节 | 7 × 12 节点状态；断言同一大节内节点状态一致 |
 | 6 observe | 生成观测事实 | 一间房 × 一周 × 一天 × 一个节次恰一行 |
 | 7 validate | 与上一版对比校验 | 校验结果入库 |
-| 8 publish | 单事务写入 | 一次发布（版本规则待重新设计） |
+| 8 publish | 单事务写入并切换 current | 一次发布（current + previous 两版） |
 
 ### 4.1 房间身份与名称规范化
 
@@ -99,13 +99,57 @@
 
 ## 5. 数据存储
 
-数据存储结构与发布版本规则待重新设计。
+canonical 是 PostgreSQL，结构以 `docs/contract/db.v2.sql` 为准。
+
+### 5.1 存储职责
+
+| 表 | 职责 |
+|---|---|
+| `room` | 房间身份与属性：`jsbh`、规范化名、原始名、首次/最近出现 |
+| `dict` / `dict_state` / `dict_symbol` | 状态字典与符号分类（版本化） |
+| `axis` / `axis_node` | 12 节点 ↔ 5 大节映射（版本化） |
+| `term` / `term_week` | 学期、总周数、每周一日期与教学周历 |
+| `settings` | WebUI 业务设置（账号、飞书、OCR 地址、cron） |
+| `release` | 发布版本：`release_id`、学期、字典/轴版本、`is_current` |
+| `observation` | 观测事实：`release × room × term × week × weekday × node → state` |
+
+### 5.2 发布与版本
+
+- 观测每格一行，主键 `(release_id, room_id, term, week, weekday, node)`；`available` 为字典 `available` 的发布期投影，`raw_text` 仅 unknown/composite 存。
+- 发布 = 单事务写入观测 → 新 release 标 `is_current` → 旧 current 降为 previous → 更早删除（保留两版）。
+- `release_id` 是可读短 id（时间戳字符串），无内容寻址。
+
+### 5.3 日历与时间
+
+时间统一 `Asia/Shanghai`。每周的周一绝对日期入库；当前周/星期由服务端时钟与日历表共同确定。
 
 ## 6. 查询 API
 
-查询 API 的路径、参数、错误码与载荷格式待重新设计。
+查询契约以 `docs/contract/api.v2.md` 为准：3 个只读 GET，统一响应 `{code, message, data, request_id}`。
+
+### 6.1 端点
+
+| 路径 | 参数 | `data` |
+|---|---|---|
+| `GET /api/context` | — | `{date, term, week, weekday, in_calendar}` |
+| `GET /api/meta` | — | 数据版本、字典、轴、可用学期与逐周新鲜度 |
+| `GET /api/query` | `view`、`keyword`、`date_offset`、`start_node`、`end_node`、`limit`、`offset` | `{total, items, date, week, day_of_week}` |
+
+### 6.2 参数与判定
+
+- `view=availability`（空教室）：`keyword` + `date_offset` + `start_node`/`end_node`（默认 `01`/`11`）；判定 = 区间内每节都可用（`free`/`fully_free`），`items=[{id, name}]`。
+- `view=day`（状态列表）：`keyword` + `date_offset`；返回 12 小节状态，`items=[{id, name, statuses}]`。
+- `date_offset` 0..10 默认 0；`limit`/`offset` 默认 50/0。
+- 不在教学周：正常返回，由 `context.in_calendar=false` 表达。
+
+### 6.3 错误码与新鲜度
+
+- `code`：`0` 成功 / `40001` 参数错误 / `40401` 无数据 / `50000` 内部错误。
+- 新鲜度 36h/8d 落在 `meta`，过期返回旧数据并标 `stale`。
 
 ## 7. WebUI 管理面板
+
+管理员登录：用户名固定 `admin`，密码来自部署期环境变量 `ADMIN_PASSWORD`（不落库）。
 
 ### 7.1 配置
 
@@ -116,9 +160,11 @@
 - `ocr_base_url`：ddddocr-fastapi 服务地址；
 - `cron_expr`：采集调度 cron 表达式。
 
-### 7.2 状态与观测
+### 7.2 状态、对比与回退
 
-面板展示采集运行状态、最近校验结果、当前数据版本与逐周新鲜度。运行状态与告警去重由后端与数据库维护。
+面板展示采集运行状态、最近校验结果、当前数据版本与逐周新鲜度；运行状态与告警去重由后端与数据库维护。
+
+发布切换后，面板提供「当前版 vs 上一版」对比：房间集合（新增/消失/共有）、状态格变更明细、汇总（变更房间数/变更格数/unknown 与 composite 增减），并支持一键回退（交换 current 与 previous）。
 
 ### 7.3 安全
 
@@ -134,9 +180,9 @@
 
 ### 8.2 交互
 
-- 打开页面请求 `context`，填入当前周与星期；有明确查询按钮，回车触发同一次查询；「今天」按钮恢复当前周与星期。
-- 筛选条件：关键词、周次、星期、起止节次；状态名与节次从 `meta` 获取，前端不硬编码。
-- 全天状态默认 12 小节，可切换为 5 大节折叠视图。
+- 打开页面请求 `context`；日期用「今天/明天/后天/…」选择器（`date_offset`）；有明确查询按钮，回车触发同一次查询。
+- 筛选条件：关键词、日期（`date_offset`，今天/明天/后天/…）、起止节次（仅空教室页）；状态名与节次从 `meta` 获取，前端不硬编码。
+- 全天状态按 12 小节展示。
 - 结果分区展示：范围内无空教室、数据未收录、数据过期、当前不在教学周。
 - 同名房间追加缩短后的 `id`，其余只显示名称。
 
@@ -164,3 +210,8 @@
 - Given 上游表头块集合变化，Then 采集终止并告警，不自动适配。
 - Given 业务设置在 WebUI 中修改，Then 采集器与查询服务在下一轮从数据库读取到新值。
 - Given `go build ./... && go test ./...` 执行，Then 全部通过且不需要外部服务。
+- Given 一次发布完成，Then 新 release 为 current、旧 release 为 previous，更早的已删除。
+- Given WebUI 执行回退，Then current 与 previous 标记互换，查询立即读到回退后的数据。
+- Given 请求 `/api/query?view=availability&keyword=…&date_offset=0&start_node=01&end_node=11`，Then 返回区间内每节空闲的房间与 `total`。
+- Given 请求 `/api/query?view=day&date_offset=0`，Then 返回房间的 12 小节状态。
+- Given 没有任何可用 release，Then 查询返回 `code=40401`。
