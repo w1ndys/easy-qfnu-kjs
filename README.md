@@ -27,6 +27,7 @@
 - `docs/upstream.md`：教务系统接口与解析事实
 - `docs/operations.md`：运行、验收、回滚、告警、日志
 - `docs/decisions/2026-10-03-frontend-react-antd.md`：前端换栈的取舍
+- `docs/contract/`：数据与接口契约基线（索引见其 `README.md`）
 
 `docs/upstream.md` 与 `docs/operations.md` 是上一版实现时期的文档，保留原样作为重写输入。其中提到的路径（`cmd/collector/`、`schemas/`、`config/rooms.json`、`scripts/ocr_ddddocr.py`）在重写产出对应实现之前并不存在。
 
@@ -38,8 +39,11 @@ docs/
   operations.md          运行、验收、回滚、告警、日志
   decisions/             决定记录，一个决定一个文件
   contract/
-    schemas/             快照 / manifest / 配置三份 JSON Schema（原 schemas/）
-    api/                 四个只读 GET 的响应契约与错误码（原 web 与 frontend 的 src/api/）
+    README.md            契约索引与设计决定记录
+    data-format.v2.md    清洗契约：上游 HTML → 清洗后的事实
+    db.v2.sql            canonical 表结构（清洗后直接入库）
+    api.v2.md            查询契约：路径、参数、载荷、错误码
+    reference-v1/        旧契约，只作考古（不是基线）
   config/
     rooms.json           人工维护的采集白名单与查询分组（原 config/rooms.json）
     env.example          环境变量清单（原 .env.example）
@@ -47,7 +51,7 @@ README.md
 .gitignore
 ```
 
-`docs/contract/` 与 `docs/config/` 是重写的输入。恢复代码时把它们放回程序期望的位置（例如 `schemas/`、`config/rooms.json`），或让程序直接读 `docs/` 下的路径——由重写的 Spec 决定。
+`docs/` 是重写的输入：契约基线在 `docs/contract/`（清洗、表结构、查询），配置在 `docs/config/`。恢复代码时把它们放到程序期望的位置，或让程序直接读 `docs/` 下的路径——由重写的 Spec 决定。
 
 ## 下一步
 

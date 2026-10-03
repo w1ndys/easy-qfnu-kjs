@@ -14,6 +14,7 @@ Issue #1 的「前端行为」段原先把实现栈写死为 Vue 3 + Vite + Vant
 计划变更把前端实现栈改为 React 19 + antd 6。antd 是桌面向组件库，与「移动优先」直接冲突，所以这次反转不只是换个库，而是改了产品对移动端的定位。半年后一定会有人重新问「当初不是说要移动优先吗」，因此单独记一次取舍。
 
 写入本文件时重写尚未开始：`frontend/` 仍是 Vue 实现，查询服务也还没有。本决定只影响计划与文档，不含代码迁移。同日计划再次变更——实现代码整体移除、仓库只保留文档，`frontend/` 目录因此已不存在，见 `README.md`。
+同日稍后又重定了数据与接口契约（v2，canonical 是数据库），见 `docs/contract/README.md`。
 
 ## Options
 
@@ -38,10 +39,10 @@ Issue #1 的「前端行为」段原先把实现栈写死为 Vue 3 + Vite + Vant
 - 第一版只有四个页面（首页、空教室、全天状态、404），两套组件库带来的第二套设计系统与双份样式维护换不来收益。
 - antd 的 Grid 断点在 375px 下做单列布局已经够用，不需要靠 antd-mobile 才能用。
 - 版本与目录分层对齐同型先例 `qfnu-course-grabber-v2`（同样是 Vue 迁 React + antd）：antd `^6.6.5`、react `^19.3.0`、react-router `^8.4.0`、vite `^8.3.0`、typescript `~6.0.2`。除 TypeScript 外都等于当时的 latest；TypeScript 停在 6.x 是为了避开工具链尚未跟齐的 7.x。
-- 请求层沿用 axios，不引入 TanStack Query。错误码与 `baseURL = /api/v1` 的约定保留在 `docs/contract/api/client.ts`；产品行为是「打开页面请求 context、有明确查询按钮、不自动查询」，没有缓存失效需求。
-- 前端目录沿用上一版已按关注点拆好的命名（`api/`、`pages/`、`components/`、`hooks/`、`manifest/`、`rooms/`、`constants/`），不照搬先例的扁平结构；冻结契约已随前端删除迁到 `docs/contract/api/`（`types.ts`、`endpoints.ts`、`client.ts`）。
+- 请求层沿用 axios，不引入 TanStack Query。客户端错误码与约定在 `docs/contract/reference-v1/api/client.ts`（旧契约）；查询契约本身已按 v2 重定，见 `docs/contract/api.v2.md`。
+- 前端目录沿用上一版已按关注点拆好的命名（`api/`、`pages/`、`components/`、`hooks/`、`manifest/`、`rooms/`、`constants/`），不照搬先例的扁平结构；v1 契约文件已迁到 `docs/contract/reference-v1/api/`，只作考古。
 - 全天状态用 antd Table，默认按 12 小节出列并支持切换 5 个大节——这是 Issue #1 本来就写下的产品行为，不是新增需求。
-- 响应字段一律不改，只收窄前端解析容忍度：`manifest.weeks` 以 `docs/contract/schemas/manifest.schema.v1.json` 的 object 为准，删掉前端对数组形式的兼容分支。
+- 响应字段随 v2 契约重定：状态是语义键（`free` / `class` / …），房间带 `release_id` 与 `dict_version`；原先"`manifest.weeks` 兼容数组"的口子随 v1 一起作废，见 `docs/contract/api.v2.md`。
 
 ## Trade-offs Accepted
 
@@ -52,8 +53,8 @@ Issue #1 的「前端行为」段原先把实现栈写死为 Vue 3 + Vite + Vant
 
 ## Follow-up
 
-- [ ] 前端按 React + antd 重写，重建 `frontend/` 目录；响应契约以 `docs/contract/api/` 为准
+- [ ] 前端按 React + antd 重写，重建 `frontend/` 目录；响应契约以 `docs/contract/api.v2.md` 为准
 - [ ] 门禁扩为 `npm run lint` + `npm run typecheck` + `npm run build` 三项必过，纯函数补单元测试
-- [ ] 删除前端对 `manifest.weeks` 数组形式的兼容校验分支
+- [ ] 前端按 v2 契约解析状态（语义键），不保留整数 ID 的映射层
 - [ ] 重写完成后人工复核移动端体验，决定是否引入第二套组件库
 - [ ] 保持 Issue #1 的「前端行为」段与本文件一致
