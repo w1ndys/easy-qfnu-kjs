@@ -27,7 +27,7 @@
 - `docs/upstream.md`：教务系统接口与解析事实
 - `docs/operations.md`：运行、验收、回滚、告警、日志
 - `docs/decisions/2026-10-03-frontend-react-antd.md`：前端换栈的取舍
-- `docs/contract/`：数据与接口契约基线（索引见其 `README.md`）
+- `docs/contract/`：数据清洗契约（数据存储结构与查询 API 待重新设计）
 - `docs/product-requirements.md`：产品需求文档（完整、初始态）
 
 `docs/upstream.md` 与 `docs/operations.md` 是上一版实现时期的文档，保留原样作为重写输入；其中引用的路径（`cmd/collector/`、`schemas/`、`scripts/`）在重写产出对应实现之前并不存在，`config/rooms.json` 已随"不设白名单"删除。
@@ -43,8 +43,6 @@ docs/
   contract/
     README.md            契约索引与设计决定记录
     data-format.v2.md    清洗契约：上游 HTML → 清洗后的事实
-    db.v2.sql            canonical 表结构（清洗后直接入库）
-    api.v2.md            查询契约：路径、参数、载荷、错误码
     reference-v1/        旧契约，只作考古（不是基线）
   config/
     env.example          部署级环境变量（数据库连接等）；业务设置走 WebUI
@@ -52,7 +50,7 @@ README.md
 .gitignore
 ```
 
-`docs/` 是重写的输入：契约基线在 `docs/contract/`（清洗、表结构、查询）。业务设置（账号、飞书、OCR、cron）由 WebUI 写入 `kjs.settings`；部署级环境变量见 `docs/config/env.example`。
+`docs/` 是重写的输入：清洗契约在 `docs/contract/`。业务设置（账号、飞书、OCR、cron）由 WebUI 写入数据库配置；部署级环境变量见 `docs/config/env.example`。数据存储结构与查询 API 待重新设计。
 
 ## 下一步
 

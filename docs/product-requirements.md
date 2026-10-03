@@ -17,21 +17,21 @@
 |---|---|
 | 采集器 | 登录教务系统，按周采集全校教室状态，清洗并写入数据库，执行发布 |
 | 查询服务 | 提供只读 HTTP API，从数据库读取当前数据并回答查询 |
-| WebUI 管理面板 | 管理员配置与状态查看；业务设置写入数据库 `kjs.settings` |
-| PostgreSQL | canonical 存储：清洗后的数据直接入库 |
+| WebUI 管理面板 | 管理员配置与状态查看；业务设置写入数据库配置 |
+| PostgreSQL | 数据存储（结构待重新设计） |
 | ddddocr-fastapi | 验证码识别服务（生产环境已用 Docker 部署），由采集器通过 HTTP 调用 |
 
 ## 3. 数据采集
 
 ### 3.1 登录与验证码
 
-采集器使用教务系统教师账号登录 CAS。账号、密码由 WebUI 管理面板配置并写入 `kjs.settings`，采集器从库读取。
+采集器使用教务系统教师账号登录 CAS。账号、密码由 WebUI 管理面板配置并写入数据库配置，采集器从库读取。
 
 验证码识别调用 ddddocr-fastapi：把验证码图片转 base64，`POST {ocr_base_url}/ocr`（表单字段 `image`，可选 `probability`、`png_fix`）。响应为 `{"code":200,"message":"Success","data":"<识别文本>"}`，识别文本在 `data`；服务异常也返回 HTTP 200，以 `code=200` 判定成功。`ocr_base_url` 由 WebUI 配置。
 
 ### 3.2 学期与教学周历
 
-采集器读取当前学期（`GET /jsxsd/kbxx/jsjy_query`）与当前周/总周数（`GET /jsxsd/framework/jsMain_new.jsp?t1=1`）。教学周历、总周数、每周的周一日期写入 `kjs.term` 与 `kjs.term_week`。
+采集器读取当前学期（`GET /jsxsd/kbxx/jsjy_query`）与当前周/总周数（`GET /jsxsd/framework/jsMain_new.jsp?t1=1`）。教学周历、总周数、每周的周一日期写入数据库。
 
 ### 3.3 周状态采集
 
@@ -46,11 +46,11 @@
 
 ### 3.5 采集调度
 
-采集时间由 WebUI 配置的 cron 表达式（`kjs.settings.cron_expr`）驱动，调度器按表达式触发采集。
+采集时间由 WebUI 配置的 cron 表达式驱动，调度器按表达式触发采集。
 
 ### 3.6 运行约束
 
-- 同一时刻至多一轮采集，锁由数据库 `pg_advisory_lock` 维护。
+- 同一时刻至多一轮采集，锁由后端与数据库维护。
 - 单次网络请求最多 3 次重试；周与周之间随机间隔 0.5–2 秒；整轮网络阶段总时限 15 分钟。
 - 登录页或非法访问特征、表头块集合变化、结构校验失败均终止本轮，按告警策略通知。
 
@@ -66,8 +66,8 @@
 | 4 classify | 35 格原文按分类表归类 | 每格一个语义状态键，未知/复合保留原文本 |
 | 5 expand | 5 大节展开为 12 小节 | 7 × 12 节点状态；断言同一大节内节点状态一致 |
 | 6 observe | 生成观测事实 | 一间房 × 一周 × 一天 × 一个节次恰一行 |
-| 7 validate | 与上一版对比校验 | 校验结果入库 `kjs.release_check` |
-| 8 publish | 单事务写入并切换当前版本 | 一个不可变 release |
+| 7 validate | 与上一版对比校验 | 校验结果入库 |
+| 8 publish | 单事务写入 | 一次发布（版本规则待重新设计） |
 
 ### 4.1 房间身份与名称规范化
 
@@ -99,73 +99,17 @@
 
 ## 5. 数据存储
 
-canonical 是数据库，结构以 `docs/contract/db.v2.sql` 为准。
-
-### 5.1 存储职责
-
-| 表 | 职责 |
-|---|---|
-| `room` | 房间身份与属性：`jsbh`、规范化名、原始名、首次/最近出现 |
-| `dict` / `dict_state` / `dict_symbol` | 状态字典与符号分类表（版本化） |
-| `axis` / `axis_node` | 12 节点 ↔ 5 大节映射（版本化） |
-| `term` / `term_week` | 学期、总周数、每周一日期与教学周历 |
-| `settings` | WebUI 业务设置（账号、飞书、OCR 地址、cron） |
-| `release` / `release_room` | 发布版本与房间在本次发布中的呈现快照 |
-| `observation` | 观测事实：`release × room × week × weekday × node → state` |
-| `release_week` / `release_week_source` | 逐周内容哈希、新鲜度、质量计数、来源参数与页面哈希 |
-| `release_check` | 校验结果，作为数据供人工与前端查看 |
-
-### 5.2 发布与版本
-
-- 一个 release 是一份不可变的观测集合，`release_id` 由内容寻址得出。
-- 同一时刻至多一个 current；切换在单事务内完成。
-- 保留 current 与 previous 两份，更早的自动清理。
-- 每周的 `content_hash` 记录内容身份；内容未变时哈希一致。
-
-### 5.3 日历与时间
-
-时间统一 `Asia/Shanghai`。每周的周一绝对日期入库，查询侧与消费方不再自行推算周次；当前周/星期由服务端时钟与日历表共同确定。
+数据存储结构与发布版本规则待重新设计。
 
 ## 6. 查询 API
 
-查询契约以 `docs/contract/api.v2.md` 为准。全部只读 GET，错误使用 RFC 9457 `application/problem+json` 并带稳定 `code`。
-
-### 6.1 资源
-
-| 路径 | 作用 |
-|---|---|
-| `GET /api/context` | 当前时间上下文：日期、学期、周次、星期、是否在教学周 |
-| `GET /api/meta` | 数据版本与字典：`release_id`、`dict_version`、`axis_version`、状态字典、节次轴 |
-| `GET /api/terms` | 学期与周：总周数、每周一日期、是否有数据与新鲜度 |
-| `GET /api/availability` | 空教室：关键词 + 周/星期 + 节次区间，返回区间内每节都空闲的房间 |
-| `GET /api/day` | 全天状态：同一筛选，返回每个房间该日的节次状态 |
-
-### 6.2 参数
-
-- `q`：关键词，对全库房名做子串匹配（NFKC、ASCII 不区分大小写、最长 32、不支持正则）；省略时返回全库房间。
-- `term`、`week`、`weekday`（1 = 周一；省略时取当前上下文）。
-- `from`、`to`：节次区间（`01`–`12`，默认 `01`、`12`，要求 `from ≤ to`），仅 `/api/availability`。
-- `fold`：`nodes`（12 小节，默认）或 `blocks`（5 大节），仅 `/api/day`。
-
-### 6.3 判定与载荷
-
-- 空教室判定：所选星期内，名称匹配的每个房间，`from` 到 `to` 的每一节都可用才返回；可用状态为 `free` 与 `fully_free`。
-- 载荷使用语义状态键；房间返回 `id`、`name`；每个响应带 `schema_version` 与 `data.release_id`、`dict_version` 等数据版本信息。
-- 第一版查询不分页，全量返回。
-
-### 6.4 错误
-
-稳定错误码：`invalid_parameter`（400）、`not_published`（404）、`no_data`（503）、`not_found`（404）、`method_not_allowed`（405）、`internal`（500）。
-
-### 6.5 新鲜度与缓存
-
-新鲜度由查询侧计算：当前周与未来 4 周距最近成功超过 36 小时为过期，其余周超过 8 天为过期；最近一次采集失败也算过期。过期仍返回上一版成功数据并标记 `stale: true`。`/api/meta`、`/api/terms` 可长缓存（随 `release_id` 变化失效），`/api/context` 短缓存，查询端点按 `release_id` 缓存。
+查询 API 的路径、参数、错误码与载荷格式待重新设计。
 
 ## 7. WebUI 管理面板
 
 ### 7.1 配置
 
-管理员在面板中维护并持久化到 `kjs.settings`：
+管理员在面板中维护并持久化到数据库配置：
 
 - `account_username` / `account_password`：教务系统教师账号；
 - `feishu_webhook_url` / `feishu_secret`：飞书告警（加签模式）；
@@ -174,11 +118,11 @@ canonical 是数据库，结构以 `docs/contract/db.v2.sql` 为准。
 
 ### 7.2 状态与观测
 
-面板展示采集运行状态、最近校验结果（`release_check`）、当前 release 与逐周新鲜度（`release_week`）。运行状态与告警去重由后端与数据库维护。
+面板展示采集运行状态、最近校验结果、当前数据版本与逐周新鲜度。运行状态与告警去重由后端与数据库维护。
 
 ### 7.3 安全
 
-账号密码与飞书签名只存于 `kjs.settings`，不进 Git、日志、快照，由面板受控存取。部署级变量（如 `DATABASE_URL`）由环境传入，其余业务设置均走面板。
+账号密码与飞书签名只存于数据库配置，不进 Git、日志、快照，由面板受控存取。部署级变量（如 `DATABASE_URL`）由环境传入，其余业务设置均走面板。
 
 ## 8. 前端
 
@@ -204,23 +148,19 @@ canonical 是数据库，结构以 `docs/contract/db.v2.sql` 为准。
 
 - 数据范围：系统存储并发布房间身份（`jsbh`）、房名与按周/星期/节次的占用状态；占用详情（课程、教师、申请人、单双周）不属于数据范围。
 - 来源留存：只存请求参数、`fetched_at` 与 `page_sha256`，不存原始 HTML。
-- 秘密管理：账号、密码、Cookie、Token、验证码、飞书签名不进 Git、Issue、快照、日志；业务秘密由 `kjs.settings` 受控存取。
+- 秘密管理：账号、密码、Cookie、Token、验证码、飞书签名不进 Git、Issue、快照、日志；业务秘密由 WebUI 配置存储受控存取。
 - 告警内容不含账号、密码、Cookie、Token、原始页面。
 
 ## 10. 运维与告警
 
-- 采集锁、运行状态、告警去重、发布验收均由后端内部与数据库维护；发布验收在库内读回 current 并抽查数据。
+- 采集锁、运行状态、告警去重、发布验收均由后端内部与数据库维护；发布验收在库内完成。
 - 告警触发：重试耗尽后的最终失败、校验拦截、学期切换、连续失败后的首次恢复。普通成功与非教学周不通知；同一轮同类错误只通知一次。
 - 公网域名切换在本机内网验收通过之后进行。
 
 ## 11. 验收标准
 
-- Given 数据库中存在一次成功发布的 release，When 请求 `GET /api/meta`，Then 返回该 release 的 `release_id`、字典与轴版本、状态字典与节次轴。
-- Given 某房间在所选星期、节次区间内每一节都空闲，When 请求 `GET /api/availability?q=…&week=…&weekday=…&from=…&to=…`，Then 该房间出现在结果中，字段为 `id`、`name`。
-- Given 没有可用 release，Then 查询返回 `no_data`（503）；Given 学期或周没有数据，Then 返回 `not_published`（404）。
 - Given 数据库中没有基线、学期切换或周日，Then 采集器刷新当前学期全部周次。
 - Given 上游出现未收录符号，Then 该格记为 `unknown` 且发布照常进行，`unknown_cells` 计数随之增长。
 - Given 上游表头块集合变化，Then 采集终止并告警，不自动适配。
-- Given 一次发布完成，Then 数据库存在且仅存在一个 current release，上一版保留为 previous。
 - Given 业务设置在 WebUI 中修改，Then 采集器与查询服务在下一轮从数据库读取到新值。
 - Given `go build ./... && go test ./...` 执行，Then 全部通过且不需要外部服务。

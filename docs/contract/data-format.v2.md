@@ -2,7 +2,7 @@
 
 上游只有一个出口：一张 35 格的表格（7 天 × 5 大节）。本文件规定它如何变成可入库、可查询的事实。
 
-canonical 是数据库（见 `db.v2.sql`）；本文件与 DDL 是同一条契约的两种表述：本文件讲语义与不变量，DDL 讲形态。
+本文只定义清洗规则；数据存储结构与查询 API 的规范另行设计。
 
 ## 上游原生事实（不可协商）
 
@@ -24,9 +24,9 @@ canonical 是数据库（见 `db.v2.sql`）；本文件与 DDL 是同一条契�
 | 3 | normalize | `name_raw` | `name`（规范化展示名） | NFKC → 反复删除容量片段 → 压缩空白并去首尾；方位、校区等其他括号保留 |
 | 4 | classify | 35 格原文 + 分类表 | 每格 `state_key`，必要时 `raw_text` | 按空白切词；整词先查表；整词未收录但每字符皆已知且长度 > 1 → 复合；多词或复合词 → `composite`；任一字符不在表内 → `unknown`，**不阻断发布** |
 | 5 | expand | 5 大节格 | 7 × 12 节点状态 | **断言同一大节内各节点状态相同**；不一致 → 结构失败（这是"作息表变了"的信号，不允许自动适配） |
-| 6 | observe | 以上 | `kjs.observation` 行 | 一间房 × 一周 × 一天 × 一个节次恰一行 |
-| 7 | validate | 本次候选 + 上一版 | `kjs.release_check` 行 | 房间总数相对上一版变化超过 20%、schema 不通过等；**结果入库**，供人工与前端查看 |
-| 8 | publish | 候选集 | 一个 `kjs.release` | 单事务写入并切 current；保留 current 与 previous 两份 |
+| 6 | observe | 以上 | 观测事实 | 一间房 × 一周 × 一天 × 一个节次恰一行 |
+| 7 | validate | 本次候选 + 上一版 | 校验结果 | 房间总数相对上一版变化超过 20% 等；结果入库，供人工与前端查看 |
+| 8 | publish | 候选集 | 一次发布 | 单事务写入；发布与版本规则另行设计 |
 
 ## 状态字典（种子值）
 
@@ -52,21 +52,16 @@ canonical 是数据库（见 `db.v2.sql`）；本文件与 DDL 是同一条契�
 
 - **身份**：房间唯一身份是 `jsbh`；展示名可以重复，不作主键，同名房间不合并。
 - **节次轴**：`axis_version` 记录"12 节点 ↔ 5 大节"的映射。上游块集合变化 → 造新版本并阻断等人工确认，而不是自动适配；旧数据因为带着自己的 `axis_version`，永远可解释。
-- **日历**：每周的周一绝对日期入库（`kjs.term_week.monday`），时区固定 `Asia/Shanghai`；消费方不再自己实现周次换算。
+- **日历**：每周的周一绝对日期入库，时区固定 `Asia/Shanghai`；消费方不再自己实现周次换算。
 - **来源与质量**：只存请求参数、`fetched_at`、`page_sha256` 与汇总计数（`unknown_cells`、`composite_cells`）；**不存原始 HTML**，不存账号、Cookie、Token、验证码。
-- **内容寻址**：`release_id` 与每周 `content_hash` 由规范序列化算出（稳定字段顺序、稳定房间顺序）。内容未变时哈希一致，可判定"是否真的变了"。
-- **保留**：只保留 current 与 previous 两份 release，更早的删除。
 
 ## 配置与运行（WebUI）
 
-- 业务设置一律由 WebUI 管理面板写入数据库 `kjs.settings`，采集器与查询服务从库读取，不再走环境变量：`account_username`/`account_password`（教务账号）、`feishu_webhook_url`/`feishu_secret`（飞书告警）、`cron_expr`（采集调度 cron）、`ocr_base_url`（ddddocr-fastapi 地址）。
+- 业务设置一律由 WebUI 管理面板写入数据库配置，采集器与查询服务从库读取，不再走环境变量：`account_username`/`account_password`（教务账号）、`feishu_webhook_url`/`feishu_secret`（飞书告警）、`cron_expr`（采集调度 cron）、`ocr_base_url`（ddddocr-fastapi 地址）。
 - 采集时间由 `cron_expr` 驱动；调度器归属（采集器内置 vs 服务端触发）在实现 Spec 里定。
-- 采集锁、运行状态与告警去重、发布验收都由后端内部 + 数据库维护，不再需要 `COLLECTOR_STATE_DIR` 与 `PUBLISH_BASE_URL`（锁用 pg_advisory_lock，运行结果落在 `kjs.release_week`、`kjs.release_check`）。
+- 采集锁、运行状态与告警去重、发布验收都由后端内部 + 数据库维护，不再需要 `COLLECTOR_STATE_DIR` 与 `PUBLISH_BASE_URL`。
 - 验证码识别：图片转 base64，POST `{ocr_base_url}/ocr`（表单字段 `image`），响应 `{"code":200,"message":"Success","data":"<文本>"}`，以 `code=200` 判定成功（细节见 `../upstream.md`）。
 
-## JSON 导出（派生，非 canonical）
-
-`collector export --release <id> --format v2` 输出与 `db.v2.sql` 同义的单文件 JSON，用于归档、夹具与人工排查。**任何校验都以 DDL 为准**，导出件不参与发布判定。
 
 ## 为什么不那样
 
@@ -74,5 +69,4 @@ canonical 是数据库（见 `db.v2.sql`）；本文件与 DDL 是同一条契�
 - **不用整数状态 ID**：整数需要查表才能读；字典改版时，旧数据会被静默重新解释。
 - **不让未知符号阻断发布**：那会把"上游新增一个符号"升级成"整个学期没有数据"；改为降级、计数、告警。
 - **不丢弃原始名**：历史周重采不可得（上游只返回当前周与未来数周）。
-- **不留两份规范**：周文件与库表互为镜像时，两套校验必然漂移。
 - **不再按楼分组/设白名单**：需求改为全量拉取、全量入库、全库查询，分组这一层从数据流里整个拿掉。

@@ -65,7 +65,7 @@ v2：采集锁用 pg_advisory_lock（同一时刻至多一轮），运行状态�
 - 自动提交信息：`data: snapshot <term> release <release_id>`；学期切换：`data: term switch <term>`。
 - 发布前自动 `git fetch && git pull --ff-only`；工作区存在采集预期外的改动会终止并告警。
 - 验收：GitHub check-runs（15s×40 次）→ 生产 `GET /api/v1/manifest` 直到 `release_id` 匹配（10s×30 次）→ 固定样例查询。
-v2：发布验收改为从数据库读回 current 并抽查，不再走 HTTP 域名验收（`PUBLISH_BASE_URL` 已废弃）；下面是上一版实现：
+v2：发布验收改为在库内读回最新一次发布并抽查，不再走 HTTP 域名验收（`PUBLISH_BASE_URL` 已废弃）；下面是上一版实现：
 - 验收失败：不自动回滚、保留当前生产部署，飞书告警后人工处理。
 
 ## 4. 飞书告警
