@@ -6,9 +6,10 @@
 ## 1. 登录
 
 - CAS 统一认证：登录页取 `salt`/`execution`，AES/CBC/PKCS7 加密密码，提交后带 ticket 跳转 SSO。
-- 实现：`internal/cas`（自旧仓库迁移）。验证码用本地离线识别：默认调用
-  `scripts/ocr_ddddocr.py`（Python `ddddocr`），可用 `OCR_CMD` 指向任意本地命令；
-  不做任何网络 OCR 服务。
+- 实现：CAS 登录会话在采集器内完成；验证码识别走 ddddocr-fastapi（生产环境已用 Docker 部署）。
+- OCR 调用：把验证码图片转 base64，POST 到 `{ocr_base_url}/ocr`（表单字段 `image`，可选 `probability`、`png_fix`）；
+  响应 `{"code":200,"message":"Success","data":"<识别文本>"}`，识别文本在 `data`；服务异常也返回 HTTP 200，须以 `code=200` 为准。
+- `ocr_base_url` 由 WebUI 管理面板配置，不再用 `OCR_CMD` 本地命令。
 
 ## 2. 学期与当前周
 

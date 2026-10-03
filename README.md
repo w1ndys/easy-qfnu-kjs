@@ -28,13 +28,15 @@
 - `docs/operations.md`：运行、验收、回滚、告警、日志
 - `docs/decisions/2026-10-03-frontend-react-antd.md`：前端换栈的取舍
 - `docs/contract/`：数据与接口契约基线（索引见其 `README.md`）
+- `docs/product-requirements.md`：产品需求文档（完整、初始态）
 
-`docs/upstream.md` 与 `docs/operations.md` 是上一版实现时期的文档，保留原样作为重写输入。其中提到的路径（`cmd/collector/`、`schemas/`、`config/rooms.json`、`scripts/ocr_ddddocr.py`）在重写产出对应实现之前并不存在。
+`docs/upstream.md` 与 `docs/operations.md` 是上一版实现时期的文档，保留原样作为重写输入；其中引用的路径（`cmd/collector/`、`schemas/`、`scripts/`）在重写产出对应实现之前并不存在，`config/rooms.json` 已随"不设白名单"删除。
 
 ## 目录
 
 ```text
 docs/
+  product-requirements.md  产品需求文档（完整、初始态）
   upstream.md            教务系统接口与解析事实
   operations.md          运行、验收、回滚、告警、日志
   decisions/             决定记录，一个决定一个文件
@@ -45,15 +47,14 @@ docs/
     api.v2.md            查询契约：路径、参数、载荷、错误码
     reference-v1/        旧契约，只作考古（不是基线）
   config/
-    rooms.json           人工维护的采集白名单与查询分组（原 config/rooms.json）
-    env.example          环境变量清单（原 .env.example）
+    env.example          部署级环境变量（数据库连接等）；业务设置走 WebUI
 README.md
 .gitignore
 ```
 
-`docs/` 是重写的输入：契约基线在 `docs/contract/`（清洗、表结构、查询），配置在 `docs/config/`。恢复代码时把它们放到程序期望的位置，或让程序直接读 `docs/` 下的路径——由重写的 Spec 决定。
+`docs/` 是重写的输入：契约基线在 `docs/contract/`（清洗、表结构、查询）。业务设置（账号、飞书、OCR、cron）由 WebUI 写入 `kjs.settings`；部署级环境变量见 `docs/config/env.example`。
 
 ## 下一步
 
-1. 按 Issue #1、#2 重写后端：采集器 + 查询服务；本机 Compose + Caddy 内网验收通过后才谈公网切换。
+1. 按 Issue #1、#2 重写后端：采集器 + 查询服务 + WebUI 管理面板；本机 Compose + Caddy 内网验收通过后才谈公网切换。
 2. 前端 React + antd 重写排在后端之后。

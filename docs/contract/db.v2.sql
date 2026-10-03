@@ -64,6 +64,26 @@ CREATE TABLE IF NOT EXISTS kjs.term_week (
   PRIMARY KEY (term, week)
 );
 
+-- ---------- WebUI 配置（管理员面板写入） ----------
+
+-- 业务设置不再走环境变量；部署级变量（如 DATABASE_URL）仍走 env，见 docs/config/env.example。
+-- account_password 与 feishu_secret 是秘密：不进 Git、日志、快照，由 WebUI 受控存取。
+CREATE TABLE IF NOT EXISTS kjs.settings (
+  key        text PRIMARY KEY,
+  value      text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- 已知键：
+--   account_username / account_password   教务系统教师账号
+--   feishu_webhook_url / feishu_secret   飞书告警（加签模式）
+--   cron_expr                             采集调度（cron 表达式）
+--   ocr_base_url                          ddddocr-fastapi 服务地址，例如 http://127.0.0.1:8000
+
+-- 采集锁、运行状态与发布验收不再依赖文件目录或外部地址：
+--   锁：pg_advisory_lock（同一时刻至多一轮采集）；
+--   运行状态/告警去重：落库（结果在 kjs.release_week、kjs.release_check；去重键由服务进程维护，实现 Spec 定）。
+
 -- ---------- 房间目录 ----------
 
 -- 身份与属性，跨发布复用；全量房间，不按白名单裁剪
@@ -71,7 +91,6 @@ CREATE TABLE IF NOT EXISTS kjs.room (
   room_id    text PRIMARY KEY,            -- jsbh
   name       text NOT NULL,               -- 规范化展示名（最近一次）
   name_raw   text,                        -- 最近一次见到的原始名
-  capacity   smallint,                    -- 从 (n/N) 解出，可为空
   first_seen date,
   last_seen  date
 );
@@ -85,7 +104,6 @@ CREATE TABLE IF NOT EXISTS kjs.release (
   generated_at   timestamptz NOT NULL,
   dict_version   integer NOT NULL REFERENCES kjs.dict(version),
   axis_version   integer NOT NULL REFERENCES kjs.axis(version),
-  config_version text NOT NULL,           -- 白名单规则的 hash
   is_current     boolean NOT NULL DEFAULT false,
   previous_id    text
 );
@@ -94,15 +112,6 @@ CREATE TABLE IF NOT EXISTS kjs.release (
 CREATE UNIQUE INDEX IF NOT EXISTS kjs_release_one_current
   ON kjs.release ((true)) WHERE is_current;
 
--- 分组视图：来自人工维护的白名单；零命中是告警，不是失败
-CREATE TABLE IF NOT EXISTS kjs.release_group (
-  release_id text NOT NULL REFERENCES kjs.release(release_id) ON DELETE CASCADE,
-  group_id   text NOT NULL,
-  name       text NOT NULL,
-  ordinal    smallint,
-  room_count integer NOT NULL,
-  PRIMARY KEY (release_id, group_id)
-);
 
 -- 房间在某次发布中的呈现快照
 CREATE TABLE IF NOT EXISTS kjs.release_room (
@@ -110,21 +119,9 @@ CREATE TABLE IF NOT EXISTS kjs.release_room (
   room_id    text NOT NULL,
   name       text NOT NULL,
   name_raw   text,
-  capacity   smallint,
   PRIMARY KEY (release_id, room_id)
 );
 
--- 多对多：一间房可以同时属于多个视图
-CREATE TABLE IF NOT EXISTS kjs.release_room_group (
-  release_id text NOT NULL,
-  room_id    text NOT NULL,
-  group_id   text NOT NULL,
-  PRIMARY KEY (release_id, room_id, group_id),
-  FOREIGN KEY (release_id, room_id)
-    REFERENCES kjs.release_room(release_id, room_id) ON DELETE CASCADE,
-  FOREIGN KEY (release_id, group_id)
-    REFERENCES kjs.release_group(release_id, group_id) ON DELETE CASCADE
-);
 
 -- ---------- 观测（canonical 事实） ----------
 
@@ -194,14 +191,15 @@ CREATE TABLE IF NOT EXISTS kjs.release_check (
 -- 保留策略：只留 current 与 previous 两份 release，更早的删除（子表级联删除）。
 
 -- ---------- 常用查询形状（供实现参考，不是契约的一部分） ----------
--- 空教室：给定 release、视图、周、星期、节点区间，返回区间内每一节都可用的房间
+-- 空教室：给定 release、周、星期、节点区间，返回区间内每一节都可用的房间；
+-- 关键词用 kjs.release_room.name 的子串匹配（NFKC、ASCII 不区分大小写）。
 --   SELECT o.room_id
 --     FROM kjs.observation o
---     JOIN kjs.release_room_group g
---       ON g.release_id = o.release_id AND g.room_id = o.room_id
---    WHERE o.release_id = $1 AND g.group_id = $2
---      AND o.week = $3 AND o.weekday = $4
---      AND o.node BETWEEN $5 AND $6
+--     JOIN kjs.release_room r ON r.release_id = o.release_id AND r.room_id = o.room_id
+--    WHERE o.release_id = $1
+--      AND o.week = $2 AND o.weekday = $3
+--      AND o.node BETWEEN $4 AND $5
 --      AND o.available
+--      AND r.name ILIKE '%' || $6 || '%'
 --    GROUP BY o.room_id
---   HAVING count(*) = ($6::int - $5::int + 1);
+--   HAVING count(*) = ($5::int - $4::int + 1);

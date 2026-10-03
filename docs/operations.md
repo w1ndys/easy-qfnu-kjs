@@ -2,9 +2,11 @@
 
 > 对应设计决策：旧仓库 `easy-qfnu-kjs-legacy` 的 `docs/issue-29-rearchitecture-decisions.md`（Q1—Q171）。
 
+> v2 起运行形态已变：本机 PostgreSQL + WebUI 管理面板。本章节的 systemd timer、环境变量配置、Vercel/Git 发布与回滚都是上一版实现，作为运维事实保留；重写后按 `docs/contract/` 再更新。
+
 ## 1. 定时采集
 
-systemd user timer，北京时间每日 `04:10`：
+v2：采集时间由 WebUI 配置的 cron 表达式驱动（`kjs.settings.cron_expr`）；下面的 systemd timer 是上一版实现。
 
 ```ini
 # ~/.config/systemd/user/easy-qfnu-collector.service
@@ -53,6 +55,7 @@ go build -o collector ./cmd/collector
 ./collector run --dry-run     # collect + validate，不发布
 ```
 
+v2：采集锁用 pg_advisory_lock（同一时刻至多一轮），运行状态与告警去重落库；下面是上一版实现的文件写法：
 锁：`~/.local/state/easy-qfnu-kjs/collector.lock`（等待 5 分钟超时放弃）。
 状态/告警去重：`~/.local/state/easy-qfnu-kjs/collector-state.json`（0600）。
 日志：`logs/collector.log`（JSON 行，日切归档，保留 30 天；目录已被 gitignore）。
@@ -62,12 +65,12 @@ go build -o collector ./cmd/collector
 - 自动提交信息：`data: snapshot <term> release <release_id>`；学期切换：`data: term switch <term>`。
 - 发布前自动 `git fetch && git pull --ff-only`；工作区存在采集预期外的改动会终止并告警。
 - 验收：GitHub check-runs（15s×40 次）→ 生产 `GET /api/v1/manifest` 直到 `release_id` 匹配（10s×30 次）→ 固定样例查询。
-- 生产域名默认 `https://kjs.easy-qfnu.top`，可用 `PUBLISH_BASE_URL` 覆盖。
+v2：发布验收改为从数据库读回 current 并抽查，不再走 HTTP 域名验收（`PUBLISH_BASE_URL` 已废弃）；下面是上一版实现：
 - 验收失败：不自动回滚、保留当前生产部署，飞书告警后人工处理。
 
 ## 4. 飞书告警
 
-可选（`.env`）：
+v2：飞书 webhook 与签名在 WebUI 管理面板配置（`kjs.settings.feishu_webhook_url` / `feishu_secret`）；下面是上一版的环境变量写法：
 
 - `FEISHU_WEBHOOK_URL`、`FEISHU_WEBHOOK_SECRET`（自定义机器人加签模式）。
 

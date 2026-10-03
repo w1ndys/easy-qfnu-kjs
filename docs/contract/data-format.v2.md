@@ -13,6 +13,7 @@ canonical 是数据库（见 `db.v2.sql`）；本文件与 DDL 是同一条契�
 - 表头的 `td[tdvalue]` 共 35 个，按 7 天切成 7 组，每组顺序固定为 `0102` / `030405` / `0607` / `0809` / `101112`——**表头本身就是大节编码**，12 个小节是由它推出来的。
 - 全学期范围（`zc=1..20`）返回聚合矩阵，无法拆回逐周，所以**必须按周请求**。
 - 房名一律带容量片段 `(n/N)`；规范化后仍可能有同名不同 `jsbh`，`jsbh` 是唯一身份。
+- 白名单与按楼分组已取消：`jsmc_mh` 留空全量拉取、全量入库，用户查询直接扫全库。
 
 ## 清洗分层
 
@@ -20,13 +21,12 @@ canonical 是数据库（见 `db.v2.sql`）；本文件与 DDL 是同一条契�
 |---|---|---|---|---|
 | 1 | fetch | 已登录会话 + 参数 | HTTP 响应、`fetched_at`、`page_sha256` | 非 200 → 失败；页面含「用户登录」或「非法访问」→ 全局失败 |
 | 2 | parse | 响应 HTML | 行：`jsbh`、`name_raw`、35 格原文 | 只解析 `table#dataList`；`td[tdvalue]` 必须恰 35 个且块序正确；每个数据行必须 36 个 `td`；`jsbh` 按 `<tr jsbh>` → 行内 checkbox `value` → 首列首个带 `value` 的 input 取值；三者皆空或同一响应内重复 → 结构失败 |
-| 3 | normalize | `name_raw` | `name`、`capacity`、分组匹配用的键 | NFKC → 反复删除容量片段 → 压缩空白并去首尾；方位、校区等其他括号保留 |
+| 3 | normalize | `name_raw` | `name`（规范化展示名） | NFKC → 反复删除容量片段 → 压缩空白并去首尾；方位、校区等其他括号保留 |
 | 4 | classify | 35 格原文 + 分类表 | 每格 `state_key`，必要时 `raw_text` | 按空白切词；整词先查表；整词未收录但每字符皆已知且长度 > 1 → 复合；多词或复合词 → `composite`；任一字符不在表内 → `unknown`，**不阻断发布** |
 | 5 | expand | 5 大节格 | 7 × 12 节点状态 | **断言同一大节内各节点状态相同**；不一致 → 结构失败（这是"作息表变了"的信号，不允许自动适配） |
-| 6 | group | 房间 + `docs/config/rooms.json` | `group_ids[]` | 先做排除，再做精确包含与前缀包含；命中几个视图就记几个；零命中 → 房间仍入库，只是不属于任何视图 |
-| 7 | observe | 以上 | `kjs.observation` 行 | 一间房 × 一周 × 一天 × 一个节次恰一行 |
-| 8 | validate | 本次候选 + 上一版 | `kjs.release_check` 行 | 房间总数相对上一版变化超过 20%、启用分组零命中、schema 不通过等；**结果入库**，供人工与前端查看 |
-| 9 | publish | 候选集 | 一个 `kjs.release` | 单事务写入并切 current；保留 current 与 previous 两份 |
+| 6 | observe | 以上 | `kjs.observation` 行 | 一间房 × 一周 × 一天 × 一个节次恰一行 |
+| 7 | validate | 本次候选 + 上一版 | `kjs.release_check` 行 | 房间总数相对上一版变化超过 20%、schema 不通过等；**结果入库**，供人工与前端查看 |
+| 8 | publish | 候选集 | 一个 `kjs.release` | 单事务写入并切 current；保留 current 与 previous 两份 |
 
 ## 状态字典（种子值）
 
@@ -57,6 +57,13 @@ canonical 是数据库（见 `db.v2.sql`）；本文件与 DDL 是同一条契�
 - **内容寻址**：`release_id` 与每周 `content_hash` 由规范序列化算出（稳定字段顺序、稳定房间顺序）。内容未变时哈希一致，可判定"是否真的变了"。
 - **保留**：只保留 current 与 previous 两份 release，更早的删除。
 
+## 配置与运行（WebUI）
+
+- 业务设置一律由 WebUI 管理面板写入数据库 `kjs.settings`，采集器与查询服务从库读取，不再走环境变量：`account_username`/`account_password`（教务账号）、`feishu_webhook_url`/`feishu_secret`（飞书告警）、`cron_expr`（采集调度 cron）、`ocr_base_url`（ddddocr-fastapi 地址）。
+- 采集时间由 `cron_expr` 驱动；调度器归属（采集器内置 vs 服务端触发）在实现 Spec 里定。
+- 采集锁、运行状态与告警去重、发布验收都由后端内部 + 数据库维护，不再需要 `COLLECTOR_STATE_DIR` 与 `PUBLISH_BASE_URL`（锁用 pg_advisory_lock，运行结果落在 `kjs.release_week`、`kjs.release_check`）。
+- 验证码识别：图片转 base64，POST `{ocr_base_url}/ocr`（表单字段 `image`），响应 `{"code":200,"message":"Success","data":"<文本>"}`，以 `code=200` 判定成功（细节见 `../upstream.md`）。
+
 ## JSON 导出（派生，非 canonical）
 
 `collector export --release <id> --format v2` 输出与 `db.v2.sql` 同义的单文件 JSON，用于归档、夹具与人工排查。**任何校验都以 DDL 为准**，导出件不参与发布判定。
@@ -66,5 +73,6 @@ canonical 是数据库（见 `db.v2.sql`）；本文件与 DDL 是同一条契�
 - **不按 5 大节存**：12 小节是超集，且查询侧本来就以节点区间表述；块归属用 `axis_version` 与解析期断言补回来（见 `README.md` 决定表）。
 - **不用整数状态 ID**：整数需要查表才能读；字典改版时，旧数据会被静默重新解释。
 - **不让未知符号阻断发布**：那会把"上游新增一个符号"升级成"整个学期没有数据"；改为降级、计数、告警。
-- **不丢弃容量与原始名**：历史周重采不可得（上游只返回当前周与未来数周）。
+- **不丢弃原始名**：历史周重采不可得（上游只返回当前周与未来数周）。
 - **不留两份规范**：周文件与库表互为镜像时，两套校验必然漂移。
+- **不再按楼分组/设白名单**：需求改为全量拉取、全量入库、全库查询，分组这一层从数据流里整个拿掉。
