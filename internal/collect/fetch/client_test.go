@@ -70,11 +70,7 @@ type fakeTransport struct {
 
 // RoundTrip 记录一次请求并返回对应的预设响应。
 func (t *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	raw, err := io.ReadAll(req.Body)
-	if err != nil {
-		return nil, err
-	}
-	form, err := url.ParseQuery(string(raw))
+	form, err := requestParams(req)
 	if err != nil {
 		return nil, err
 	}
@@ -97,6 +93,19 @@ func (t *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		Header:     http.Header{},
 		Body:       io.NopCloser(strings.NewReader(next.body)),
 	}, nil
+}
+
+// requestParams 取出一次请求的参数：GET 的参数在查询串里，POST 的参数在表单里。
+func requestParams(req *http.Request) (url.Values, error) {
+	// GET 没有请求体，参数只能从查询串读
+	if req.Method == http.MethodGet {
+		return url.ParseQuery(req.URL.RawQuery)
+	}
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	return url.ParseQuery(string(raw))
 }
 
 // newTestClient 组装一个用假会话、假时钟与假传输的客户端。
@@ -343,5 +352,109 @@ func TestSha256Hex(t *testing.T) {
 	sum := sha256.Sum256([]byte("abc"))
 	if got := sha256Hex([]byte("abc")); got != hex.EncodeToString(sum[:]) {
 		t.Errorf("摘要 = %s，期望 %s", got, hex.EncodeToString(sum[:]))
+	}
+}
+
+// TestCellDetailBuildsWeekdayBlockCode 断言占用明细请求的写法：GET 到明细端点，
+// kcsj 是「星期 1 位数字 + 表头 tdvalue」，xq 用同一个星期数字（需求 4.1）。
+// 四个例子取自上游探测记录第 5.1 节。
+func TestCellDetailBuildsWeekdayBlockCode(t *testing.T) {
+	cases := []struct {
+		weekday int    // 星期
+		block   string // 表头 tdvalue
+		kcsj    string // 期望的 kcsj
+	}{
+		{1, "0102", "10102"},
+		{2, "0102", "20102"},
+		{1, "030405", "1030405"},
+		{1, "101112", "1101112"},
+	}
+
+	for _, testCase := range cases {
+		client, transport, _, _ := newTestClient(t, fakeResponse{status: http.StatusOK, body: testPageBody})
+
+		response, err := client.CellDetail(context.Background(), CellDetailParams{
+			Term:       testTerm,
+			RoomID:     "1088",
+			Weekday:    testCase.weekday,
+			Block:      testCase.block,
+			TimeModeID: "94786EE0",
+		})
+		if err != nil {
+			t.Fatalf("请求占用明细失败: %v", err)
+		}
+		// 一次请求、且是 GET：参数要落在查询串里，不能当表单发
+		if len(transport.requests) != 1 {
+			t.Fatalf("发出 %d 次请求，期望 1 次", len(transport.requests))
+		}
+		request := transport.requests[0]
+		if request.method != http.MethodGet || request.path != CellDetailPath {
+			t.Errorf("请求 = %s %s，期望 GET %s", request.method, request.path, CellDetailPath)
+		}
+		if got := request.form.Get("kcsj"); got != testCase.kcsj {
+			t.Errorf("kcsj = %q，期望 %q", got, testCase.kcsj)
+		}
+		if got := request.form.Get("xq"); got != fmt.Sprint(testCase.weekday) {
+			t.Errorf("xq = %q，期望 %d", got, testCase.weekday)
+		}
+		if request.form.Get("xnxqh") != testTerm || request.form.Get("jsbh") != "1088" {
+			t.Errorf("学期或房间没带上: %v", request.form)
+		}
+		// 时间模式随请求带上，读不到时为空串
+		if request.form.Get("kbjcmsid") != "94786EE0" {
+			t.Errorf("kbjcmsid = %q，期望 94786EE0", request.form.Get("kbjcmsid"))
+		}
+		if request.form.Get("typewhere") != typewhereValue {
+			t.Errorf("typewhere = %q，期望 %q", request.form.Get("typewhere"), typewhereValue)
+		}
+		if response.PageSHA256 != sha256Hex([]byte(testPageBody)) {
+			t.Errorf("正文摘要 = %s，期望按正文算出", response.PageSHA256)
+		}
+	}
+}
+
+// TestCellDetailRejectsBadParamsBeforeRequest 断言参数不合法时一次请求都不发：
+// 空房间、越界星期与非数字大节都定位不到格子。
+func TestCellDetailRejectsBadParamsBeforeRequest(t *testing.T) {
+	cases := []struct {
+		name     string           // 用例说明
+		params   CellDetailParams // 请求参数
+		expected error            // 期望的错误
+	}{
+		{"房间为空", CellDetailParams{Term: testTerm, Weekday: 1, Block: "0102"}, ErrEmptyRoom},
+		{"房间只有空白", CellDetailParams{Term: testTerm, RoomID: "  ", Weekday: 1, Block: "0102"}, ErrEmptyRoom},
+		{"星期为 0", CellDetailParams{Term: testTerm, RoomID: "1088", Block: "0102"}, ErrBadWeekday},
+		{"星期为 8", CellDetailParams{Term: testTerm, RoomID: "1088", Weekday: 8, Block: "0102"}, ErrBadWeekday},
+		{"大节为空", CellDetailParams{Term: testTerm, RoomID: "1088", Weekday: 1}, ErrBadBlock},
+		{"大节不是数字", CellDetailParams{Term: testTerm, RoomID: "1088", Weekday: 1, Block: "0102x"}, ErrBadBlock},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client, transport, _, _ := newTestClient(t, fakeResponse{status: http.StatusOK, body: testPageBody})
+			if _, err := client.CellDetail(context.Background(), testCase.params); !errors.Is(err, testCase.expected) {
+				t.Fatalf("返回 %v，期望 %v", err, testCase.expected)
+			}
+			if len(transport.requests) != 0 {
+				t.Errorf("发出 %d 次请求，期望 0 次", len(transport.requests))
+			}
+		})
+	}
+}
+
+// TestCellDetailWithoutSessionDoesNotRequest 断言没有会话就不发请求：
+// 空手请求只会拿到登录页，调用方应当先重新登录（需求 5.3）。
+func TestCellDetailWithoutSessionDoesNotRequest(t *testing.T) {
+	client, transport, _, session := newTestClient(t, fakeResponse{status: http.StatusOK, body: testPageBody})
+	session.cookie = ""
+
+	_, err := client.CellDetail(context.Background(), CellDetailParams{
+		Term: testTerm, RoomID: "1088", Weekday: 1, Block: "0102",
+	})
+	if !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("返回 %v，期望 ErrSessionExpired", err)
+	}
+	if len(transport.requests) != 0 {
+		t.Errorf("发出 %d 次请求，期望 0 次", len(transport.requests))
 	}
 }

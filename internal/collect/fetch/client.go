@@ -1,7 +1,8 @@
 // 本文件属于 business 层：向上游教室状态接口发请求。
-// 按楼请求周矩阵：jxlbh 用该楼编号、jsmc_mh 留空；相邻请求间隔至少 500 毫秒；单次最多 3 次重试。
+// 按楼请求周矩阵：jxlbh 用该楼编号、jsmc_mh 留空；按格子请求占用明细：kcsj 用星期加表头 tdvalue。
+// 相邻请求间隔至少 500 毫秒；单次最多 3 次重试。
 // 依据 docs/contract/data-format.v2.md 第 1 层、docs/upstream.md 第 3 节与
-// specs/collector-full-sync/requirements.md 的 2.2、3.4、5.7。
+// specs/collector-full-sync/requirements.md 的 2.2、3.4、4.1、5.7。
 // 本层只发请求与取正文，不解析正文、不写数据库，也不保存账号、Cookie 与原始页面。
 
 package fetch
@@ -24,6 +25,10 @@ import (
 // WeekMatrixPath 是按楼请求周矩阵的端点。
 const WeekMatrixPath = "/jsxsd/kbxx/jsjy_query2"
 
+// CellDetailPath 是下钻一个格子的占用明细的端点，用 GET。
+// 依据 docs/decisions/2026-10-09-saturday-full-sync.md 与 specs/collector-full-sync/requirements.md 的 4.1。
+const CellDetailPath = "/jsxsd/kbxx/jsjy_jszyqk"
+
 // RequestInterval 是相邻上游请求的最小间隔：每秒最多两次，见需求 5.7。
 const RequestInterval = 500 * time.Millisecond
 
@@ -37,6 +42,10 @@ const (
 	typewhereValue = "jszq" // 按周查询
 	weekdayFirst   = "1"    // 星期一
 	weekdayLast    = "7"    // 星期日
+	// detailTypeAdd 是占用明细请求里的 type 值，与页面上双击格子的请求一致
+	detailTypeAdd = "add"
+	// weekdayMax 是星期的最大取值：kcsj 的星期部分只能是一位数字
+	weekdayMax = 7
 )
 
 // sessionLostMarkers 是正文里的会话失效特征：登录页与非法访问提示，见契约第 1 层。
@@ -51,6 +60,15 @@ var ErrEmptyBuilding = errors.New("教学楼编号为空，拒绝按楼请求")
 
 // ErrBadWeek 表示周次不是正整数：zc 与 zc2 会退化成全学期聚合矩阵。
 var ErrBadWeek = errors.New("周次必须是正整数")
+
+// ErrEmptyRoom 表示房间编号为空：没有 jsbh 就定位不到要说明的格子。
+var ErrEmptyRoom = errors.New("房间编号为空，拒绝请求占用明细")
+
+// ErrBadWeekday 表示星期不在 1 到 7 之间：它是 kcsj 的第一位，越界会请求到别的格子。
+var ErrBadWeekday = errors.New("星期必须在 1 到 7 之间")
+
+// ErrBadBlock 表示大节编码不是非空数字串：它接在星期后面组成 kcsj。
+var ErrBadBlock = errors.New("大节编码必须是非空数字串")
 
 // RequestError 是重试耗尽后的请求失败，带本次发出的请求次数。
 type RequestError struct {
@@ -86,6 +104,16 @@ type WeekMatrixParams struct {
 	Term       string // 学期编号，作为 xnxqh
 	BuildingID string // 教学楼编号 jxlbh；留空等于拉全校，必须拒绝
 	Week       int    // 周次，zc 与 zc2 填同一个值
+}
+
+// CellDetailParams 是一次占用明细请求的参数。
+// 它只带定位一个格子需要的东西：学期、房间、星期与大节。
+type CellDetailParams struct {
+	Term       string // 学期编号，作为 xnxqh
+	RoomID     string // 房间编号 jsbh；留空时定位不到格子，必须拒绝
+	Weekday    int    // 星期，1=周一 … 7=周日，同时是 kcsj 的第一位
+	Block      string // 大节编码（表头 tdvalue），接到星期后面组成 kcsj
+	TimeModeID string // 时间模式 kbjcmsid，来自查询页；读不到时留空
 }
 
 // ClientConfig 是构造上游客户端需要的参数。
@@ -162,15 +190,73 @@ func (c *Client) WeekMatrix(ctx context.Context, params WeekMatrixParams) (Respo
 	form.Set("xq", weekdayFirst)
 	form.Set("xq2", weekdayLast)
 
-	return c.post(ctx, form)
+	return c.request(ctx, http.MethodPost, WeekMatrixPath, form)
 }
 
-// post 发送表单并处理重试：会话失效不重试，其余失败最多重试 MaxRetries 次。
-func (c *Client) post(ctx context.Context, form url.Values) (Response, error) {
+// CellDetail 请求一个格子的占用明细：GET /jsxsd/kbxx/jsjy_jszyqk。
+// kcsj 由「星期 1 位数字 + 表头 tdvalue」拼成，例如星期一 0102 块是 10102（需求 4.1）。
+// 房间留空、星期越界或大节编码不是数字串时直接失败，不发出请求。
+func (c *Client) CellDetail(ctx context.Context, params CellDetailParams) (Response, error) {
+	// 没有 jsbh 就定位不到要说明的格子，这一格的明细只能不要
+	if strings.TrimSpace(params.RoomID) == "" {
+		return Response{}, ErrEmptyRoom
+	}
+	// 星期是 kcsj 的第一位，越界说明调用方算错了星期
+	if params.Weekday < 1 || params.Weekday > weekdayMax {
+		return Response{}, ErrBadWeekday
+	}
+	// 大节编码接在星期后面构成 kcsj，写错就等于请求另一个格子
+	if !isBlockCode(params.Block) {
+		return Response{}, ErrBadBlock
+	}
+
+	weekday := strconv.Itoa(params.Weekday)
+	form := url.Values{}
+	form.Set("xnxqh", params.Term)
+	form.Set("jsbh", params.RoomID)
+	// 星期一 0102 块写成 10102：星期一位数字直接接表头的 tdvalue
+	form.Set("kcsj", weekday+params.Block)
+	// xq 与 kcsj 用同一个星期数字
+	form.Set("xq", weekday)
+	form.Set("typewhere", typewhereValue)
+	// 其余参数与页面上双击格子的请求逐项一致，周次、节次、状态一律留空
+	form.Set("startZc", "")
+	form.Set("endZc", "")
+	form.Set("startJc", "")
+	form.Set("endJc", "")
+	form.Set("startXq", weekdayFirst)
+	form.Set("endXq", weekdayLast)
+	form.Set("kssj", "")
+	form.Set("jssj", "")
+	form.Set("jszt", "")
+	form.Set("type", detailTypeAdd)
+	form.Set("kbjcmsid", params.TimeModeID)
+
+	return c.request(ctx, http.MethodGet, CellDetailPath, form)
+}
+
+// isBlockCode 判断大节编码是不是非空数字串：表头 tdvalue 只有数字（0102、030405 …）。
+func isBlockCode(block string) bool {
+	// 空编码拼出来的 kcsj 会少一段，等于把请求打到别的格子上
+	if block == "" {
+		return false
+	}
+	for _, r := range block {
+		// 出现非数字说明这不是表头给的块编码
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// request 发送一次请求并处理重试：会话失效不重试，其余失败最多重试 MaxRetries 次。
+// method 与 path 由调用方按请求种类给：周矩阵是 POST /jsxsd/kbxx/jsjy_query2，占用明细是 GET /jsxsd/kbxx/jsjy_jszyqk。
+func (c *Client) request(ctx context.Context, method, path string, form url.Values) (Response, error) {
 	var lastErr error
 
 	for attempt := 1; attempt <= MaxRetries+1; attempt++ {
-		response, err := c.send(ctx, form)
+		response, err := c.send(ctx, method, path, form)
 		// 会话失效与请求本身无关，重试只会再拿到一次登录页
 		if errors.Is(err, ErrSessionExpired) {
 			return Response{}, err
@@ -184,20 +270,41 @@ func (c *Client) post(ctx context.Context, form url.Values) (Response, error) {
 	return Response{}, RequestError{Attempts: MaxRetries + 1, Err: lastErr}
 }
 
+// newRequest 组装一次上游请求：GET 把参数放进查询串，POST 放进表单。
+func (c *Client) newRequest(ctx context.Context, method, path string, form url.Values, cookie string) (*http.Request, error) {
+	target := c.baseURL + path
+	var body io.Reader
+	// 占用明细是 GET：参数只能进查询串，当表单发出去服务端读不到
+	if method == http.MethodGet {
+		target += "?" + form.Encode()
+	} else {
+		body = strings.NewReader(form.Encode())
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
+	if err != nil {
+		return nil, fmt.Errorf("构造上游请求失败: %w", err)
+	}
+	// 只有带表单的 POST 需要声明表单类型
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	req.Header.Set("Cookie", cookie)
+	return req, nil
+}
+
 // send 发出一次请求并按契约判定结果：非 200 失败，正文含会话失效特征按会话失效处理。
-func (c *Client) send(ctx context.Context, form url.Values) (Response, error) {
+func (c *Client) send(ctx context.Context, method, path string, form url.Values) (Response, error) {
 	cookie := c.session.Cookie()
 	// 没有会话就直接说会话失效：空手请求只会拿到登录页
 	if cookie == "" {
 		return Response{}, ErrSessionExpired
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), strings.NewReader(form.Encode()))
+	req, err := c.newRequest(ctx, method, path, form, cookie)
 	if err != nil {
-		return Response{}, fmt.Errorf("构造上游请求失败: %w", err)
+		return Response{}, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Cookie", cookie)
 
 	// 相邻请求间隔：等掉与上一次请求的差额再发，保证每秒最多两次
 	c.waitTurn()
@@ -222,11 +329,6 @@ func (c *Client) send(ctx context.Context, form url.Values) (Response, error) {
 		return Response{}, ErrSessionExpired
 	}
 	return Response{Body: content, FetchedAt: c.now(), PageSHA256: sha256Hex(content)}, nil
-}
-
-// endpoint 拼出周矩阵请求的完整地址。
-func (c *Client) endpoint() string {
-	return c.baseURL + WeekMatrixPath
 }
 
 // waitTurn 保证与上一次请求之间至少隔 RequestInterval：不足的部分等掉，再记下这一刻。
