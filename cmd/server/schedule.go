@@ -1,5 +1,5 @@
-// 本文件是 entry 层：采集器内置的定时器。
-// 到达 cron_expr 指定的时间就调用传进来的 run；run 与手动开始是同一个入口，
+// 本文件是 entry 层：常驻进程内置的定时器。
+// 到达 cron_expr 指定的时间就调用传进来的 run；run 与以后的手动同步是同一个 Start，
 // 因此定时与手动跑的是同一套全量（需求 5.4、5.5 与设计文档 Architecture）。
 
 package main

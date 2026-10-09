@@ -52,5 +52,5 @@ status: accepted
 
 ## Follow-up
 
-- [ ] 把 `cmd/server` 与 `cmd/collector` 收成一个常驻入口
+- [x] 把 `cmd/server` 与 `cmd/collector` 收成一个常驻入口。入口是 `cmd/server`，`cmd/collector` 已删除
 - [ ] 面板的手动同步调用这个进程里的采集模块，不另起进程
