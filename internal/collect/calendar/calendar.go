@@ -21,6 +21,25 @@ var ErrNoWeekText = errors.New("周历页里没有周次文本")
 // ErrBadWeekRange 表示取到的周次或总周数不是正整数，或者周次大于总周数。
 var ErrBadWeekRange = errors.New("周次与总周数不合法")
 
+// ErrNoTerm 表示学期页正文里没有学期编号：页面结构变了，或这次拿到的不是学期页。
+var ErrNoTerm = errors.New("学期页里没有学期编号")
+
+// termPattern 是学期编号的匹配式：docs/upstream.md 第 2 节记录默认页里的学期写作 YYYY-YYYY-N。
+// 只认这个格式，不猜别的写法：格式变化时应当失败并让人来看。
+var termPattern = regexp.MustCompile(`\d{4}-\d{4}-\d+`)
+
+// ParseTerm 从学期页正文里取出当前学期编号（需求 1.1）。
+// 取不到就返回失败：学期编号是请求参数与任务清单的基础，猜一个会把整轮数据写错学期。
+func ParseTerm(body []byte) (string, error) {
+	// 实测这一页里学期编号只出现一次，取第一处匹配即可
+	match := termPattern.Find(body)
+	// 没有这个格式说明这页不是学期页，或页面结构已经变化
+	if match == nil {
+		return "", ErrNoTerm
+	}
+	return string(match), nil
+}
+
 // weekTextPattern 是周次那一句的匹配式。
 // 实测正文写作「第6周/16周」，需求与契约写作「第 X 周 / 共 16 周」，
 // 两种写法都要认，所以「共」与空白可有可无。

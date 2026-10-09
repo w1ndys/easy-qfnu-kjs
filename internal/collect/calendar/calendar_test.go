@@ -157,3 +157,51 @@ func checkContiguousWeeks(t *testing.T, weeks []model.TermWeek) {
 		}
 	}
 }
+
+// TestParseTermReadsTermNumber 断言学期页里只取 YYYY-YYYY-N 这一个编号（需求 1.1）。
+// 样本按 docs/upstream.md 第 2 节记录的格式手写，真实学期页不进 git。
+func TestParseTermReadsTermNumber(t *testing.T) {
+	cases := []struct {
+		name string // 用例说明
+		body string // 学期页正文片段
+		want string // 期望取到的学期编号
+	}{
+		{"选项里的学期编号", `当前学期：2026-2027-1`, "2026-2027-1"},
+		{"值属性里的学期编号", `value="2025-2026-3"`, "2025-2026-3"},
+		{"两位数的第几学期", `2026-2027-10`, "2026-2027-10"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := ParseTerm([]byte(testCase.body))
+			if err != nil {
+				t.Fatalf("解析学期编号失败: %v", err)
+			}
+			if got != testCase.want {
+				t.Errorf("学期编号 = %q，期望 %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestParseTermWithoutTerm 断言取不到学期编号时失败：宁可整轮停下，也不猜一个学期去请求。
+func TestParseTermWithoutTerm(t *testing.T) {
+	cases := []struct {
+		name string // 用例说明
+		body string // 学期页正文片段
+	}{
+		{"空正文", ""},
+		{"登录页", `用户登录`},
+		{"只有年份区间没有学期序号", `2026-2027`},
+		{"学期序号不是数字", `2026-2027-第一学期`},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			// 认不出学期编号时必须失败，调用方据此把本轮标成失败
+			if _, err := ParseTerm([]byte(testCase.body)); !errors.Is(err, ErrNoTerm) {
+				t.Fatalf("返回 %v，期望 ErrNoTerm", err)
+			}
+		})
+	}
+}

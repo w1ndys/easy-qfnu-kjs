@@ -29,6 +29,15 @@ const WeekMatrixPath = "/jsxsd/kbxx/jsjy_query2"
 // 依据 docs/decisions/2026-10-09-saturday-full-sync.md 与 specs/collector-full-sync/requirements.md 的 4.1。
 const CellDetailPath = "/jsxsd/kbxx/jsjy_jszyqk"
 
+// TermPath 是当前学期所在页：采集器从它的正文里取当前学期编号（需求 1.1）。
+const TermPath = "/jsxsd/kbxx/jsjy_query"
+
+// CalendarPath 是周历页：带采样日期 `rq` 请求一次，正文里只有一句周次文本（需求 1.2）。
+const CalendarPath = "/jsxsd/framework/main_index_loadkb.jsp"
+
+// dateLayout 是采样日期写进表单的格式：只到日，不带时分秒。
+const dateLayout = "2006-01-02"
+
 // RequestInterval 是相邻上游请求的最小间隔：每秒最多两次，见需求 5.7。
 const RequestInterval = 500 * time.Millisecond
 
@@ -178,19 +187,40 @@ func (c *Client) WeekMatrix(ctx context.Context, params WeekMatrixParams) (Respo
 		return Response{}, ErrBadWeek
 	}
 
+	return c.request(ctx, http.MethodPost, WeekMatrixPath, matrixForm(params.Term, params.BuildingID, params.Week))
+}
+
+// AggregateMatrix 按楼请求周次留空的聚合矩阵：zc 与 zc2 都留空（需求 4.1）。
+// 聚合矩阵只用来挑出要下钻的格子，它的状态不进观测；楼编号留空同样必须拒绝。
+func (c *Client) AggregateMatrix(ctx context.Context, params WeekMatrixParams) (Response, error) {
+	// 空 jxlbh 会被上游当成「不限楼」，等于拉全校，所以在这里也挡一次
+	if strings.TrimSpace(params.BuildingID) == "" {
+		return Response{}, ErrEmptyBuilding
+	}
+	// 周次传 0：表单仍然带 zc 与 zc2 两个字段，值留空，与页面上的全学期查询一致
+	return c.request(ctx, http.MethodPost, WeekMatrixPath, matrixForm(params.Term, params.BuildingID, 0))
+}
+
+// matrixForm 拼一次矩阵请求的表单：week 为正整数是周矩阵，为 0 是聚合矩阵。
+func matrixForm(term, buildingID string, week int) url.Values {
 	form := url.Values{}
 	form.Set("typewhere", typewhereValue)
-	form.Set("xnxqh", params.Term)
-	form.Set("jxlbh", params.BuildingID)
+	form.Set("xnxqh", term)
+	form.Set("jxlbh", buildingID)
 	// 教室关键词留空，也绝不把楼名写进去：楼名与房名前缀不是同一套（见白名单决定）
 	form.Set("jsmc_mh", "")
-	// zc 与 zc2 填同一个周次，xq 与 xq2 覆盖周一到周日
-	form.Set("zc", strconv.Itoa(params.Week))
-	form.Set("zc2", strconv.Itoa(params.Week))
+	// zc 与 zc2 填同一个周次；周次留空表示聚合矩阵，两项都写成空值
+	weekText := ""
+	// 周矩阵才带周次，聚合矩阵留空
+	if week > 0 {
+		weekText = strconv.Itoa(week)
+	}
+	form.Set("zc", weekText)
+	form.Set("zc2", weekText)
+	// xq 与 xq2 覆盖周一到周日
 	form.Set("xq", weekdayFirst)
 	form.Set("xq2", weekdayLast)
-
-	return c.request(ctx, http.MethodPost, WeekMatrixPath, form)
+	return form
 }
 
 // CellDetail 请求一个格子的占用明细：GET /jsxsd/kbxx/jsjy_jszyqk。
@@ -233,6 +263,20 @@ func (c *Client) CellDetail(ctx context.Context, params CellDetailParams) (Respo
 	form.Set("kbjcmsid", params.TimeModeID)
 
 	return c.request(ctx, http.MethodGet, CellDetailPath, form)
+}
+
+// TermPage 请求当前学期所在页：GET，不带表单参数（需求 1.1）。
+// 正文交给 calendar.ParseTerm 取学期编号，本层不解析正文。
+func (c *Client) TermPage(ctx context.Context) (Response, error) {
+	return c.request(ctx, http.MethodGet, TermPath, url.Values{})
+}
+
+// CalendarPage 用采样日期请求周历页：POST，表单字段只有 rq（需求 1.2）。
+// 采样日期由调用方按 Asia/Shanghai 的当天给出，本层只负责写成 YYYY-MM-DD。
+func (c *Client) CalendarPage(ctx context.Context, date time.Time) (Response, error) {
+	form := url.Values{}
+	form.Set("rq", date.Format(dateLayout))
+	return c.request(ctx, http.MethodPost, CalendarPath, form)
 }
 
 // isBlockCode 判断大节编码是不是非空数字串：表头 tdvalue 只有数字（0102、030405 …）。

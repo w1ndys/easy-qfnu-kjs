@@ -458,3 +458,115 @@ func TestCellDetailWithoutSessionDoesNotRequest(t *testing.T) {
 		t.Errorf("发出 %d 次请求，期望 0 次", len(transport.requests))
 	}
 }
+
+// TestTermPageRequestsTermPage 断言读学期是一次不带表单的 GET：学期编号从这一页的正文里取。
+func TestTermPageRequestsTermPage(t *testing.T) {
+	client, transport, _, _ := newTestClient(t, fakeResponse{status: http.StatusOK, body: testPageBody})
+
+	response, err := client.TermPage(context.Background())
+	if err != nil {
+		t.Fatalf("请求学期页失败: %v", err)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("发出 %d 次请求，期望 1 次", len(transport.requests))
+	}
+
+	request := transport.requests[0]
+	// 学期页是默认查询页，不带任何表单参数
+	if request.method != http.MethodGet || request.path != TermPath {
+		t.Errorf("请求 %s %s，期望 GET %s", request.method, request.path, TermPath)
+	}
+	if len(request.form) != 0 {
+		t.Errorf("查询串有 %d 个参数，期望一个都不带", len(request.form))
+	}
+	if response.Attempts != 1 {
+		t.Errorf("请求次数 = %d，期望 1", response.Attempts)
+	}
+}
+
+// TestCalendarPageSendsSampleDate 断言周历采样只带 rq：日期按 YYYY-MM-DD 写成 Asia/Shanghai 的当天。
+func TestCalendarPageSendsSampleDate(t *testing.T) {
+	client, transport, _, _ := newTestClient(t, fakeResponse{status: http.StatusOK, body: testPageBody})
+
+	sampleDate := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	if _, err := client.CalendarPage(context.Background(), sampleDate); err != nil {
+		t.Fatalf("请求周历页失败: %v", err)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("发出 %d 次请求，期望 1 次", len(transport.requests))
+	}
+
+	request := transport.requests[0]
+	if request.method != http.MethodPost || request.path != CalendarPath {
+		t.Errorf("请求 %s %s，期望 POST %s", request.method, request.path, CalendarPath)
+	}
+	// 表单字段只有 rq，多带参数会被上游当成另一次查询
+	if got := request.form.Get("rq"); got != "2026-10-30" {
+		t.Errorf("表单 rq = %q，期望 2026-10-30", got)
+	}
+	if len(request.form) != 1 {
+		t.Errorf("表单有 %d 个字段，期望只有 rq", len(request.form))
+	}
+}
+
+// TestAggregateMatrixLeavesWeekEmpty 断言聚合矩阵把 zc 与 zc2 留空：周次填上就变成逐周矩阵。
+func TestAggregateMatrixLeavesWeekEmpty(t *testing.T) {
+	client, transport, _, _ := newTestClient(t, fakeResponse{status: http.StatusOK, body: testPageBody})
+
+	if _, err := client.AggregateMatrix(context.Background(), WeekMatrixParams{
+		Term:       testTerm,
+		BuildingID: "jxlbh-1",
+	}); err != nil {
+		t.Fatalf("请求聚合矩阵失败: %v", err)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("发出 %d 次请求，期望 1 次", len(transport.requests))
+	}
+
+	request := transport.requests[0]
+	if request.method != http.MethodPost || request.path != WeekMatrixPath {
+		t.Errorf("请求 %s %s，期望 POST %s", request.method, request.path, WeekMatrixPath)
+	}
+	// 两个字段都在，值留空：与页面上的全学期查询一致
+	for _, name := range []string{"zc", "zc2"} {
+		value, exists := request.form[name]
+		if !exists {
+			t.Errorf("表单缺少 %s", name)
+			continue
+		}
+		if len(value) != 1 || value[0] != "" {
+			t.Errorf("表单 %s = %v，期望留空", name, value)
+		}
+	}
+	if got := request.form.Get("jxlbh"); got != "jxlbh-1" {
+		t.Errorf("表单 jxlbh = %q，期望 jxlbh-1", got)
+	}
+	if got := request.form.Get("jsmc_mh"); got != "" {
+		t.Errorf("表单 jsmc_mh = %q，期望留空", got)
+	}
+}
+
+// TestAggregateMatrixRejectsEmptyBuilding 断言聚合矩阵同样拒绝空楼编号，且不发请求。
+func TestAggregateMatrixRejectsEmptyBuilding(t *testing.T) {
+	cases := []struct {
+		name     string // 用例说明
+		building string // 传入的楼编号
+	}{
+		{"楼编号为空", ""},
+		{"楼编号只有空白", "  "},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client, transport, _, _ := newTestClient(t, fakeResponse{status: http.StatusOK, body: testPageBody})
+			_, err := client.AggregateMatrix(context.Background(), WeekMatrixParams{Term: testTerm, BuildingID: testCase.building})
+			// 空 jxlbh 等于拉全校，必须在本地挡住
+			if !errors.Is(err, ErrEmptyBuilding) {
+				t.Fatalf("返回 %v，期望 ErrEmptyBuilding", err)
+			}
+			if len(transport.requests) != 0 {
+				t.Errorf("发出 %d 次请求，期望 0 次", len(transport.requests))
+			}
+		})
+	}
+}
