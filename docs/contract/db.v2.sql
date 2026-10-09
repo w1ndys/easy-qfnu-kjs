@@ -65,12 +65,16 @@ CREATE TABLE IF NOT EXISTS term_week (
 -- ---------- 房间目录 ----------
 
 CREATE TABLE IF NOT EXISTS room (
-  room_id    text PRIMARY KEY,            -- jsbh
-  name       text NOT NULL,               -- 规范化展示名（最近一次）
-  name_raw   text,                        -- 最近一次见到的原始名
-  first_seen date,
-  last_seen  date
+  room_id       text PRIMARY KEY,         -- jsbh
+  name          text NOT NULL,            -- 规范化展示名（最近一次）
+  name_raw      text,                     -- 最近一次见到的原始名
+  building_id   text,                     -- 返回该房间的 jxlbh；状态行本身不带楼，禁止从房名反推
+  building_name text,                     -- 该次采集时的教学楼展示名
+  first_seen    date,
+  last_seen     date
 );
+-- building_id / building_name 尚未进入已执行的 internal/store/migrations/0001_init.sql。
+-- 不要改 0001。采集器实现时另加迁移补上这两列。
 
 -- ---------- WebUI 配置（管理员面板写入） ----------
 
@@ -84,6 +88,7 @@ CREATE TABLE IF NOT EXISTS settings (
 --   feishu_webhook_url / feishu_secret   飞书告警（加签模式）
 --   cron_expr                             采集调度（cron 表达式）
 --   ocr_base_url                          ddddocr-fastapi 服务地址，例如 http://127.0.0.1:8000
+--   building_whitelist                    教学楼白名单。JSON 数组，元素为 {"jxlbh","name"}。空数组不得触发全校请求。
 -- account_password 与 feishu_secret 是秘密：不进 Git、日志、快照，由 WebUI 受控存取。
 -- 管理员登录密码不在此表：用户名固定 admin，密码走环境变量 ADMIN_PASSWORD。
 
