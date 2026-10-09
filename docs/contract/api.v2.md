@@ -29,7 +29,7 @@
 - `view`：`availability`（空教室）或 `day`（状态列表）。
 - `keyword`：教室名子串匹配；NFKC + 去首尾空白，ASCII 不区分大小写，最长 32，不支持正则；省略时返回全库。
 - `date_offset`：`0..10`，默认 `0`（今天）；服务端按 `Asia/Shanghai` 与学期日历解析成 `(term, week, weekday, date)`。
-- `start_node` / `end_node`：仅 `availability`；两位节次 `01`–`12`，默认 `01`、`11`，要求 `start_node ≤ end_node`。
+- `start_node` / `end_node`：仅 `availability`；当前轴上的小节编号，现在是 `01`–`12`，默认 `01`、`11`，要求 `start_node ≤ end_node`。区间不必对齐上游大节，也可以跨大节。不接收不连续的节次列表。见 `../decisions/2026-10-09-query-by-node-range.md`。
 - `limit` / `offset`：分页，默认 `50` / `0`。
 
 ## 空教室（view=availability）

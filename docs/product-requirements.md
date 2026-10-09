@@ -143,7 +143,7 @@ canonical 是 PostgreSQL，结构以 `docs/contract/db.v2.sql` 为准。
 
 ### 6.2 参数与判定
 
-- `view=availability`（空教室）：`keyword` + `date_offset` + `start_node`/`end_node`（默认 `01`/`11`）；判定 = 区间内每节都可用（`free`/`fully_free`），`items=[{id, name}]`。
+- `view=availability`（空教室）：`keyword` + `date_offset` + `start_node`/`end_node`（默认 `01`/`11`）。起止是小节编号，不必对齐上游大节，也可以跨大节。判定 = 区间内每节都可用（`free`/`fully_free`），`items=[{id, name}]`。
 - `view=day`（状态列表）：`keyword` + `date_offset`；返回 12 小节状态，`items=[{id, name, statuses}]`。
 - `date_offset` 0..10 默认 0；`limit`/`offset` 默认 50/0。
 - 不在教学周：正常返回，由 `context.in_calendar=false` 表达。
