@@ -25,6 +25,7 @@
 - `docs/decisions/2026-10-09-saturday-full-sync.md`：周六全量同步各周矩阵，占用格明细只请求一次
 - `docs/decisions/2026-10-09-term-week-from-one-sample.md`：采样一次生成学期周历，查询用日期偏移查本地表
 - `docs/decisions/2026-10-09-query-by-node-range.md`：查询按小节区间，不必对齐上游大节
+- `docs/decisions/2026-10-09-single-process-entry.md`：查询与采集由同一个进程启动
 - `docs/contract/`：数据清洗、存储与查询契约（索引见其 `README.md`）
 - `docs/product-requirements.md`：产品需求文档（完整、初始态）
 
