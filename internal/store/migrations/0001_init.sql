@@ -1,5 +1,4 @@
--- 契约 v2 的 canonical 结构：清洗后的数据逐格入库。
--- 含义与不变量见 data-format.v2.md；查询契约见 api.v2.md。
+-- 契约 v2 的表结构：内容与 docs/contract/db.v2.sql 一致，改这里之前先改契约文件。
 -- 约定：时间用 timestamptz；状态存语义键；不为省体积而拆键（可读优先）；表名不加前缀。
 
 -- ---------- 字典与轴（版本化，属于数据本身） ----------
@@ -65,16 +64,12 @@ CREATE TABLE IF NOT EXISTS term_week (
 -- ---------- 房间目录 ----------
 
 CREATE TABLE IF NOT EXISTS room (
-  room_id       text PRIMARY KEY,         -- jsbh
-  name          text NOT NULL,            -- 规范化展示名（最近一次）
-  name_raw      text,                     -- 最近一次见到的原始名
-  building_id   text,                     -- 返回该房间的 jxlbh；状态行本身不带楼，禁止从房名反推
-  building_name text,                     -- 该次采集时的教学楼展示名
-  first_seen    date,
-  last_seen     date
+  room_id    text PRIMARY KEY,            -- jsbh
+  name       text NOT NULL,               -- 规范化展示名（最近一次）
+  name_raw   text,                        -- 最近一次见到的原始名
+  first_seen date,
+  last_seen  date
 );
--- building_id / building_name 尚未进入已执行的 internal/store/migrations/0001_init.sql。
--- 不要改 0001。采集器实现时另加迁移补上这两列。
 
 -- ---------- WebUI 配置（管理员面板写入） ----------
 
@@ -83,13 +78,9 @@ CREATE TABLE IF NOT EXISTS settings (
   value      text NOT NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
--- 已知键：
---   account_username / account_password   教务系统教师账号
---   feishu_webhook_url / feishu_secret   飞书告警（加签模式）
---   cron_expr                             采集调度（cron 表达式）
---   ocr_base_url                          ddddocr-fastapi 服务地址，例如 http://127.0.0.1:8000
---   building_whitelist                    教学楼白名单。JSON 数组，元素为 {"jxlbh","name"}。空数组不得触发全校请求。
--- account_password 与 feishu_secret 是秘密：不进 Git、日志、快照，由 WebUI 受控存取。
+-- 已知键见 docs/contract/db.v2.sql：account_username / account_password /
+-- feishu_webhook_url / feishu_secret / cron_expr / ocr_base_url。
+-- account_password 与 feishu_secret 是秘密：不进 Git、日志、快照。
 -- 管理员登录密码不在此表：用户名固定 admin，密码走环境变量 ADMIN_PASSWORD。
 
 -- ---------- 发布 ----------
@@ -131,19 +122,3 @@ CREATE TABLE IF NOT EXISTS observation (
 CREATE INDEX IF NOT EXISTS observation_free
   ON observation (release_id, term, week, weekday, node, room_id)
   WHERE available;
-
--- 保留策略：release 只保留 current 与 previous 两行（按 generated_at 取最近两条），更早的删除（观测级联删除）。
-
--- ---------- 常用查询形状（供实现参考，不是契约的一部分） ----------
--- 空教室：current release、给定 term/week/weekday、节点区间内每节可用，且房名命中关键词
---   SELECT o.room_id, r.name
---     FROM observation o
---     JOIN room r ON r.room_id = o.room_id
---    WHERE o.release_id = :current AND o.term = :term AND o.week = :week AND o.weekday = :weekday
---      AND o.node BETWEEN :start AND :end AND o.available
---      AND r.name ILIKE '%' || :keyword || '%'
---    GROUP BY o.room_id, r.name
---   HAVING count(*) = (:end::int - :start::int + 1)
---    ORDER BY r.name LIMIT :limit OFFSET :offset;
-
--- 版本对比：给定 current 与 previous 两个 release_id，按 (room_id, term, week, weekday, node) 求状态差集即可。
