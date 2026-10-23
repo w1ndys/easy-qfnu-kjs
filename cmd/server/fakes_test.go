@@ -260,11 +260,11 @@ func testAxis() []model.AxisNode {
 }
 
 // testSymbols 造契约种子里 dict_version 1 的符号表，码点原样。
+// “完全空闲”不登记：它不是格子符号，真出现时由清洗层判成 unknown。
 func testSymbols() []model.DictSymbol {
 	return []model.DictSymbol{
 		{Symbol: "◆", StateKey: model.StateClass},
 		{Symbol: "空闲", StateKey: model.StateFree},
-		{Symbol: "完全空闲", StateKey: model.StateFullyFree},
 	}
 }
 

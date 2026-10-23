@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS dict_state (
   PRIMARY KEY (dict_version, state_key)
 );
 
--- 符号 → 状态键。分类规则本身也是数据，改表只影响之后的发布
+-- 符号 → 状态键。分类规则本身也是数据，改表只影响之后的发布。
+-- “完全空闲”不是格子符号：空白格由清洗层判成 free，该状态只留给查询侧的区间聚合语义，
+-- 因此不登记在这里（见 docs/decisions/2026-10-23-fully-free-is-range-aggregate.md）。
 CREATE TABLE IF NOT EXISTS dict_symbol (
   dict_version integer NOT NULL,
   symbol       text    NOT NULL,          -- 上游原文本，码点不得规范成 ASCII

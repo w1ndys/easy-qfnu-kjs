@@ -95,10 +95,14 @@ func TestCatalogReadsLatestVersionsAndSymbols(t *testing.T) {
 	for _, symbol := range symbols {
 		found[symbol.Symbol] = true
 	}
-	for _, want := range []string{"◆", "空闲", "完全空闲"} {
+	for _, want := range []string{"◆", "空闲"} {
 		if !found[want] {
 			t.Errorf("符号表里缺少 %q", want)
 		}
+	}
+	// “完全空闲”不是格子符号：采集只为空白格产生 free，它只作为查询侧的区间聚合语义
+	if found["完全空闲"] {
+		t.Error("符号表不该登记“完全空闲”")
 	}
 
 	// 没有这一版时返回空表而不是报错：调用方按空表判失败

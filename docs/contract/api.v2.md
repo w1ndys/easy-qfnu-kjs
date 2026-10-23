@@ -34,7 +34,7 @@
 
 ## 空教室（view=availability）
 
-给定 `date_offset` 解析出的星期内，名称匹配的每个房间，`start_node` 到 `end_node` 的**每一节**都可用才返回。可用 = 字典 `available=true` 的 `free` 与 `fully_free`。
+给定 `date_offset` 解析出的星期内，名称匹配的每个房间，`start_node` 到 `end_node` 的**每一节**都可用才返回。可用 = 观测行的 `available=true`；采集只为空白格产生 `free`，`fully_free` 只作为查询侧的区间聚合标签存在（所选区间每节都可用），不落逐格观测。
 
 ```json
 {
@@ -102,6 +102,8 @@
   "request_id": "req_abc123"
 }
 ```
+
+`states` 里的 `fully_free` 只作查询/展示标签，不代表格子会出现该状态；采集实际产生的可用状态只有 `free`。
 
 ## 不在教学周
 

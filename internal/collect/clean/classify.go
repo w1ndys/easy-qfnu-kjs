@@ -47,7 +47,7 @@ func (c classifier) classify(raw string) Cell {
 	if text == "" {
 		return Cell{StateKey: model.StateFree}
 	}
-	// 整词命中（◆、Ｊ、空闲、完全空闲 …）直接用它的语义键
+	// 整词命中（◆、Ｊ、空闲 …）直接用它的语义键
 	if stateKey, ok := c.symbols[text]; ok {
 		return Cell{StateKey: stateKey}
 	}

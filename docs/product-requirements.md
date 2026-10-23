@@ -1,5 +1,7 @@
 # 产品需求文档（easy-qfnu-kjs）
 
+> **已被 [docs/prd.md](prd.md) 取代（2026-10-23）。** 本文保留作历史与排障输入；与 PRD 冲突时以 PRD 为准。
+
 > 本文档整合 Issue #1、Issue #2 与当前仓库 `docs/` 下的数据与接口契约，是产品需求的完整、初始态描述。
 > 当 Issue 与本仓库发生冲突时（例如教室清洗规则、分组、配置来源、验证码识别、状态编码），**以当前仓库为准**。
 
@@ -86,7 +88,7 @@
 | 语义键 | 名称 | 可用 | 上游符号 |
 |---|---|---|---|
 | `free` | 空闲 | 是 | 空单元格、`空闲` |
-| `fully_free` | 完全空闲 | 是 | `完全空闲` |
+| `fully_free` | 完全空闲 | 是 | 无（房间级筛选语义，不由格子产生） |
 | `class` | 正常上课 | 否 | `◆` |
 | `borrowed` | 借用 | 否 | `Ｊ` |
 | `locked` | 锁定 | 否 | `Ｘ` |
@@ -97,7 +99,7 @@
 | `composite` | 复合占用 | 否 | 多个已收录符号的组合 |
 | `unknown` | 未知 | 否 | 未收录文本 |
 
-符号码点固定（`Ｊ`/`Ｘ`/`Ｇ`/`Ｌ` 是全角拉丁字母，`Κ` 是希腊大写 Kappa）。空单元格归入 `free`；多个已收录符号或复合词归入 `composite`；未收录文本归入 `unknown` 并保留原文。`unknown` 与 `composite` 一律不可用，未知不会映射成空闲。
+符号码点固定（`Ｊ`/`Ｘ`/`Ｇ`/`Ｌ` 是全角拉丁字母，`Κ` 是希腊大写 Kappa）。空单元格归入 `free`；多个已收录符号或复合词归入 `composite`；未收录文本归入 `unknown` 并保留原文。`unknown` 与 `composite` 一律不可用，未知不会映射成空闲。`fully_free` 不是格子状态：矩阵里的空白格一律是 `free`；教务的“完全空闲”只在按日期与节次区间筛选整间教室时成立，查询侧用区间内每一节 `available` 聚合表达。
 
 ### 4.3 节次轴
 
@@ -143,7 +145,7 @@ canonical 是 PostgreSQL，结构以 `docs/contract/db.v2.sql` 为准。
 
 ### 6.2 参数与判定
 
-- `view=availability`（空教室）：`keyword` + `date_offset` + `start_node`/`end_node`（默认 `01`/`11`）。起止是小节编号，不必对齐上游大节，也可以跨大节。判定 = 区间内每节都可用（`free`/`fully_free`），`items=[{id, name}]`。
+- `view=availability`（空教室）：`keyword` + `date_offset` + `start_node`/`end_node`（默认 `01`/`11`）。起止是小节编号，不必对齐上游大节，也可以跨大节。判定 = 区间内每节都可用（当前采集产生 `free`；`fully_free` 是区间聚合标签，不落格子），`items=[{id, name}]`。
 - `view=day`（状态列表）：`keyword` + `date_offset`；返回 12 小节状态，`items=[{id, name, statuses}]`。
 - `date_offset` 0..10 默认 0；`limit`/`offset` 默认 50/0。
 - 不在教学周：正常返回，由 `context.in_calendar=false` 表达。
