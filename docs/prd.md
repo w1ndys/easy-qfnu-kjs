@@ -12,11 +12,11 @@
 
 - 产品是**曲阜师范大学空教室公开查询**：公开页只读本地 PostgreSQL，不实时请求教务。
 - 采集走**强智教务教师端直登**（`/Logon.do?method=logonLdap`），不是 CAS；验证码交 ddddocr-fastapi 识别。
-- 每个白名单教学楼按周拉 7 天 × 5 大节共 35 格矩阵；再拉一次周次留空的聚合矩阵，只对聚合矩阵上有内容的格子各下钻一次占用明细。
+- 每个白名单教学楼只拉**算上当前周共至多 4 周**（当前周及之后 3 周）的周矩阵；占用明细从这些周矩阵的并集中挑格子，一格一次。过去周不再采集。
 - 矩阵解析使用 **goquery**（CSS 选择器），不用正则抠 HTML。目标表是 `table#dataList`，真实页面里 `dataListHeader` 排在它前面。
 - 空白格一律是 `free`。教务的“完全空闲”是按查询范围对整间教室的筛选结论，**不是格子状态**；不落逐格观测，查询侧用区间内每节 `available` 聚合表达。
 - 观测按「房 × 周 × 天 × 节」逐格一行；发布用单事务切换 current/previous，失败不覆盖旧版。
-- 发布门槛：**当前及未来周的周矩阵是必需任务**；过去周的周矩阵、聚合矩阵和占用明细是可选任务。必需任务失败不发布；仅可选任务失败时发布并标 `partial`。
+- 发布门槛：**采集窗口内的周矩阵是必需任务**；占用明细是可选任务。必需任务失败不发布；仅明细失败时发布并标 `partial`。
 - 公开查询 3 个只读端点；空教室 = 所选区间每一节都可用；新鲜度 8 天。
 - 管理面板负责登录、配置、进度、手动同步、版本对比与一键回退；管理员密码走环境变量，业务秘密加密存库。
 - 技术栈固定：Go 1.26 + PostgreSQL 17 + React 19 + antd 6 + goquery + ddddocr-fastapi。
@@ -39,7 +39,7 @@
 ### 1.3 范围
 
 - 公开查询：空教室、全天 12 小节状态、当前日期上下文、数据版本与新鲜度。
-- 采集：教师端登录、周历采样、白名单楼各周矩阵、聚合矩阵、占用明细、清洗、校验、发布。
+- 采集：教师端登录、周历采样、白名单楼窗口周矩阵、占用明细、清洗、校验、发布。
 - 管理：管理员登录、业务设置、同步进度、手动同步、版本对比、一键回退、告警记录。
 - 部署：本机 Docker Compose + Caddy；内网验收通过后再切公网域名。
 
@@ -55,7 +55,7 @@
 
 ## 2. 已定上游事实
 
-以下为 2026-10-23 用教师账号只读探测确认的事实，也是采集实现必须匹配的结构。详细字段见附录 A。
+以下为 2026-10-23 用教师账号只读探测确认的事实，也是采集实现必须匹配的结构。详细字段见附录 A；请求/响应原文结构见 [docs/upstream-api.md](upstream-api.md)。
 
 ### 2.1 入口
 
@@ -85,7 +85,8 @@
 - 采样日取 `Asia/Shanghai` 当天，格式 `YYYY-MM-DD`。
 - 正文匹配 `第\s*(\d+)\s*周\s*/\s*共?\s*(\d+)\s*周`；实测写作“第5周 /16周”。
 - `X` 必须满足 `1 ≤ X ≤ Y`；否则本轮失败，不写周历。
-- 第 1 周周一 = 采样日所在周的周一 − 7×(X−1)；第 1…Y 周各写一行 `term_week`。
+- 第 1 周周一 = 采样日所在周的周一 − 7×(X−1)；第 1…Y 周各写一行 `term_week`。周历仍覆盖全学期，供查询按日期定位；矩阵只采集窗口内的周。
+- 采集窗口：当前周 `C` 到 `min(Y, C+3)`；算上当前周共 4 周。`C` 之前的周不请求、不入库。
 - 非教学周或文本缺失 → 本轮失败；不猜周次，不发布。
 
 ### 2.4 矩阵
@@ -93,7 +94,7 @@
 - 请求表单：`typewhere=jszq`、`xnxqh=<学期>`、`jxlbh=<楼编号>`、`jsmc_mh=`（留空）、`zc=zc2=<周次>`、`xq=1`、`xq2=7`。
 - **不传** `jc`、`jc2`、`jszt`；不把楼名写进 `jsmc_mh`；不允许 `jxlbh` 为空。
 - 一栋楼一周一次请求。周矩阵返回 7 天 × 5 大节 = 35 个状态格。
-- 聚合矩阵：同一端点，`zc` 与 `zc2` 留空；只用于挑出有内容的格子，不参与逐周可用性判定。
+- 只请求窗口内的周（当前周及之后 3 周）；不请求聚合矩阵，也不请求过去周。占用明细从窗口内各周矩阵的并集挑格子：同一格在任一周不可用就下钻一次。
 - 表头 `td[tdvalue]` 恰好 35 个，按天重复 5 个大节：`0102`、`030405`、`0607`、`0809`、`101112`。
 - 真实页面在 `table#dataList` 之前还有一个 `table#dataListHeader`；解析必须按 id 精确选中 `dataList`。
 
@@ -108,8 +109,8 @@
 
 - 矩阵单元格从不返回“完全空闲”文字；空白格就是 `free`。
 - 教务的 `jszt=8`（完全空闲）是**按查询范围对整间教室的筛选**：所选周次、星期、节次范围内 35 格全空才返回该房间。
-- 本地全量爬取已拿到全部格子，因此不需要存房间级状态；查询侧对所选区间做“每节都可用”聚合即可。
-- 2026-10-23 实测：曲阜校区 26 栋楼全学期聚合矩阵中“完全空闲”出现 0 次；旧版 4 周快照里状态 8 出现 0 次；Q06 房间 0008 第 5 周全空但全学期不空，`jszt=8` 只在第 5 周返回它。
+- 本地只需窗口内的格子；不需要存房间级状态；查询侧对所选区间做“每节都可用”聚合即可。
+- 2026-10-23 探测用全学期聚合矩阵（**仅用于确认语义，不是采集范围**）：曲阜校区 26 栋楼中“完全空闲”出现 0 次；旧版 4 周快照里状态 8 出现 0 次；Q06 房间 0008 第 5 周全空但全学期不空，`jszt=8` 只在第 5 周返回它。
 
 ## 3. 系统组成与部署
 
@@ -183,9 +184,9 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 | `release` | 发布版本：学期、时间、字典/轴版本、是否 current；`release_id` 为 UTC `YYYYMMDDTHHMMSS.ffffffZ` |
 | `observation` | 观测事实：房 × 周 × 天 × 节 → 状态 |
 | `occupancy_detail` | 占用说明：状态、课程、周次范围、时间标志、派生标记 |
-| `collect_run` | 一轮采集：状态、必需/可选任务计数、汇总计数、发布版本 |
+| `collect_run` | 一轮采集：状态、窗口起止与周数、必需/可选任务计数、汇总计数、发布版本 |
 | `collect_run_week` | 每轮每楼每周的周矩阵抓取结果与页面哈希 |
-| `sync_task` | 断点续传任务：周矩阵、聚合矩阵、占用明细 |
+| `sync_task` | 断点续传任务：窗口周矩阵、占用明细 |
 | `alert_log` | 告警去重 |
 | `schema_migration` | 迁移版本记录 |
 
@@ -224,19 +225,19 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 
 ### 5.3 任务
 
-一轮全量的任务清单：
+一轮采集的任务清单：
 
-1. 每栋白名单楼 × 第 1…Y 周 → `week_matrix`。
-2. 每栋白名单楼 → `aggregate_matrix`。
-3. 聚合矩阵解析后，每个有内容的格子 → `cell_detail`（一格一条，周次为空）。
+1. 每栋白名单楼 × 窗口内每一周（`C…min(Y,C+3)`）→ `week_matrix`。
+2. 窗口内各周矩阵解析后，取所有“任一周不可用”的格子并集 → `cell_detail`（一格一条，周次为空）。
 
 任务写入 `sync_task`：
 
-- `required`：当前周及未来周的 `week_matrix` 为 true；过去周为 false；`aggregate_matrix` 与 `cell_detail` 为 false。
+- `required`：窗口内 `week_matrix` 全部为 true；`cell_detail` 为 false。
 - `status`：`pending` / `done` / `failed`。
-- 唯一性：同一轮同一楼同一周、同一楼同一聚合、同一楼同一格各至多一条。
+- 唯一性：同一轮同一楼同一周、同一楼同一格各至多一条。
 - 断点续传从第一个 `pending` 继续；`done` 不重打；`failed` 不在同一轮重试。
 - 进程启动时把 `running` 超过 2 小时的轮次标 `failed`（`error_code=stale_run`），避免崩溃后永久锁死；同一时刻仍至多一轮。
+- `collect_run.weeks_total` 记窗口周数（`window_end-window_start+1`）；`required_total` = 楼数 × 窗口周数；`window_start/end` 落库供面板显示。
 
 ### 5.4 请求约束
 
@@ -249,15 +250,13 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 
 | 任务 | 失败后的处理 |
 |---|---|
-| 当前/未来周 `week_matrix` | 本轮失败，不发布；保留原 current；告警 |
-| 过去周 `week_matrix` | 记录失败，继续；该周无矩阵的格子可由明细派生；本轮可发布，标 `partial` |
-| `aggregate_matrix` | 记录失败；该楼不下钻明细；本轮可发布，标 `partial` |
+| 窗口内 `week_matrix` | 本轮失败，不发布；保留原 current；告警 |
 | `cell_detail` | 记录失败；该格无课程说明；本轮可发布，标 `partial` |
 | 表头/轴变化、重复 jsbh、同房两楼 | 整轮停止，不发布；告警 |
 
 - 发布条件：`required_total > 0` 且 `required_done == required_total`，候选集非空，校验通过。
-- 没有必需任务（学期已结束）→ 本轮 `skipped`，不发布。
-- 全部任务完成 → `success`；仅可选失败 → `partial`；必需失败 → `failed`；白名单为空 → `blocked`。
+- 窗口为空（异常兜底）→ 本轮 `skipped`，不发布。
+- 全部任务完成 → `success`；仅明细失败 → `partial`；必需周矩阵失败 → `failed`；白名单为空 → `blocked`。
 
 ### 5.6 周矩阵清洗
 
@@ -276,20 +275,21 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 
 房间目录在采集过程中按 `jsbh` Upsert，不参与发布事务；所属楼取自返回该房间的那次 `jxlbh` 请求。失败的一轮不抹掉已收下的房名，也不改已有归属。同一 `jsbh` 在本轮出现两栋楼 → 整轮停止。
 
-### 5.7 聚合矩阵与明细
+### 5.7 占用明细
 
-- 聚合矩阵只用于挑格子：只挑状态不可用（占用、未知、复合）的格子；空格子不下钻。
+- 窗口内各周矩阵解析完成后，按“房 × 星期 × 大节”取并集：任一周不可用（占用、未知、复合）就下钻一次；所有窗口周都空闲的格子不下钻。
 - 每个格子一条 `cell_detail` 任务；同一格一轮只下钻一次，不按周重复。
 - 明细解析不按表格 id 取字段：扫描整页 `tr`，只认三列（标签 / 空列 / 值）且标签去掉冒号后属于四个字段的行；`table#tab1` 只作标题与页面校验。只保留 `教室状态`、`课程`、`周次`、`时间标志`。
 - `教室状态` 用 `dict_state.label` 换语义键；标签未收录 → `unknown`。
-- 周次范围与时间标志在派生时解析；解析失败不派生，相关周保持未知。
-- 明细写入 `occupancy_detail`，`derived` 表示该说明是否给“没有该房间周矩阵行的周”补过状态。
+- 明细的周次范围先与采集窗口求交：只保留与窗口相交的记录；`occupancy_detail.week_range` 存相交后的范围，窗口外原文与记录不落库。没有交集或范围解析失败的记录丢弃，不猜。
+- 明细写入 `occupancy_detail`，`derived` 表示该说明是否给“窗口内没有该房间周矩阵行的周”补过状态。
 
 ### 5.8 派生
 
+- 只在采集窗口内派生；窗口外的周不写观测。
 - 有该房间该周矩阵行 → 矩阵说了算，明细只作说明。
-- 没有该房间该周矩阵行 → 才允许用明细的周次范围补状态，并标 `derived=true`。
-- 范围解析失败、时间标志不认识、周次超出学期 → 不派生；不得当成空闲。
+- 窗口内没有该房间该周矩阵行 → 才允许用明细的周次范围（与窗口相交的部分）补状态，并标 `derived=true`。
+- 范围解析失败、时间标志不认识、与窗口无交集 → 不派生；不得当成空闲。
 - 派生状态同样写 `observation`；`available` 按字典投影。
 
 ### 5.9 发布
@@ -297,14 +297,14 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 1. 在内存中按周展开观测；按批 `COPY` 写入。
 2. 单事务：写 `release`（非 current）→ 写 `observation` → 写 `occupancy_detail` → 降原 current → 抬新 current → 删除 current/previous 之外的版本。
 3. 任意一步失败整体回滚；原 current 不动。
-4. 发布后写 `collect_run` 汇总（房间数、未知/复合计数、release_id），标 `success` 或 `partial`。
+4. 发布后写 `collect_run` 汇总（窗口起止、房间数、未知/复合计数、release_id），标 `success` 或 `partial`。
 5. 校验：候选集为空 → 拒绝；同房两楼 → 拒绝；必需任务未完成 → 拒绝；未知/复合只计数，不阻断。
 6. `unknown_cells`/`composite_cells` 按大节格计数（房 × 周 × 天 × 大节），同一大节展开出的 2–3 个小节不重复计数。
 
 ### 5.10 调度与告警
 
 - cron 用 6 段式（含秒），默认 `0 10 4 * * 6`（每周六 04:10，`Asia/Shanghai`）；管理员可在面板修改。
-- 手动同步与定时跑同一套全量；同一时刻至多一轮。
+- 手动同步与定时跑同一套窗口采集；同一时刻至多一轮。
 - 告警场合：必需任务失败/整轮停止、发布校验拦截、学期切换、连续失败后的首次恢复。
 - 告警去重键：`final_failure:<run_id>`、`validation_blocked:<run_id>`、`term_changed:<term>`、`recovered:<run_id>`。
 - 告警内容不含账号、密码、Cookie、Token、验证码、原始页面、申请人、任课教师。
@@ -381,6 +381,7 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 - day：返回该房间该日已存在的 12 小节状态；缺失节点不出现在 `statuses` 中。
 - 排序：`name` 升序，再 `id` 升序；分页按房间。
 - 无 current release、日期不在任何学期周、或该周无观测 → `40401`。
+- current release 只含采集窗口内的周；窗口外的日期（含过去周）没有观测，查询返回 `40401`。
 - `in_calendar=false` 不改变查询；没有对应数据时仍按 `40401`。
 
 响应：
@@ -453,12 +454,12 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 
 - `GET /api/admin/runs?limit=20`：最近轮次摘要。
 - `GET /api/admin/runs/{run_id}`：状态、阶段、必需/可选完成数、未知/复合计数、release_id、最近错误、更新时间。
-- 阶段：`login`、`calendar`、`week_matrix`、`aggregate_matrix`、`cell_detail`、`validate`、`publish`、`finished`。
+- 阶段：`login`、`calendar`、`week_matrix`、`cell_detail`、`validate`、`publish`、`finished`。
 - 面板运行中每 2 秒轮询；不做 WebSocket。
 
 ### 7.4 手动同步
 
-- `POST /api/admin/sync`：启动同一套全量；返回 `202 {run_id}`。
+- `POST /api/admin/sync`：启动同一套窗口采集；返回 `202 {run_id}`。
 - 已有一轮 → `40901`；未登录 → `40101`；CSRF 不符 → `40301`。
 - 白名单为空时允许启动，轮次立即 `blocked` 并在面板提示。
 
@@ -522,8 +523,8 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 
 ### 9.2 容量与性能
 
-- 单校约 2–3k 房间；16 周约 2.8–4M 观测行/版本；保留两版。
-- 全量请求量：楼数×周数次周矩阵（26 栋×16 周约 416 次）+ 楼数次聚合 + 占用格数次明细（实测全校约 8.5k 个，约 71 分钟，2 次/秒）。
+- 单校约 2–3k 房间；窗口至多 4 周，约 0.6–1.0M 观测行/版本；保留两版。
+- 请求量：楼数×窗口周数次周矩阵（26 栋×4 周约 104 次，约 52 秒）+ 窗口并集明细；明细是 8.5k 全学期有内容格的子集，具体取决于窗口内占用分布。
 - 不设整轮 15 分钟上限；必须断点续传。
 - 空教室查询 p95 < 300ms（50 条/页，单周单日）。
 - 发布按批 COPY，单批 ≤ 5 万行；不逐行 Exec。
@@ -578,9 +579,11 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 
 - Given 教师账号、OCR 可用，Then 登录成功；验证码错误换图重试 ≤3；密码错误立即失败。
 - Given 采样日与“第 X 周 / Y 周”，Then 生成 Y 条周一；非法 → 不写周历、不发布。
+- Given 当前周为 `C`、总周数为 `Y`，Then 只请求 `C…min(Y,C+3)`，算上当前周共 4 周；不请求 `C-1` 及更早。
+- Given 窗口为空（异常兜底），Then 本轮 `skipped`，不发布。
 - Given 白名单为空，Then 轮次 `blocked`，不发任何矩阵请求。
-- Given 必需周矩阵失败，Then 整轮 `failed`，不发布，保留 current。
-- Given 仅可选任务失败，Then 发布 `partial`，可用性不受影响，明细/过去周缺数据。
+- Given 窗口内任一必需周矩阵失败，Then 整轮 `failed`，不发布，保留 current。
+- Given 仅明细失败，Then 发布 `partial`，可用性不受影响，明细缺数据。
 - Given 会话失效，Then 重登录后从当前任务继续；已完成任务不重打。
 - Given 请求密集，Then 相邻请求 ≥500ms，单任务最多 3 次重试。
 
@@ -629,6 +632,8 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 
 ## 附录 A：上游事实与解析细节
 
+请求/响应结构、表单字段与脱敏片段见 [docs/upstream-api.md](upstream-api.md)；本附录只列重写必须遵守的结论。
+
 ### A.1 登录
 
 - 登录页 `GET /`；表单字段 `userAccount`、`userPassword`、`RANDOMCODE`、`encoded`。
@@ -672,6 +677,7 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 ### A.4 实测数据
 
 - 2026-2027-1，第 5 周，共 16 周；曲阜校区 26 栋教学楼，日照校区 11 栋。
+- 以下全学期数字只用于确认状态与“完全空闲”语义，不是采集范围；采集窗口现在是“当前周 + 3 周（共 4 周）”。
 - Q10 综合教学楼第 5 周：30 行、35 格；`◆` 345、`Ｊ` 114、空白 591。
 - 26 栋楼全学期聚合矩阵：空白 36,474、`◆` 2,706、`Ｊ` 974，复合写法 50+；`完全空闲` 0。
 - 旧版 2025-2026-3 四周快照：状态 8 出现 0 次，状态 5 每周约 1.1–1.2 万格。
@@ -794,9 +800,9 @@ CREATE TABLE occupancy_detail (
   weekday    smallint NOT NULL,
   block      text     NOT NULL,
   state_key  text     NOT NULL,
-  course     text,
-  week_range text,
-  time_flag  text,
+  course     text,                -- 课程/考试科目原文
+  week_range text,                -- 与采集窗口相交后的周次范围
+  time_flag  text,                -- 单双周原文
   derived    boolean  NOT NULL DEFAULT false,
   CHECK (weekday BETWEEN 1 AND 7)
 );
@@ -813,6 +819,8 @@ CREATE TABLE collect_run (
   status          text NOT NULL,
   phase           text NOT NULL DEFAULT 'login',
   term            text REFERENCES term(term),
+  window_start    smallint,
+  window_end      smallint,
   weeks_total     integer NOT NULL DEFAULT 0,
   rooms_total     integer NOT NULL DEFAULT 0,
   required_total  integer NOT NULL DEFAULT 0,
@@ -825,7 +833,7 @@ CREATE TABLE collect_run (
   error_code      text,
   error_message   text,
   CHECK (status IN ('running','success','partial','failed','blocked','skipped')),
-  CHECK (phase IN ('login','calendar','week_matrix','aggregate_matrix','cell_detail','validate','publish','finished'))
+  CHECK (phase IN ('login','calendar','week_matrix','cell_detail','validate','publish','finished'))
 );
 
 CREATE INDEX collect_run_started_at ON collect_run (started_at DESC);
@@ -858,14 +866,12 @@ CREATE TABLE sync_task (
   status        text NOT NULL DEFAULT 'pending',
   attempt_count integer NOT NULL DEFAULT 0,
   error_message text,
-  CHECK (kind IN ('week_matrix','aggregate_matrix','cell_detail')),
+  CHECK (kind IN ('week_matrix','cell_detail')),
   CHECK (status IN ('pending','done','failed')),
   CHECK (attempt_count >= 0),
   CHECK (weekday IS NULL OR weekday BETWEEN 1 AND 7),
   CHECK (
     (kind = 'week_matrix' AND week IS NOT NULL AND room_id IS NULL AND weekday IS NULL AND block IS NULL)
-    OR
-    (kind = 'aggregate_matrix' AND week IS NULL AND room_id IS NULL AND weekday IS NULL AND block IS NULL)
     OR
     (kind = 'cell_detail' AND week IS NULL AND room_id IS NOT NULL AND weekday IS NOT NULL AND block IS NOT NULL)
   )
@@ -874,10 +880,6 @@ CREATE TABLE sync_task (
 CREATE UNIQUE INDEX sync_task_week_matrix
   ON sync_task (run_id, building_id, week)
   WHERE kind = 'week_matrix';
-
-CREATE UNIQUE INDEX sync_task_aggregate
-  ON sync_task (run_id, building_id)
-  WHERE kind = 'aggregate_matrix';
 
 CREATE UNIQUE INDEX sync_task_cell_detail
   ON sync_task (run_id, building_id, room_id, weekday, block)
@@ -950,7 +952,7 @@ INSERT INTO settings (key, value) VALUES
 
 - 本文是唯一产品基线。旧 `docs/product-requirements.md`、`docs/contract/*`、`specs/collector-full-sync/*` 只保留作历史与排障输入。
 - 旧代码中的 `done == total` 发布门槛、正则解析、CAS 登录描述、`main_index_loadkb.jsp` 之外的周次来源，均以本文为准。
-- `docs/upstream.md` 的登录章节写着 CAS，已被 2026-10-23 实测推翻；以本文 2.2 与附录 A 为准。
+- `docs/upstream.md` 的登录章节写着 CAS，已被 2026-10-23 实测推翻；以本文 2.2、附录 A 与 [docs/upstream-api.md](upstream-api.md) 为准。
 - `docs/decisions/2026-10-23-fully-free-is-range-aggregate.md` 记录的结论保留；本文把它上升为产品口径。
 - 重写前已确认的技术细节与坑点见 [docs/pitfalls.md](pitfalls.md)；本文与它冲突时以本文为准，坑点文档补充证据与实现提醒。
 - 重写完成后，可删除旧 `internal/` 与旧契约文档；删除前先把仍需保留的排障事实移到本文附录。
