@@ -4,6 +4,7 @@
 - 来源：教师账号只读探测、当前代码、旧实现快照与旧文档核对
 - 用途：重写 PRD 与实现时快速查结论；不含账号、密码、Cookie、原始 HTML
 - 权威：产品口径以 [docs/prd.md](prd.md) 为准；本文补充证据、坑点与旧结论核对
+- 请求/响应结构：[docs/upstream-api.md](upstream-api.md)
 
 ## 1. 登录
 

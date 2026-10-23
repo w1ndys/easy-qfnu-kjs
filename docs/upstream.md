@@ -1,5 +1,7 @@
 # 上游教务系统接口与解析契约（脱敏摘要）
 
+> **已被 [docs/upstream-api.md](upstream-api.md) 取代（2026-10-23）。** 本文保留作历史；登录章节的 CAS 描述已被实测推翻，请求/响应结构以新文档为准。
+
 > 只读事实记录，不含账号、Cookie、Token、验证码或原始完整页面。用于排查接口变化。来源：旧仓库
 > `easy-qfnu-kjs-legacy` 的探测记录（Issue #29）与 `docs/get-classroom-staus.md`、`docs/get-week.md`。
 

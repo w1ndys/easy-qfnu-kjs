@@ -18,9 +18,11 @@
 
 - [docs/prd.md](docs/prd.md)：重写基线（2026-10-23 定稿，取代旧需求与契约）
 - [docs/pitfalls.md](docs/pitfalls.md)：重写前已确认的技术细节与坑点
+- [docs/upstream-api.md](docs/upstream-api.md)：教务系统请求/响应结构（脱敏参考）
 - [Issue #1](https://github.com/w1ndys/easy-qfnu-kjs/issues/1)：需求与产品边界基线
 - [Issue #2](https://github.com/w1ndys/easy-qfnu-kjs/issues/2)：从上游 HTML 到周快照与库表的算法
-- `docs/upstream.md`：教务系统接口与解析事实
+- `docs/upstream-api.md`：教务系统请求/响应结构（当前参考）
+- `docs/upstream.md`：旧接口事实（CAS 描述已过时，保留历史）
 - `docs/operations.md`：运行、验收、回滚、告警、日志
 - `docs/decisions/2026-10-03-frontend-react-antd.md`：前端换栈的取舍
 - `docs/decisions/2026-10-09-keep-teacher-status-api.md`：仍走教师端，采集按教学楼白名单逐楼请求
@@ -32,7 +34,7 @@
 - `docs/contract/`：数据清洗、存储与查询契约（索引见其 `README.md`）
 - `docs/product-requirements.md`：产品需求文档（完整、初始态）
 
-`docs/upstream.md` 与 `docs/operations.md` 是上一版实现时期的文档，保留原样作为重写输入；其中引用的路径（`cmd/collector/`、`schemas/`、`scripts/`）在重写产出对应实现之前并不存在，`config/rooms.json` 已随"不设白名单"删除。
+`docs/upstream-api.md` 是请求/响应结构的当前参考；`docs/upstream.md` 与 `docs/operations.md` 是上一版实现时期的文档，保留原样作为重写输入；其中引用的路径（`cmd/collector/`、`schemas/`、`scripts/`）在重写产出对应实现之前并不存在，`config/rooms.json` 已随"不设白名单"删除。
 
 ## 目录
 
@@ -40,6 +42,7 @@
 docs/
   prd.md                   重写基线：产品、上游事实、数据模型、接口与验收
   pitfalls.md              重写前已确认的技术细节、坑点与旧结论核对
+  upstream-api.md          教务系统请求/响应结构（脱敏参考）
   product-requirements.md  旧产品需求（已被 prd.md 取代，保留历史）
   upstream.md            教务系统接口与解析事实
   operations.md          运行、验收、回滚、告警、日志
