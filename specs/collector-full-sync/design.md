@@ -1,5 +1,7 @@
 # 采集器全量同步
 
+> **已被 [docs/prd.md](../../docs/prd.md) 取代（2026-10-23）。** 本 spec 保留作历史与排障输入；与 PRD 冲突时以 PRD 为准。
+
 Feature Name: collector-full-sync
 Updated: 2026-10-09
 

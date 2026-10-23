@@ -2,7 +2,7 @@
 
 曲阜师范大学空教室查询系统（新架构）。
 
-**当前状态（2026-10-09）：** `main` 含数据层与只读查询服务。采集器、面板和前端尚未重写。
+**当前状态（2026-10-23）：** 重写基线已定稿，见 [docs/prd.md](docs/prd.md)。现有 Go 代码只作行为参考，接下来按 PRD 从空目录重写。
 
 ## 旧实现
 
@@ -16,6 +16,8 @@
 
 ## 重写依据
 
+- [docs/prd.md](docs/prd.md)：重写基线（2026-10-23 定稿，取代旧需求与契约）
+- [docs/pitfalls.md](docs/pitfalls.md)：重写前已确认的技术细节与坑点
 - [Issue #1](https://github.com/w1ndys/easy-qfnu-kjs/issues/1)：需求与产品边界基线
 - [Issue #2](https://github.com/w1ndys/easy-qfnu-kjs/issues/2)：从上游 HTML 到周快照与库表的算法
 - `docs/upstream.md`：教务系统接口与解析事实
@@ -26,6 +28,7 @@
 - `docs/decisions/2026-10-09-term-week-from-one-sample.md`：采样一次生成学期周历，查询用日期偏移查本地表
 - `docs/decisions/2026-10-09-query-by-node-range.md`：查询按小节区间，不必对齐上游大节
 - `docs/decisions/2026-10-09-single-process-entry.md`：查询与采集由同一个进程启动
+- `docs/decisions/2026-10-23-fully-free-is-range-aggregate.md`：完全空闲是查询侧区间聚合，不是格子状态
 - `docs/contract/`：数据清洗、存储与查询契约（索引见其 `README.md`）
 - `docs/product-requirements.md`：产品需求文档（完整、初始态）
 
@@ -35,7 +38,9 @@
 
 ```text
 docs/
-  product-requirements.md  产品需求文档（完整、初始态）
+  prd.md                   重写基线：产品、上游事实、数据模型、接口与验收
+  pitfalls.md              重写前已确认的技术细节、坑点与旧结论核对
+  product-requirements.md  旧产品需求（已被 prd.md 取代，保留历史）
   upstream.md            教务系统接口与解析事实
   operations.md          运行、验收、回滚、告警、日志
   decisions/             决定记录，一个决定一个文件
@@ -50,9 +55,9 @@ README.md
 .gitignore
 ```
 
-`docs/` 是重写的输入：清洗、存储与查询契约在 `docs/contract/`。业务设置（账号、飞书、OCR、cron）由 WebUI 写入数据库配置；部署级环境变量见 `docs/config/env.example`。
+`docs/prd.md` 是重写的唯一基线；`docs/contract/` 与 `specs/` 保留作历史与排障输入。业务设置（账号、飞书、OCR、cron）由 WebUI 写入数据库配置；部署级环境变量见 `docs/config/env.example`。
 
 ## 下一步
 
-1. 按 Issue #1、#2 重写后端：采集器 + 查询服务 + WebUI 管理面板；本机 Compose + Caddy 内网验收通过后才谈公网切换。
-2. 前端 React + antd 重写排在后端之后。
+1. 按 `docs/prd.md` 从空目录重写后端：采集器 + 查询服务 + WebUI 管理面板；本机 Compose + Caddy 内网验收通过后才谈公网切换。
+2. 前端 React + antd 重写与后端同批交付，按 PRD 的页面与质量门禁验收。
