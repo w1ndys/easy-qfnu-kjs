@@ -10,16 +10,15 @@
 
 ## 0. 结论摘要
 
-- 产品是**曲阜师范大学空教室公开查询**：公开页只读本地 PostgreSQL，不实时请求教务。
-- 采集走**强智教务教师端直登**（`/Logon.do?method=logonLdap`），不是 CAS；验证码交 ddddocr-fastapi 识别。
+- 产品是**曲阜师范大学空教室公开查询**：公开页只读本地已发布数据，不实时请求教务。
+- 采集走**强智教务教师端直登**（`/Logon.do?method=logonLdap`），不是 CAS；验证码交 OCR 服务识别。
 - 每个白名单教学楼只拉**算上当前周共至多 4 周**（当前周及之后 3 周）的周矩阵；占用明细从这些周矩阵的并集中挑格子，一格一次。过去周不再采集。
-- 矩阵解析使用 **goquery**（CSS 选择器），不用正则抠 HTML。目标表是 `table#dataList`，真实页面里 `dataListHeader` 排在它前面。
+- 矩阵解析使用 HTML 解析库按结构定位，不用正则抠 HTML。目标表是 `table#dataList`，真实页面里 `dataListHeader` 排在它前面。
 - 空白格一律是 `free`。教务的“完全空闲”是按查询范围对整间教室的筛选结论，**不是格子状态**；不落逐格观测，查询侧用区间内每节 `available` 聚合表达。
 - 观测按「房 × 周 × 天 × 节」逐格一行；发布用单事务切换 current/previous，失败不覆盖旧版。
 - 发布门槛：**采集窗口内的周矩阵是必需任务**；占用明细是可选任务。必需任务失败不发布；仅明细失败时发布并标 `partial`。
 - 公开查询 3 个只读端点；空教室 = 所选区间每一节都可用；新鲜度 8 天。
-- 管理面板负责登录、配置、进度、手动同步、版本对比与一键回退；管理员密码走环境变量，业务秘密加密存库。
-- 技术栈固定：Go 1.26 + PostgreSQL 17 + React 19 + antd 6 + goquery + ddddocr-fastapi。
+- 管理面板负责登录、配置、进度、手动同步、版本对比与一键回退；管理员密码由部署环境提供，业务秘密加密存库。
 - 不存原始 HTML、申请人、任课教师；不提供学生课表、成绩、借教室、容量或多租户能力。
 
 ## 1. 产品定义
@@ -34,14 +33,14 @@
 |---|---|---|
 | 公开用户 | 浏览器访问公开页面 | 只读查询，不需要登录 |
 | 管理员 | 浏览器访问 `/admin` | 登录后配置、手动同步、查看进度、对比与回退 |
-| 运维 | 部署机、Compose、日志与数据库 | 部署、迁移、备份、排障 |
+| 运维 | 部署环境、日志与数据库 | 部署、迁移、备份、排障 |
 
 ### 1.3 范围
 
 - 公开查询：空教室、全天 12 小节状态、当前日期上下文、数据版本与新鲜度。
 - 采集：教师端登录、周历采样、白名单楼窗口周矩阵、占用明细、清洗、校验、发布。
 - 管理：管理员登录、业务设置、同步进度、手动同步、版本对比、一键回退、告警记录。
-- 部署：本机 Docker Compose + Caddy；内网验收通过后再切公网域名。
+- 部署：本机或内网部署；内网验收通过后再切公网域名。
 
 ### 1.4 非目标
 
@@ -112,65 +111,16 @@
 - 本地只需窗口内的格子；不需要存房间级状态；查询侧对所选区间做“每节都可用”聚合即可。
 - 2026-10-23 探测用全学期聚合矩阵（**仅用于确认语义，不是采集范围**）：曲阜校区 26 栋楼中“完全空闲”出现 0 次；旧版 4 周快照里状态 8 出现 0 次；Q06 房间 0008 第 5 周全空但全学期不空，`jszt=8` 只在第 5 周返回它。
 
-## 3. 系统组成与部署
+## 3. 运行边界
 
-### 3.1 进程
-
-| 进程 | 职责 |
-|---|---|
-| `cmd/server` | 唯一常驻进程：公开查询 API、管理 API、内置 cron、手动同步。公开路由不登录教务；管理/采集路由才使用教师会话。 |
-| `cmd/migrate` | 一次性迁移命令；部署时先执行，失败即退出。 |
-
-### 3.2 服务
-
-| 服务 | 技术 | 说明 |
-|---|---|---|
-| `app` | Go 1.26 | `server` 与 `migrate` 共用镜像 |
-| `postgres` | `postgres:17-alpine` | canonical 存储，端口只绑回环 |
-| `ocr` | Python 3.12 + ddddocr-fastapi | 无状态 HTTP 服务，`POST /ocr`，`GET /healthz` |
-| `caddy` | `caddy:2-alpine` | TLS、反向代理、安全头 |
-
-### 3.3 技术栈与版本
-
-- Go 1.26，`go.mod` 写 `go 1.26`。
-- PostgreSQL 17，镜像 `postgres:17-alpine`。
-- 后端依赖：`github.com/jackc/pgx/v5`、`github.com/PuerkitoBio/goquery v1.13.0`、`github.com/robfig/cron/v3`、`golang.org/x/text`。
-- HTML 解析：**goquery v1.13.0**，底层 `golang.org/x/net/html`；禁止再用正则抠 HTML 结构。
-- 前端：React 19、antd 6、Vite 8、`@vitejs/plugin-react` 6、TypeScript 6、`react-router` 8、Node 24、pnpm。
-- 前端测试：vitest + `@testing-library/react`，测试与被测模块同目录。
-- 任务编排：根 `Taskfile.yml`，`task ci` 聚合静态检查、测试与构建。
-
-### 3.4 部署拓扑
-
-```text
-Internet
-   │ 443
-Caddy ──► app:8080 ──► postgres:5432
-   │           │
-   │           └──► ocr:8000
-   └── 前端构建产物嵌入 app 二进制，由 app 提供静态文件；Caddy 只做 TLS 与反向代理
-```
-
-- 顶层 `name: easy-qfnu-kjs`；容器名 `easy-qfnu-kjs-postgres/app/ocr/caddy`。
-- 数据卷使用命名卷 `kjs-pgdata`；不 bind-mount 数据目录。
-- 数据库与应用端口只绑 `127.0.0.1`；Caddy 对外。
-- `migrate` 作为一次性服务在 `app` 之前完成；`app` 不自动改结构。
-- 公网 `kjs.easy-qfnu.top` 在内网验收通过前不切换。
-
-部署级环境变量：
-
-| 变量 | 必填 | 说明 |
-|---|---|---|
-| `DATABASE_URL` | 是 | `postgres://...`；app 与 migrate 共用 |
-| `UPSTREAM_BASE_URL` | 否 | 默认 `http://zhjw.qfnu.edu.cn` |
-| `ADMIN_PASSWORD` | 是 | ≥12 字符；只存环境，不落库 |
-| `ADMIN_SESSION_SECRET` | 是 | ≥32 字节随机值；签名管理会话 |
-| `SETTINGS_ENCRYPTION_KEY` | 是 | base64 编码的 32 字节；加密业务秘密 |
-| `TZ` | 否 | 容器时区，固定 `UTC`；业务日期另按 `Asia/Shanghai` 解释 |
+- 公开查询与采集/管理分离：公开页面和公开 API 只读已发布数据，不登录教务；采集、手动同步和管理写接口只对管理员开放，不挂公开路由。
+- 部署在本机或内网，先完成内网验收，再切公网域名；对外入口启用 TLS，数据库不直接暴露公网。
+- 进程数量、服务拆分、技术栈、容器编排与任务编排由接手开发者决定；PRD 不规定。
+- 业务时间口径：时间戳按 UTC 存储与传输，业务日期与 cron 按 `Asia/Shanghai`；详见第 9 节。
 
 ## 4. 数据模型
 
-canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日期 `monday` 是 `date`，按 `Asia/Shanghai` 解释。完整 DDL 见附录 B。
+数据以本地数据库为准；时间戳按 UTC 存储与传输，业务日期按 `Asia/Shanghai` 解释。参考结构见附录 B，不强制技术选型。
 
 ### 4.1 表
 
@@ -236,7 +186,7 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 - `status`：`pending` / `done` / `failed`。
 - 唯一性：同一轮同一楼同一周、同一楼同一格各至多一条。
 - 断点续传从第一个 `pending` 继续；`done` 不重打；`failed` 不在同一轮重试。
-- 进程启动时把 `running` 超过 2 小时的轮次标 `failed`（`error_code=stale_run`），避免崩溃后永久锁死；同一时刻仍至多一轮。
+- 启动时把 `running` 超过 2 小时的轮次标 `failed`（`error_code=stale_run`），避免崩溃后永久锁死；同一时刻仍至多一轮。
 - `collect_run.weeks_total` 记窗口周数（`window_end-window_start+1`）；`required_total` = 楼数 × 窗口周数；`window_start/end` 落库供面板显示。
 
 ### 5.4 请求约束
@@ -260,7 +210,7 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 
 ### 5.6 周矩阵清洗
 
-使用 goquery 解析 `table#dataList`：
+使用 HTML 解析库解析 `table#dataList`：
 
 1. 选 `table#dataList`；没有 → 结构失败。
 2. 找第一个含 `td[tdvalue]` 的行作为表头；没有 → 结构失败。
@@ -294,7 +244,7 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 
 ### 5.9 发布
 
-1. 在内存中按周展开观测；按批 `COPY` 写入。
+1. 按周展开观测；按批写入。
 2. 单事务：写 `release`（非 current）→ 写 `observation` → 写 `occupancy_detail` → 降原 current → 抬新 current → 删除 current/previous 之外的版本。
 3. 任意一步失败整体回滚；原 current 不动。
 4. 发布后写 `collect_run` 汇总（窗口起止、房间数、未知/复合计数、release_id），标 `success` 或 `partial`。
@@ -416,13 +366,13 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 
 ### 7.1 登录
 
-- 用户名固定 `admin`；密码来自 `ADMIN_PASSWORD`，启动时为空或少于 12 字符直接退出。
+- 用户名固定 `admin`；密码由部署环境提供，为空或少于 12 字符不得启动。
 - `POST /api/admin/session`，JSON `{username, password}`；成功设置：
-  - `kjs_admin`：HttpOnly 签名会话，12 小时，`SameSite=Lax`，HTTPS 时 `Secure`。
-  - `kjs_csrf`：可读 CSRF token，前端在写请求头 `X-CSRF-Token` 回传。
+  - 管理会话：HttpOnly 签名 Cookie，12 小时，`SameSite=Lax`，HTTPS 时 `Secure`。
+  - CSRF token：可读，前端在写请求头回传。
 - 登录失败 5 次/分钟/IP 限流；错误不区分用户名/密码。
 - `DELETE /api/admin/session` 清 cookie；`GET /api/admin/session` 返回 `{authenticated, username}`。
-- 签名密钥 `ADMIN_SESSION_SECRET` 必须 ≥32 字节，缺失启动失败。
+- 会话签名密钥由部署环境提供，必须 ≥32 字节；缺失不得启动。
 
 ### 7.2 设置
 
@@ -434,7 +384,7 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
   "account_password": { "set": true },
   "feishu_webhook_url": { "set": true },
   "feishu_secret": { "set": true },
-  "ocr_base_url": "http://ocr:8000",
+  "ocr_base_url": "http://ocr.example:8000",
   "cron_expr": "0 10 4 * * 6",
   "next_run_at": "2026-10-23T20:10:00Z",
   "building_whitelist": [{ "jxlbh": "Q10", "name": "综合教学楼" }]
@@ -448,14 +398,14 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 - 白名单由管理员填写 `jxlbh` 与展示名；系统不自动发现楼。`jxlbh` 即附录 A.2 中 `jsjy_processAjax` 返回的 `dm`。
 - `cron_expr`：6 段式；保存前解析校验；时区固定 `Asia/Shanghai`。
 - 校验失败 → `42201`，整次不保存。
-- 秘密值用 AES-256-GCM 加密存 `settings.value`（`enc:v1:` 前缀）；密钥 `SETTINGS_ENCRYPTION_KEY`（base64 32 字节）缺失启动失败；解密只在采集/告警内存中进行。
+- 秘密值加密存储；加密密钥由部署环境提供，缺失不得启动；解密只在采集/告警内存中进行。
 
 ### 7.3 运行状态
 
 - `GET /api/admin/runs?limit=20`：最近轮次摘要。
 - `GET /api/admin/runs/{run_id}`：状态、阶段、必需/可选完成数、未知/复合计数、release_id、最近错误、更新时间。
 - 阶段：`login`、`calendar`、`week_matrix`、`cell_detail`、`validate`、`publish`、`finished`。
-- 面板运行中每 2 秒轮询；不做 WebSocket。
+- 面板显示运行进度，刷新方式由实现决定。
 
 ### 7.4 手动同步
 
@@ -486,7 +436,7 @@ canonical 是 PostgreSQL。时间为 `timestamptz`（库内 UTC）；业务日�
 
 ### 8.1 技术
 
-React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + testing-library。桌面优先，移动端可用；品牌色 `#884F22` 作为 antd token；状态颜色/图标只在前端映射。
+Web 前端；桌面优先、移动端可用；品牌色 `#884F22`；状态颜色与图标只在前端映射。
 
 ### 8.2 页面
 
@@ -508,15 +458,14 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 
 ### 8.4 质量门禁
 
-- `pnpm lint`、`pnpm typecheck`、`pnpm build`、`pnpm test` 必须通过。
+- 前端 lint、类型检查、构建、单元测试必须通过。
 - 周次/日期换算、房名展示、状态视觉映射等纯函数配单元测试。
-- 不做 `any`；不引入第二套组件库或测试框架。
 
 ## 9. 非功能
 
 ### 9.1 时间
 
-- 数据库时间戳 `timestamptz`，库内 UTC；API 时间 RFC3339 UTC（`Z`）。
+- 时间戳存 UTC；API 时间 RFC3339 UTC（`Z`）。
 - 业务日期 `monday`、`date` 是 `Asia/Shanghai` 的日历日，纯 `date`，不做时区换算。
 - cron 按 `Asia/Shanghai` 解释；界面显示时标注 `Asia/Shanghai`。
 - 周次/星期由 `term_week` 解析，不在前端重算。
@@ -527,11 +476,11 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 - 请求量：楼数×窗口周数次周矩阵（26 栋×4 周约 104 次，约 52 秒）+ 窗口并集明细；明细是 8.5k 全学期有内容格的子集，具体取决于窗口内占用分布。
 - 不设整轮 15 分钟上限；必须断点续传。
 - 空教室查询 p95 < 300ms（50 条/页，单周单日）。
-- 发布按批 COPY，单批 ≤ 5 万行；不逐行 Exec。
+- 发布按批写入，单批 ≤ 5 万行。
 
 ### 9.3 可靠性
 
-- 同一时刻至多一轮（数据库唯一约束）。
+- 同一时刻至多一轮。
 - 必需任务失败不发布，保留旧 current；可选失败发布 `partial`。
 - 发布事务失败整体回滚。
 - 会话失效重登录一次；重试耗尽只影响当前任务（必需则整轮失败）。
@@ -539,29 +488,29 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 
 ### 9.4 安全与隐私
 
-- 管理员密码只存环境变量；业务秘密加密存库；API/日志不返回明文。
-- `SETTINGS_ENCRYPTION_KEY` 必须与数据库备份一起保管；密钥丢失后已存秘密无法解密，只能重新录入。
+- 管理员密码只由部署环境提供，不落库；业务秘密加密存库；API/日志不返回明文。
+- 加密密钥必须与数据库备份一起保管；密钥丢失后已存秘密无法解密，只能重新录入。
 - Cookie：HttpOnly、SameSite=Lax、HTTPS 时 Secure；CSRF token；登录限流。
 - 数据库只绑回环；管理接口不暴露给公开用户；采集/手动同步不挂公开路由。
 - 不存原始 HTML、账号、Cookie、Token、验证码、申请人、任课教师。
 - 日志脱敏：不打印 `encoded`、密码、Cookie、页面正文、`Authorization`。
-- Caddy 启用 TLS/HSTS 与基础安全头；CSP 禁止内联脚本。
+- 对外入口启用 TLS/HSTS 与基础安全头。
 
 ### 9.5 可观测性
 
 - 结构化 JSON 日志：`request_id`、`run_id`、`task_id`、`phase`、`building_id`、`week`、`kind`、`duration_ms`、`error_code`。
-- `GET /healthz`：进程存活；`GET /readyz`：数据库可用 + 迁移已应用。
+- 提供存活与就绪检查：服务存活、数据库可用、结构变更已完成。
 - 运行状态、任务、周抓取、告警都在库内，面板与运维共用。
 - 不引入独立 metrics 栈；需要时再评估。
 
 ### 9.6 运维
 
-- `docker compose -f deploy/compose.yaml up -d` 启动。
-- `migrate` 一次性完成；失败阻止 `app` 启动。
+- 按部署环境的方式启动服务。
+- 结构变更在服务启动前完成；失败不得启动。
 - 每日 `pg_dump` 到宿主机，保留 7 天；每季度做一次恢复演练。
-- 日志走 Docker json-file，轮转 10MB×5；不写本地大文件。
+- 日志按大小轮转，不写无限增长文件。
 - 回滚：面板一键交换 current/previous；数据库备份用于灾难恢复。
-- 首次部署顺序：`migrate` → 启动 app/ocr → 管理员登录 → 配置账号、密码、OCR、白名单 → 手动同步一次 → 检查 current 与查询。
+- 首次部署顺序：完成结构变更 → 启动服务与 OCR → 管理员登录 → 配置账号、密码、OCR、白名单 → 手动同步一次 → 检查 current 与查询。
 
 ## 10. 验收标准
 
@@ -605,7 +554,7 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 
 ### 10.5 管理
 
-- Given 正确 `ADMIN_PASSWORD`，Then 登录成功并设置会话/CSRF；错误密码限流。
+- Given 正确的部署环境管理员密码，Then 登录成功并设置会话/CSRF；错误密码限流。
 - Given 修改设置，Then 下一轮采集/查询从库读取新值；秘密不回显。
 - Given 已有一轮，Then 手动同步返回 `40901`。
 - Given 两版数据，Then 对比返回汇总与分页明细；回退只交换 `is_current`，查询立即生效。
@@ -613,20 +562,20 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 
 ### 10.6 部署
 
-- Given `docker compose up -d` 与 `migrate`，Then 数据库、app、OCR、Caddy 健康。
+- Given 完成部署与结构变更，Then 数据库、服务与 OCR 健康。
 - Given 内网验收，Then 连续两周同步成功、查询/回退/告警演练通过，才切公网域名。
-- Given `task ci`，Then Go 与前端静态检查、测试、构建全部通过。
+- Given 质量门禁，Then 后端与前端静态检查、测试、构建全部通过。
 
 ## 11. 交付顺序
 
 | 阶段 | 内容 | 退出条件 |
 |---|---|---|
-| M0 骨架 | 仓库、Compose、迁移、Taskfile、PRD | `task ci` 通过；`migrate` 成功 |
-| M1 采集 | 登录/OCR、周历、goquery 矩阵解析、明细、发布 | 真账号跑通一轮并发布；解析测试通过 |
+| M0 骨架 | 仓库、数据契约、迁移方案、PRD | 质量门禁通过；结构变更成功 |
+| M1 采集 | 登录/OCR、周历、HTML 矩阵解析、明细、发布 | 真账号跑通一轮并发布；解析测试通过 |
 | M2 查询 | 3 个公开端点、新鲜度 | 契约测试与手工查询通过 |
 | M3 管理 | 登录、设置、进度、手动同步、对比/回退 | 管理端到端通过 |
 | M4 前端 | 公开页 + 管理页 | lint/typecheck/build/test 通过；移动端可用 |
-| M5 验收 | 内网 Compose + Caddy、连续两周同步、回退演练 | 验收记录归档后才切公网 |
+| M5 验收 | 内网部署、连续两周同步、回退演练 | 验收记录归档后才切公网 |
 
 重写从空目录开始；旧 Go 代码只作行为参考，不再以它为基础修改。旧代码保留在 git 历史。
 
@@ -684,7 +633,9 @@ React 19 + TypeScript 6 + Vite 8 + antd 6 + `react-router` 8；pnpm；vitest + t
 - `jszt=8` 实测：Q03 第 5 周 53 间中 49 间整周全空；Q10 第 5 周 0 间；Q06 房间 0008 第 5 周全空但全学期不空。
 - 真实明细弹窗实测：`table#tab1` 只有“教室占用情况”标题；字段行在下方嵌套表格里，标签写作 `教室状态：`、`课程：`、`周次：`、`时间标志：`。解析结果为 `教室状态=正常上课、课程=概率论与数理统计、周次=1-16、时间标志=单双周`。
 
-## 附录 B：数据库 DDL 与种子
+## 附录 B：参考数据结构与种子
+
+> 以下只说明字段、约束与种子值，不强制数据库产品或实现技术；满足第 4 节的不变量即可。
 
 ```sql
 -- 字典与轴
