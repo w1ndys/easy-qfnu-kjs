@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
@@ -118,4 +119,69 @@ SELECT axis_version, node, ordinal, block, block_ordinal
 		return nil, fmt.Errorf("遍历节次轴失败: %w", err)
 	}
 	return nodes, nil
+}
+
+// ErrNoDictVersion 表示字典表里还没有任何版本：采集器不能凭空挑一版去分类符号。
+var ErrNoDictVersion = errors.New("没有可用的字典版本")
+
+// ErrNoAxisVersion 表示节次轴表里还没有任何版本：没有轴就展开不出 7×12 小节。
+var ErrNoAxisVersion = errors.New("没有可用的节次轴版本")
+
+// DictSymbols 读出某个字典版本的符号表：清洗层按它把上游原文换成语义键。
+// 符号的码点必须原样读出，不能在这里做任何规范化。
+func (s *Store) DictSymbols(ctx context.Context, dictVersion int) ([]model.DictSymbol, error) {
+	const sqlText = `
+SELECT symbol, state_key
+  FROM dict_symbol
+ WHERE dict_version = $1
+ ORDER BY symbol`
+
+	rows, err := s.pool.Query(ctx, sqlText, dictVersion)
+	if err != nil {
+		return nil, fmt.Errorf("查询符号字典失败: %w", err)
+	}
+	defer rows.Close()
+
+	symbols := make([]model.DictSymbol, 0, 16)
+	for rows.Next() {
+		var symbol model.DictSymbol
+		var stateKey string
+		if err := rows.Scan(&symbol.Symbol, &stateKey); err != nil {
+			return nil, fmt.Errorf("扫描符号字典失败: %w", err)
+		}
+		symbol.StateKey = model.StateKey(stateKey)
+		symbols = append(symbols, symbol)
+	}
+	// 遍历中途出错时不能当作读完，否则分类表会缺符号，未知会凭空变多
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历符号字典失败: %w", err)
+	}
+	return symbols, nil
+}
+
+// LatestDictVersion 读出最新的字典版本：版本只增不改，最新的一版就是当前口径。
+// 表里一版都没有时返回 ErrNoDictVersion，由调用方决定是否还有别的来源。
+func (s *Store) LatestDictVersion(ctx context.Context) (int, error) {
+	return latestVersion(ctx, s, "dict", ErrNoDictVersion)
+}
+
+// LatestAxisVersion 读出最新的节次轴版本；表里一版都没有时返回 ErrNoAxisVersion。
+func (s *Store) LatestAxisVersion(ctx context.Context) (int, error) {
+	return latestVersion(ctx, s, "axis", ErrNoAxisVersion)
+}
+
+// latestVersion 取某个版本表的当前最大版本号。
+// 表名只由本文件的调用方给（dict / axis），不接受外部输入。
+func latestVersion(ctx context.Context, s *Store, table string, missing error) (int, error) {
+	sqlText := fmt.Sprintf(`SELECT COALESCE(max(version), 0) FROM %s`, table)
+
+	var version int
+	if err := s.pool.QueryRow(ctx, sqlText).Scan(&version); err != nil {
+		return 0, fmt.Errorf("查询 %s 最新版本失败: %w", table, err)
+	}
+	// 0 说明这张表一版都没有：拿不到口径就不该继续采集
+	if version == 0 {
+		return 0, missing
+	}
+	return version, nil
 }

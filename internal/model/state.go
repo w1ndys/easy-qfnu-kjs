@@ -10,7 +10,7 @@ type StateKey string
 // 状态语义键取值，与契约的种子表逐条对应。
 const (
 	StateFree            StateKey = "free"             // 空闲：空单元格，或文字“空闲”
-	StateFullyFree       StateKey = "fully_free"       // 完全空闲
+	StateFullyFree       StateKey = "fully_free"       // 完全空闲：查询侧的区间聚合标签，不由格子解析产生
 	StateClass           StateKey = "class"            // 正常上课
 	StateBorrowed        StateKey = "borrowed"         // 借用
 	StateLocked          StateKey = "locked"           // 锁定
@@ -23,7 +23,8 @@ const (
 )
 
 // IsUsable 判断该状态在空间意义上是否可用。
-// 只有 free 与 fully_free 可用；unknown 与 composite 一律不可用，绝不把未知当空闲。
+// 只有 free 与 fully_free 可用；当前采集只为空白格产生 free，
+// fully_free 是查询侧按区间聚合出来的房间级标签，不会落成格子状态。
 func (k StateKey) IsUsable() bool {
 	// 两个可用状态直接放行，其余全部按占用处理
 	if k == StateFree || k == StateFullyFree {

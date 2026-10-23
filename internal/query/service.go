@@ -48,7 +48,7 @@ type QueryResult struct {
 // MetaState 是 meta 里对某个状态的说明。
 type MetaState struct {
 	Label     string // 状态中文名，前端直接展示
-	Available bool   // 是否算可用，只有 free 与 fully_free 为 true
+	Available bool   // 是否算可用；当前采集只产生 free，fully_free 仅作区间聚合标签
 }
 
 // MetaNode 是 meta 里的一个节次节点及其所属大节。

@@ -6,11 +6,13 @@ import "time"
 
 // Room 是房间目录里的一条：身份是 jsbh（ID），展示名允许重复，同名房间不合并。
 type Room struct {
-	ID        string     // jsbh，房间唯一身份
-	Name      string     // 规范化展示名（最近一次）
-	NameRaw   string     // 最近一次见到的原始名，含容量片段
-	FirstSeen *time.Time // 首次出现的日期；还没有数据时为 nil
-	LastSeen  *time.Time // 最近出现的日期；还没有数据时为 nil
+	ID           string     // jsbh，房间唯一身份
+	Name         string     // 规范化展示名（最近一次）
+	NameRaw      string     // 最近一次见到的原始名，含容量片段
+	BuildingID   string     // 返回该房间的 jxlbh；状态行本身不带楼，不能从房名反推
+	BuildingName string     // 该次采集时的教学楼展示名
+	FirstSeen    *time.Time // 首次出现的日期；还没有数据时为 nil
+	LastSeen     *time.Time // 最近出现的日期；还没有数据时为 nil
 }
 
 // Term 是一个学期。

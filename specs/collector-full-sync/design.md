@@ -1,5 +1,7 @@
 # 采集器全量同步
 
+> **已被 [docs/prd.md](../../docs/prd.md) 取代（2026-10-23）。** 本 spec 保留作历史与排障输入；与 PRD 冲突时以 PRD 为准。
+
 Feature Name: collector-full-sync
 Updated: 2026-10-09
 
@@ -18,15 +20,13 @@ Updated: 2026-10-09
 
 ```mermaid
 flowchart LR
-  cron[cron_expr] --> collector[cmd/collector]
-  admin[手动开始] --> collector
-  collector --> upstream[教师端教务系统]
-  collector --> db[(PostgreSQL)]
-  query[cmd/server] --> db
-  web[公开页面] --> query
+  cron[cron_expr] --> app[cmd/server]
+  app --> upstream[教师端教务系统]
+  app --> db[(PostgreSQL)]
+  web[公开页面] --> app
 ```
 
-采集器是唯一访问教务系统的进程。查询服务只读 `is_current` 快照和 `term_week`。手动开始与定时触发进入同一个任务队列。
+常驻入口只有 `cmd/server`：它听公开查询，并在同一进程里按 `cron_expr` 跑采集。见 `docs/decisions/2026-10-09-single-process-entry.md`。公开查询处理函数不登录教务。`cmd/migrate` 仍单独跑一次。手动同步以后由这个进程里的采集模块执行，不另起进程，也不挂到公开查询路由。
 
 一轮的顺序固定为：登录、读学期、采样周历、按楼拉各周矩阵、按楼拉聚合矩阵、下钻有内容格子、校验、发布。前一步失败且该失败被定为整轮失败时，后面的步骤不开始。
 
@@ -34,16 +34,15 @@ flowchart LR
 
 | 组件 | 职责 |
 |---|---|
-| `cmd/collector` | 进程入口。读 `DATABASE_URL`，启动内置 cron，执行一轮或从断点继续。 |
-| `internal/collect/login` | CAS 登录与 ddddocr。会话失效时重新登录。 |
+| `cmd/server` | 唯一常驻入口。听公开查询，并按 `cron_expr` 在同一进程里跑采集。 |
+| `internal/collect/login` | CAS 登录与 ddddocr。会话失效时重新登录。目前仍是未实现入口。 |
 | `internal/collect/calendar` | 请求周历页，解析周次文本，生成 `term_week`。 |
 | `internal/collect/fetch` | 按 `jxlbh` 请求周矩阵、聚合矩阵和占用明细。相邻请求间隔至少 500 毫秒，单次最多 3 次重试。 |
 | `internal/collect/clean` | 沿用 `docs/contract/data-format.v2.md` 的解析、房名规范、状态分类和 12 小节展开。 |
 | `internal/collect/sync` | 任务状态机。任务完成后不重打。 |
 | `internal/collect/publish` | 校验通过后单事务切换 current / previous。 |
-| `cmd/server` | 已有查询服务。本功能只让它消费新写入的周历、房间所属楼和过期规则。 |
 
-面板的登录、白名单编辑页和进度页属于阶段 3。本功能先提供采集器读取的配置和进度表，管理接口可以后接。手动开始在阶段 3 面板落地前，由采集器进程内的管理调用触发，不暴露到公开查询端口。
+面板的登录、白名单编辑页和进度页属于阶段 3。本功能先提供采集器读取的配置和进度表，管理接口可以后接。手动开始在阶段 3 落地前不暴露成产品入口，也不挂到公开查询路由。
 
 ## Data Models
 
