@@ -24,16 +24,18 @@ func testDictStates() []model.DictState {
 	}
 }
 
-// buildDetailBody 拼一份最小的占用明细弹窗：每条记录是若干「标签 + 值」字段。
+// buildDetailBody 拼一份接近真实结构的占用明细弹窗：
+// table#tab1 只是标题表；字段行在下半部的嵌套表格里，每行三列，标签带全角冒号。
 func buildDetailBody(records ...[]detailField) []byte {
 	var body strings.Builder
-	body.WriteString(`<html><body><center id="alldiv"><table id="tab1">`)
+	body.WriteString(`<html><body><center id="alldiv"><table id="tab1"><tr><td>教室占用情况</td></tr></table></center>`)
+	body.WriteString(`<form id="Form1" action="/jsxsd/jspyfa/selectJx02"><table><tr><td><table>`)
 	for _, record := range records {
 		for _, field := range record {
-			body.WriteString(`<tr><td>` + field.label + `</td><td></td><td>` + field.value + `</td></tr>`)
+			body.WriteString(`<tr><td>` + field.label + `：</td><td></td><td>` + field.value + `</td></tr>`)
 		}
 	}
-	body.WriteString(`</table></center></body></html>`)
+	body.WriteString(`</table></td></tr></table></form></body></html>`)
 	return []byte(body.String())
 }
 

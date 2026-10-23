@@ -17,19 +17,19 @@ import (
 var testBlockCodes = []string{"0102", "030405", "0607", "0809", "101112"}
 
 // TestParseClassifiesContractStates 按契约样例覆盖各状态：空闲、上课、借用、锁定、考试、
-// 完全空闲、跨模式，以及要能区分且一律不可用的未知与复合。
+// 固定调课、跨模式，以及要能区分且一律不可用的未知与复合。
 func TestParseClassifiesContractStates(t *testing.T) {
 	cells := freeCells()
-	cells[0] = "◆"    // 周一 0102：正常上课
-	cells[1] = "Ｊ"    // 周一 030405：借用
-	cells[2] = "Ｘ"    // 周一 0607：锁定
-	cells[3] = "Κ"    // 周一 0809：考试
-	cells[4] = "完全空闲" // 周一 101112：完全空闲
-	cells[5] = "张老师"  // 周二 0102：未收录文本
-	cells[6] = "◆Ｊ"   // 周二 030405：两个已收录符号拼在一起
-	cells[7] = "空闲"   // 周二 0607：空闲文字
-	cells[8] = " "    // 周二 0809：空单元格
-	cells[9] = "M"    // 周二 101112：跨模式占用
+	cells[0] = "◆"   // 周一 0102：正常上课
+	cells[1] = "Ｊ"   // 周一 030405：借用
+	cells[2] = "Ｘ"   // 周一 0607：锁定
+	cells[3] = "Κ"   // 周一 0809：考试
+	cells[4] = "Ｇ"   // 周一 101112：固定调课
+	cells[5] = "张老师" // 周二 0102：未收录文本
+	cells[6] = "◆Ｊ"  // 周二 030405：两个已收录符号拼在一起
+	cells[7] = "空闲"  // 周二 0607：空闲文字
+	cells[8] = " "   // 周二 0809：空单元格
+	cells[9] = "M"   // 周二 101112：跨模式占用
 
 	body := buildBody(testRoom{jsbh: "r-1", nameRaw: "F126(90/0)", cells: cells})
 	matrix, err := Parse(body, testAxis(), testSymbols())
@@ -50,7 +50,7 @@ func TestParseClassifiesContractStates(t *testing.T) {
 		model.StateBorrowed, model.StateBorrowed, model.StateBorrowed,
 		model.StateLocked, model.StateLocked,
 		model.StateExam, model.StateExam,
-		model.StateFullyFree, model.StateFullyFree, model.StateFullyFree,
+		model.StateFixedReschedule, model.StateFixedReschedule, model.StateFixedReschedule,
 	})
 	// 周二：未知、复合、空闲、空单元格与跨模式
 	checkDay(t, row, 1, []model.StateKey{
@@ -73,6 +73,57 @@ func TestParseClassifiesContractStates(t *testing.T) {
 	// 空单元格是空闲，算可用
 	if !row.Week[3][0].StateKey.IsUsable() {
 		t.Error("空单元格应当判为可用状态")
+	}
+}
+
+// TestParseTreatsFullyFreeTextAsUnknown 断言“完全空闲”不再是格子符号：矩阵里的空白格统一是
+// free，真出现这四个字时只能按未收录文本处理，绝不判成可用。
+func TestParseTreatsFullyFreeTextAsUnknown(t *testing.T) {
+	cells := freeCells()
+	cells[0] = "完全空闲"
+
+	matrix, err := Parse(buildBody(testRoom{jsbh: "r-ff", nameRaw: "F126(90/0)", cells: cells}), testAxis(), testSymbols())
+	if err != nil {
+		t.Fatalf("清洗失败: %v", err)
+	}
+	// 符号表没有登记它，只能留原文并按未知处理
+	checkCell(t, matrix.Rows[0].Week[0][0], model.StateUnknown, "完全空闲")
+}
+
+// TestParseSelectsExactDataListID 覆盖真实响应的表顺序：dataListHeader 排在 dataList 前面时，
+// 只能选中 id 精确等于 dataList 的那张表。
+func TestParseSelectsExactDataListID(t *testing.T) {
+	room := testRoom{jsbh: "r-exact", nameRaw: "F126(90/0)", cells: freeCells()}
+	body := strings.TrimPrefix(string(buildBody(room)), `<html><body>`)
+	// 在真实表前插一个带 dataList 前缀的干扰表，模拟上游真实的 dataListHeader
+	body = `<html><body><table id="dataListHeader"><tr><td>筛选</td></tr></table>` + body
+
+	matrix, err := Parse([]byte(body), testAxis(), testSymbols())
+	if err != nil {
+		t.Fatalf("清洗失败: %v", err)
+	}
+	if len(matrix.Rows) != 1 {
+		t.Fatalf("清洗出 %d 行，期望 1 行", len(matrix.Rows))
+	}
+	if matrix.Rows[0].Jsbh != "r-exact" {
+		t.Errorf("jsbh = %q，期望 r-exact", matrix.Rows[0].Jsbh)
+	}
+}
+
+// TestParseAcceptsUnquotedDataListID 覆盖 id 不带引号的写法：词边界匹配不能要求 id 必须带引号。
+func TestParseAcceptsUnquotedDataListID(t *testing.T) {
+	room := testRoom{jsbh: "r-unquoted", nameRaw: "F127(90/0)", cells: freeCells()}
+	body := strings.Replace(string(buildBody(room)), `id="dataList"`, `id=dataList`, 1)
+
+	matrix, err := Parse([]byte(body), testAxis(), testSymbols())
+	if err != nil {
+		t.Fatalf("清洗失败: %v", err)
+	}
+	if len(matrix.Rows) != 1 {
+		t.Fatalf("清洗出 %d 行，期望 1 行", len(matrix.Rows))
+	}
+	if matrix.Rows[0].Jsbh != "r-unquoted" {
+		t.Errorf("jsbh = %q，期望 r-unquoted", matrix.Rows[0].Jsbh)
 	}
 }
 
@@ -273,7 +324,6 @@ func testSymbols() []model.DictSymbol {
 		{Symbol: "空闲", StateKey: model.StateFree},
 		{Symbol: "Ｇ", StateKey: model.StateFixedReschedule},
 		{Symbol: "Ｌ", StateKey: model.StateTempReschedule},
-		{Symbol: "完全空闲", StateKey: model.StateFullyFree},
 		{Symbol: "M", StateKey: model.StateCrossMode},
 	}
 }
