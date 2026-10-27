@@ -1,0 +1,27 @@
+# --- secrets ---
+.env
+.env.*
+!.env.example
+
+# --- go ---
+backend/bin/
+*.test
+*.out
+coverage.out
+
+# --- node / web ---
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.local
+
+# --- runtime artifacts ---
+backup/
+logs/
+*.log
+
+# --- ide / os ---
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -1,0 +1,174 @@
+version: '3'
+
+# 仓库根 Taskfile：把日常运维与质量门禁收在一处，避免记一长串 docker compose / go / pnpm 参数。
+# 用法：task（列出全部任务）、task up、task logs service=server、task gate
+
+vars:
+  COMPOSE: docker compose
+  GO: go
+  PNPM: pnpm
+  # 数据库连接串仅用于本机排障，容器内连接以 compose 环境变量为准
+  LOCAL_DSN: postgres://postgres:postgres@127.0.0.1:5432/easy_qfnu_kjs?sslmode=disable
+  BACKUP_DIR: ./backup
+
+tasks:
+  default:
+    desc: 列出可用任务
+    cmds:
+      - task --list
+
+  # ---------- 编排 ----------
+  up:
+    desc: 构建并启动 web + server + postgres
+    cmds:
+      - '{{.COMPOSE}} up -d --build'
+
+  down:
+    desc: 停止并移除容器（保留数据卷）
+    cmds:
+      - '{{.COMPOSE}} down'
+
+  ps:
+    desc: 查看服务状态
+    cmds:
+      - '{{.COMPOSE}} ps'
+
+  logs:
+    desc: 跟踪日志，可用 service=server|web|postgres 只看一个
+    cmds:
+      - '{{.COMPOSE}} logs -f {{.service}}'
+
+  restart:
+    desc: 重启指定服务，默认 server
+    vars:
+      target: '{{default "server" .service}}'
+    cmds:
+      - '{{.COMPOSE}} restart {{.target}}'
+
+  build:
+    desc: 构建两个镜像（不启动）
+    cmds:
+      - '{{.COMPOSE}} build'
+
+  # ---------- 数据库 ----------
+  db:up:
+    desc: 只启动数据库
+    cmds:
+      - '{{.COMPOSE}} up -d postgres'
+
+  db:psql:
+    desc: 进入数据库交互终端
+    cmds:
+      - '{{.COMPOSE}} exec postgres psql -U postgres -d easy_qfnu_kjs'
+
+  db:reset:
+    desc: 清空数据卷并重建数据库（危险：本地开发用）
+    prompt: 这会删除本地数据库数据，确认继续？
+    cmds:
+      - '{{.COMPOSE}} down -v'
+      - '{{.COMPOSE}} up -d postgres'
+
+  db:dump:
+    desc: 导出全量备份到 ./backup，文件名带 UTC 时间戳
+    cmds:
+      - mkdir -p {{.BACKUP_DIR}}
+      - '{{.COMPOSE}} exec -T postgres pg_dump -U postgres -d easy_qfnu_kjs | gzip > {{.BACKUP_DIR}}/easy_qfnu_kjs_$(date -u +%Y%m%dT%H%M%SZ).sql.gz'
+
+  db:restore:
+    desc: 从备份恢复，需 file=backup/xxx.sql.gz
+    requires:
+      vars: [file]
+    cmds:
+      - gunzip -c {{.file}} | '{{.COMPOSE}}' exec -T postgres psql -U postgres -d easy_qfnu_kjs
+
+  # ---------- 后端 ----------
+  backend:run:
+    desc: 本机跑后端（数据库需先 task db:up）
+    dir: backend
+    cmds:
+      - '{{.GO}} run ./cmd/server'
+
+  backend:build:
+    desc: 编译后端二进制到 backend/bin/server
+    dir: backend
+    cmds:
+      - '{{.GO}} build -o bin/server ./cmd/server'
+
+  backend:test:
+    desc: 后端全量测试
+    dir: backend
+    cmds:
+      - '{{.GO}} test ./...'
+
+  backend:vet:
+    desc: 后端 go vet
+    dir: backend
+    cmds:
+      - '{{.GO}} vet ./...'
+
+  backend:lint:
+    desc: 后端静态检查（含 depguard 依赖方向）
+    dir: backend
+    cmds:
+      - golangci-lint run
+
+  backend:fmt:
+    desc: 后端格式化
+    dir: backend
+    cmds:
+      - '{{.GO}} fmt ./...'
+
+  # ---------- 前端 ----------
+  frontend:install:
+    desc: 安装前端依赖
+    dir: frontend
+    cmds:
+      - '{{.PNPM}} install'
+
+  frontend:dev:
+    desc: 起前端开发服务器（/api 代理到后端）
+    dir: frontend
+    cmds:
+      - '{{.PNPM}} dev'
+
+  frontend:build:
+    desc: 构建前端产物
+    dir: frontend
+    cmds:
+      - '{{.PNPM}} build'
+
+  frontend:test:
+    desc: 前端单测
+    dir: frontend
+    cmds:
+      - '{{.PNPM}} test -- --run'
+
+  frontend:lint:
+    desc: 前端 eslint + 类型检查
+    dir: frontend
+    cmds:
+      - '{{.PNPM}} exec eslint .'
+      - '{{.PNPM}} exec tsc --noEmit'
+
+  frontend:fmt:
+    desc: 前端格式化
+    dir: frontend
+    cmds:
+      - '{{.PNPM}} exec prettier --write .'
+
+  # ---------- 门禁 ----------
+  fmt:
+    desc: 前后端一起格式化
+    cmds:
+      - task: backend:fmt
+      - task: frontend:fmt
+
+  gate:
+    desc: 提交前门禁：后端测试/vet/lint + 前端测试/lint/构建
+    cmds:
+      - task: backend:test
+      - task: backend:vet
+      - task: backend:lint
+      - task: frontend:test
+      - task: frontend:lint
+      - task: frontend:build

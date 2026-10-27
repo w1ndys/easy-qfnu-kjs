@@ -1,0 +1,254 @@
+# 需求实施计划
+
+- [ ] 1. M0 仓库基线清理与工程骨架
+  - [ ] 1.1 归档旧实现并清空主线
+    - 新建归档分支 `legacy/go-collector` 保存旧 `internal/`、`cmd/migrate`、`deploy/`、`docs/contract/*`、`docs/product-requirements.md`、`docs/upstream.md`、`specs/collector-full-sync/*`
+    - 在主线删除上述内容，保留 `docs/prd.md`、`docs/pitfalls.md`、`docs/upstream-api.md`、`docs/decisions/`（design D3）
+    - 同步修正 `docs/prd.md` 附录 B 的旧文档指向为归档分支
+  - [ ] 1.2 建立目录结构与模块定义
+    - 建顶层 `backend/` 与 `frontend/` 两个自足工程；后端目录为 `backend/{cmd/server,internal/{model,upstream,parser,clean,pipeline,publish,store,query,api,config},migrations}`（design 目录结构）
+    - `backend/go.mod` 写 `go 1.26.10` + `toolchain go1.26.10`，引入 pgx、cron、HTML 解析库与 x/text；`frontend/package.json` 初始化 React 19 + antd 6 工程
+    - `compose.yaml`、`Dockerfile.backend`、`Dockerfile.frontend`、`Taskfile.yml` 放仓库根目录；构建上下文仍为 `./backend` 与 `./frontend`，两个工程目录内不放 Dockerfile（design D2）
+    - `model` 定义跨层结构体与错误码；`parser`、`clean` 只 import `model`，不 import `store`/`upstream`（design 依赖方向）
+    - 在 `.golangci.yml` 配 depguard 规则，把 design 的依赖方向写成可执行约束，越层即 lint 失败
+  - [ ] 1.3 迁移基线与执行器
+    - 在 `backend/migrations/` 写 `0001` 基线：字典/轴、学期日历、room、admin_user、settings、release、release_room_building、observation、occupancy_detail、collect_run、collect_run_week、sync_task、alert_log、schema_migration（design 数据模型）
+    - 种子：`dict` v1（`fully_free` 只进 `dict_state`）、`axis` v1、默认 cron 与空白名单
+    - 迁移执行器在服务启动前跑完，失败退出（Requirement 31.2）
+    - 保证 `collect_run_single_running`、`release_one_current`、`sync_task_*` 唯一索引存在（CP6/CP8）
+  - [ ] 1.4 迁移与唯一索引行为测试
+    - 对真实 PostgreSQL 17 跑迁移两次，断言幂等
+    - 并发插入两个 `running` 轮次被唯一索引拒绝（CP6）
+    - 删除最旧 release 时 `collect_run.release_id` 置空而不报外键错误（CP8）
+
+- [ ] 2. 存储与配置底座
+  - [ ] 2.1 配置读取与连接池
+    - 读取数据库地址、监听地址、OCR 超时等非秘密配置；秘密项一律走库（design 目录结构 + Requirement 22.2）
+    - 连接池上限与查询超时，采集批量写入单独限额
+  - [ ] 2.2 settings 读写与秘密加解密
+    - 密钥在初始化时生成并落库，缺失时初始化流程无法跳过（Requirement 20.3、CP11）
+    - 加密写入、按需解密、接口只回「已设置」
+    - 提供再次导出密钥的读取入口，不提供覆盖密钥的写入入口（CP11）
+  - [ ] 2.3 基础仓储
+    - `room`、`term`、`term_week`、`settings`、`admin_user` 的读写；学期与周历在同一事务内整体替换（Requirement 3.2）
+  - [ ] 2.4 仓储测试
+    - 学期整体替换的原子性（事务失败后旧日历不变）
+    - 秘密字段存取不回显明文（CP9）
+    - 属性测试：任意秘密值经加密-解密往返等价
+
+- [ ] 3. 上游客户端（upstream）
+  - [ ] 3.1 请求骨架与节奏控制
+    - 统一 Cookie（仅内存）、`Content-Type`、User-Agent；相邻请求至少 500ms、单请求重试 ≤3 次（Requirement 11.5）
+    - 非 200、网络错误、读取失败计入重试；正文含会话失效标记时抛会话错误而非数据错误
+  - [ ] 3.2 登录流程
+    - `GET /` → 验证码 → `POST logon&flag=sess` 取 `scode#sxh` → 生成 `encoded` → `POST logonLdap` → `GET jsMain.jsp` 校验成功标识（Requirement 2.1–2.4）
+    - 验证码交 OCR，`code=200` 判成功，失败换图重试累计 ≤3 次
+    - 密码错误立即失败、不重试；会话失效只重登录一次
+  - [ ] 3.3 学期与周历请求
+    - 学期页取学期编号与 `kbjcmsid`；周历页取「第 X 周 / Y 周」并做 `1 ≤ X ≤ Y` 校验（Requirement 3.1、3.3）
+  - [ ] 3.4 楼列表与周矩阵请求
+    - 楼列表按校区取 `dm`/`dmmc`；矩阵请求按楼筛选 + 周次，每楼每周一次（Requirement 4.1、5.1）
+  - [ ] 3.5 占用说明请求
+    - 组装 `kcsj=<星期><大节>`、`xq`、`kbjcmsid` 等参数（Requirement 6.1）
+  - [ ] 3.6 上游单元测试
+    - 用 `httptest` 夹具锁 `encoded` 生成算法与 `scode` 消耗顺序
+    - 节奏控制断言：任意两次请求间隔 ≥500ms
+    - 重试与错误分类：3 次耗尽后返回任务级失败，密码错误不重试
+
+- [ ] 4. HTML 解析器（parser）
+  - [ ] 4.1 矩阵解析
+    - 按结构精确定位目标表，避开同名前缀表（Requirement 4.2）
+    - 校验 35 个状态格集合与顺序；数据行单元格数量一致；响应内重复房号判结构失败（Requirement 4.3–4.6）
+    - 房号三来源顺序：行属性 → 行内复选框 → 首列输入框（Requirement 4.7）
+  - [ ] 4.2 占用说明解析
+    - 扫描整页行，只采纳三列且标签去冒号后属于四字段的行；同一格多条按顺序保留（Requirement 6.2、6.5）
+    - 有标题表无字段行视为「该格无说明」且解析成功；连标题表都没有才结构失败
+  - [ ] 4.3 周历与学期文本解析
+    - 纯文本正则解析学期编号与周次，兼容「共」与空白（Requirement 3.1、3.3）
+  - [ ] 4.4 解析夹具测试
+    - 夹具必须包含：同名前缀表在目标表之前、表头 36 单元格 / 35 个状态格、数据行 36 单元格、房号三种来源各一例
+    - 明细夹具：标题表 + 下方嵌套三列 + 全角冒号；空字段行返回空列表
+    - 结构变更夹具：状态格缺一个、顺序错、单元格数量不符，均返回结构错误
+
+- [ ] 5. 清洗（clean）
+  - [ ] 5.1 状态分类与可用性投影
+    - 整词命中字典 → 语义键；空文本 → 空闲；多符号组合 → 复合；未收录 → 未知，均保留原文（Requirement 7.1–7.4）
+    - 可用性只按字典字段投影，未知与复合恒不可用；代码内不保留第二套判断（Requirement 7.5、CP4）
+  - [ ] 5.2 房名规范化
+    - 全半角归一 → 反复删容量片段 → 压缩空白；保留方位/校区括号与原始名（Requirement 5.2）
+  - [ ] 5.3 周次范围解析与窗口求交
+    - 解析「起-止」与单双周标记；与采集窗口求交，空交集丢弃（Requirement 6.4）
+  - [ ] 5.4 节次展开
+    - 5 大节 → 12 小节，同一大节内各小节状态一致（Requirement 7.6）
+  - [ ] 5.5 属性与单元测试
+    - CP4：任意状态原文，投影出的 `available` 与字典一致，未知/复合恒为 false
+    - CP1：任意观测落库后 `week` 必然在 `[window_start, window_end]` 内
+    - 房名规范化幂等；容量片段出现在任意位置都能删除
+
+- [ ] 6. 同步编排（pipeline）
+  - [ ] 6.1 窗口计算与任务规划
+    - 在 `backend/internal/pipeline/` 实现：由当前周 `C` 与总周数 `Y` 求窗口 `C..min(Y,C+3)`；窗口为空 → `skipped`（Requirement 1.1、1.4、10.4）
+    - 任务分类：窗口内周矩阵必需、占用说明可选；同一楼同一周、同一格各至多一条（Requirement 10.1–10.2、5.2 唯一性、CP5）
+  - [ ] 6.2 单轮互斥与过期轮次收敛
+    - 以唯一索引保证同一时刻一轮，冲突时返回已有轮次（Requirement 11.3、CP6）
+    - 启动时把超过 2 小时的 `running` 置为失败并记 `stale_run`（Requirement 11.4）
+  - [ ] 6.3 执行循环与断点续传
+    - 从第一个 `pending` 继续，跳过 `done`，`failed` 不在本轮重试（Requirement 11.1、11.2）
+    - 每任务完成即写 `collect_run_week`（含 `fetched_at` 与页面哈希）并回写轮次计数
+  - [ ] 6.4 归属落库与冲突处理
+    - 每楼响应内房号归属该楼，写 `room.building_id` 与当轮归属集合（Requirement 5.1）
+    - 冲突按白名单顺序 + 周次升序取首个命中，后续楼该房号整行丢弃，一轮只记一次冲突并打标记（Requirement 5.3–5.4、12.1–12.3、CP3）
+  - [ ] 6.5 失败分层与阶段推进
+    - 必需失败 → 轮次 failed 且不发布；可选失败 → 继续并标记 partial（Requirement 10.1–10.2）
+    - 阶段字段按 登录 → 学期周历 → 周矩阵 → 占用说明 → 校验 → 发布 → 结束 推进（Requirement 23.1）
+  - [ ] 6.6 规划与续跑测试
+    - 给定窗口与矩阵结果，断言任务集合唯一性与必需/可选分类
+    - 模拟中途失败后续跑，断言不再重打 `done` 任务
+    - CP3：构造两楼同房号响应，断言归属取首个、冲突只记一次
+
+- [ ] 7. 发布（publish）
+  - [ ] 7.1 候选集构建
+    - 组装观测（含派生状态）、占用说明与归属快照；按批写入单批 ≤5 万行（Requirement 28.3）
+    - 派生只在窗口内、且该房号该周无矩阵行时生成，并标记为派生（Requirement 8.1–8.3）
+  - [ ] 7.2 发布校验
+    - 候选集为空、必需任务未完成 → 拒绝并记录校验拦截（Requirement 10.5）
+    - 未知与复合按房×周×天×大节计数，同一大节只计一次（Requirement 9.5、CP4 关联）
+  - [ ] 7.3 单事务版本切换
+    - 写 release（非 current）→ 观测 → 说明 → 归属快照 → 降原 current → 抬新 current → 删更早版本（Requirement 9.1–9.4、CP7、CP8）
+    - 任一步失败整体回滚；成功后回写轮次汇总与 `release_id`（Requirement 23.1）
+  - [ ] 7.4 发布测试
+    - 事务中途失败后原 current 仍可用（CP7）
+    - 连续发布三次后 `release` 只剩两行，最旧版本被删
+    - 回退后归属快照随版本切换（Requirement 24.2–24.3）
+
+- [ ] 8. 检查点 - 采集链路可端到端跑通
+  - 确保所有测试通过,如有疑问请询问用户
+
+- [ ] 9. 公开 API
+  - [ ] 9.1 查询服务骨架
+    - 在 `backend/internal/query/` 实现只读查询，handler 只做参数解析、校验与序列化（design 依赖方向）
+  - [ ] 9.2 context 与 meta
+    - `context` 返回日期、学期、周次、星期、是否教学周（Requirement 17.1）
+    - `meta` 返回版本标识、生成时间、字典、轴、白名单楼列表与逐周新鲜度（Requirement 17.2、17.5）
+  - [ ] 9.3 空教室查询
+    - 区间内每一节都可用才命中；按楼筛选走归属快照，「全部」为白名单楼并集（Requirement 15.1–15.3、CP2）
+    - 关键词子串匹配 + 全半角归一 + ASCII 大小写不敏感 + 通配符转义（Requirement 15.4）
+    - 排序与分页、总数（Requirement 15.5）
+  - [ ] 9.4 全天状态查询
+    - 返回该日 12 小节状态，缺失节点标为无数据（Requirement 16.1–16.3）
+  - [ ] 9.5 参数校验与错误码
+    - 日期偏移、节次区间、`limit`/`offset`、view 枚举越界返回参数错误（Requirement 18.1–18.2）
+    - 无当前版本、非学期周、该周无观测返回无数据空态（Requirement 18.4）
+  - [ ] 9.6 新鲜度与过期
+    - 以该周最近一次成功抓取时间为起点，8 天阈值；partial 不算失败（Requirement 17.3–17.4）
+  - [ ] 9.7 限流与缓存
+    - 按来源每分钟上限拒绝超额请求（Requirement 32.1）
+    - 相同查询复用缓存，新鲜度与空态与实时查询一致（Requirement 32.2）
+  - [ ] 9.8 公开 API 契约测试
+    - 三个端点的响应形状、错误码、越界参数全覆盖
+    - CP10：请求中的节次区间决定结果，与请求时刻无关
+    - 该周全空时返回结果并附带疑似无排课提示（Requirement 18.3）
+
+- [ ] 10. 管理 API
+  - [ ] 10.1 初始化与状态
+    - `state` 返回是否已初始化与是否已登录；未初始化时初始化入口唯一可用（Requirement 20.1）
+    - 初始化校验两次一致与长度、写哈希、生成密钥并返回一次导出内容；已初始化返回冲突码（Requirement 20.2–20.5、CP11）
+  - [ ] 10.2 会话、CSRF 与限流
+    - 登录建立 12 小时会话 + CSRF 令牌；同源每分钟 5 次失败后限流（Requirement 21.1–21.2）
+    - 写操作校验会话与 CSRF；过期跳登录（Requirement 21.3–21.4）
+    - 改密校验当前密码并使既有会话失效（Requirement 20.6）
+  - [ ] 10.3 设置读写
+    - 校验白名单楼编号唯一非空、执行时间表达式格式（Requirement 22.1）
+    - 秘密只写不读、空串清除、省略不变（Requirement 22.2–22.3）
+    - 白名单为空时启动同步返回阻止并说明原因（Requirement 22.4）
+  - [ ] 10.4 运行状态与手动同步
+    - 轮次列表与详情含状态、冲突标记、阶段、必需/可选完成数、未知/复合计数、关联版本、最近错误（Requirement 23.1）
+    - 已有一轮时拒绝手动同步；否则返回轮次标识（Requirement 23.2–23.3）
+  - [ ] 10.5 版本对比与回退
+    - 对比返回房间增删、格子变化、未知/复合增减与单独的归属变化（Requirement 24.1）
+    - 回退在单事务内交换 current/previous 且立即生效（Requirement 24.2–24.3、CP7）
+  - [ ] 10.6 异常数据视图
+    - 列出未归属教室、归属冲突与未知/复合清单，来源为当前版本与最近轮次（Requirement 25.1–25.2）
+  - [ ] 10.7 管理 API 契约测试
+    - 未登录、缺 CSRF、已初始化再初始化、已有一轮再同步等分支全覆盖
+    - 秘密字段响应中不出现明文（CP9）
+
+- [ ] 11. 进程装配、调度与可观测性
+  - [ ] 11.1 服务装配
+    - 在 `backend/cmd/server/main.go` 装配 store、upstream、pipeline、query、api、cron；启动前跑迁移，失败退出（Requirement 31.2–31.3）
+  - [ ] 11.2 cron 调度
+    - 按 `Asia/Shanghai` 解释表达式，默认每周六 04:10；保存前校验格式（Requirement 14.1–14.3）
+    - 定时与手动复用同一采集流程
+  - [ ] 11.3 日志与探针
+    - 结构化日志字段：轮次、阶段、楼栋、周次、任务、耗时、错误码；排除敏感内容（Requirement 31.1、30.2）
+    - 存活/就绪探针返回服务、依赖与迁移状态（Requirement 31.2）
+  - [ ] 11.4 装配集成测试
+    - 起库 + 起服务，跑一轮 stubbed 采集到发布，再查询验证（CP1/CP5/CP7 联测）
+
+- [ ] 12. 前端公共层
+  - [ ] 12.1 工程初始化
+    - 在 `frontend/` 用 Vite + React 19 + antd 6，按 `src/{api,lib,components,layouts,pages/{public,admin},theme}` 建目录（design 目录结构）
+    - 单一构建、两套布局：`PublicLayout` 移动优先、`AdminLayout` 桌面优先；`/admin` 为路由前缀，不拆第二个 SPA
+    - 开发期 `/api` 代理到后端；构建产物供 web 容器托管（design D2）
+  - [ ] 12.2 API 客户端与数据层
+    - 在 `src/api/` 统一请求封装、错误码映射、`request_id` 透传
+    - `context` / `meta` 加载与缓存；状态名与节次名取自 `meta`（Requirement 26.3）
+  - [ ] 12.3 时段默认节次
+    - 在 `src/lib/` 实现：12:00 前 01–05、12:00–18:00 06–09、18:00 后 10–12；非今天沿用当前时段（Requirement 19.1–19.4）
+  - [ ] 12.4 公共层单测
+    - 边界时刻（11:59 / 12:00 / 17:59 / 18:00）默认区间断言
+    - 错误码到提示文案的映射
+    - CP10 前端侧：改动预填不影响已提交查询的参数
+
+- [ ] 13. 公开页
+  - [ ] 13.1 首页与查询入口
+    - 在 `src/pages/public/` + `PublicLayout` 实现单列移动优先布局，主操作在单手可达区域（Requirement 26.1）
+  - [ ] 13.2 空教室页（`src/pages/public/Availability`）
+    - 筛选：日期快选（今天…+10 天）、教学楼下拉（全部 + 白名单楼）、节次区间、关键词、查询按钮（Requirement 15.1–15.6）
+    - 结果列表显示房名、房号与所属教学楼；同名追加房号后缀（Requirement 18.5）
+    - 空态、过期提示、疑似无排课页顶提示、页脚数据说明（Requirement 18.3–18.4、17.3、26.4–26.5）
+  - [ ] 13.3 全天状态页（`src/pages/public/Day`）
+    - 12 小节网格，缺失节点显示无数据；支持同一套筛选（Requirement 16.1–16.3）
+  - [ ] 13.4 公开页组件测试
+    - 空态四类分支、过期提示、时段默认与切换日期后的预填
+    - `tsc --noEmit`、`eslint`、构建全绿
+
+- [ ] 14. 管理面板
+  - [ ] 14.1 布局与鉴权守卫
+    - 在 `src/pages/admin/` + `AdminLayout` 实现桌面优先侧边导航布局，长列表用表格 + 分页（Requirement 26.2）
+    - 未登录跳登录页；未初始化跳初始化页（Requirement 20.1、21.4）
+  - [ ] 14.2 初始化页与密钥导出
+    - 两次密码一致与长度校验、提交后展示密钥与复制/下载、提示「丢失需重录」（Requirement 20.2–20.4）
+    - 设置页提供再次导出入口（Requirement 20.4）
+  - [ ] 14.3 登录页
+    - 错误提示不区分账号与密码；限流提示（Requirement 21.1–21.2）
+  - [ ] 14.4 总览与运行详情
+    - 当前版本、最近一轮、过期周、手动同步按钮；详情含冲突标记与阶段（Requirement 23.1–23.3）
+  - [ ] 14.5 设置页
+    - 账号、密码、飞书、OCR、cron、白名单；秘密只写不读与清除语义（Requirement 22.1–22.4）
+  - [ ] 14.6 版本对比与回退
+    - 汇总 + 明细分页（含归属变化），回退二次确认（Requirement 24.1–24.3）
+  - [ ] 14.7 异常数据与告警页（`src/pages/admin/Anomalies`、`Alerts`）
+    - 三类异常清单 + 告警记录（Requirement 25.1–25.2、13.3）
+  - [ ] 14.8 管理面板组件测试
+    - 初始化→登录→改密流程、CSRF 缺失提示、对比分页
+
+- [ ] 15. 部署与交付
+  - [ ] 15.1 server 容器
+    - 根目录 `Dockerfile.backend` 配 `./backend` 上下文；多阶段构建，`golang:1.26.10-alpine` 构建、静态链接产物运行；启动时跑迁移（Requirement 31.3）
+  - [ ] 15.2 web 容器
+    - 根目录 `Dockerfile.frontend` 配 `./frontend` 上下文；构建 React 产物并托管，反代 `/api` 到 server（design D2）
+  - [ ] 15.3 compose 编排
+    - 根目录 `compose.yaml`：`web` + `server` + `postgres` 三服务，两个 build 分别指 `Dockerfile.frontend` 与 `Dockerfile.backend`；数据库仅内网、不映射公网端口；健康检查与启动顺序（Requirement 30.3）
+    - 日志按大小轮转（Requirement 31.3）
+  - [ ] 15.4 每日备份
+    - 全量备份任务与保留 7 天策略（Requirement 31.3）
+  - [ ] 15.5 Taskfile 与实现对齐
+    - 校对 `Taskfile.yml` 的服务名、构建上下文与 `backend/`、`frontend/` 的真实路径一致
+    - `task gate` 必须等于 16 检查点的命令集；`task db:dump/db:restore` 与 15.4 的备份策略一致
+    - README 的运维段落只写 `task <名字>`，不重复原始命令（design 运维入口约定）
+
+- [ ] 16. 检查点 - 全量门禁与验收自检
+  - 确保所有测试通过,如有疑问请询问用户
+  - 后端 `go test ./...`、`go vet ./...`、`golangci-lint run` 全绿
+  - 前端 `eslint`、`tsc --noEmit`、构建与单测全绿（Requirement 26、28.2）
