@@ -1,0 +1,119 @@
+version: "2"
+
+# 后端质量门禁：standard 默认集 + 依赖方向（depguard）。
+# 依赖方向来自 specs/2026-10-27-classroom-availability-rewrite/design.md「依赖方向」。
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - depguard   # 强制分层依赖方向，越层即失败
+    - bodyclose  # HTTP 响应体必须关闭
+    - errorlint  # 错误比较必须走 errors.Is/As
+    - gocritic   # 常见可疑写法
+    - misspell   # 拼写
+    - noctx      # 出站请求必须带 context
+    - revive     # 风格与注释
+    - unconvert  # 多余类型转换
+    - unparam    # 未被使用的参数
+    - whitespace # 多余空行
+
+  settings:
+    depguard:
+      rules:
+        # 实体与错误码：只允许标准库，避免数据层反向依赖业务。
+        model:
+          files:
+            - "**/internal/model/**"
+          allow:
+            - $gostd
+
+        # 纯解析：只依赖实体，不碰网络与数据库。
+        parser:
+          files:
+            - "**/internal/parser/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+
+        # 纯变换：同上，保持可测无副作用。
+        clean:
+          files:
+            - "**/internal/clean/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+
+        # 上游客户端：解析交给 parser，所以只允许实体与标准库。
+        upstream:
+          files:
+            - "**/internal/upstream/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+
+        # 存储层：只依赖实体与驱动。
+        store:
+          files:
+            - "**/internal/store/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/jackc/pgx/v5
+            - github.com/w1ndys/easy-qfnu-kjs/migrations
+
+        # 编排：可调上游、解析、清洗与存储，不直接写 HTTP 或 SQL 细节。
+        pipeline:
+          files:
+            - "**/internal/pipeline/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/w1ndys/easy-qfnu-kjs/internal/upstream
+            - github.com/w1ndys/easy-qfnu-kjs/internal/parser
+            - github.com/w1ndys/easy-qfnu-kjs/internal/clean
+            - github.com/w1ndys/easy-qfnu-kjs/internal/store
+
+        # 发布：只做校验与事务切换。
+        publish:
+          files:
+            - "**/internal/publish/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/w1ndys/easy-qfnu-kjs/internal/store
+
+        # 查询：读存储，可调统计聚合。
+        query:
+          files:
+            - "**/internal/query/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/w1ndys/easy-qfnu-kjs/internal/store
+            - github.com/w1ndys/easy-qfnu-kjs/internal/stats
+
+        # 统计：记账与聚合，只碰存储与实体。
+        stats:
+          files:
+            - "**/internal/stats/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/w1ndys/easy-qfnu-kjs/internal/store
+
+        # HTTP 层：编排与查询都从这一层进，不直接访问上游。
+        api:
+          files:
+            - "**/internal/api/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/w1ndys/easy-qfnu-kjs/internal/query
+            - github.com/w1ndys/easy-qfnu-kjs/internal/publish
+            - github.com/w1ndys/easy-qfnu-kjs/internal/pipeline
+            - github.com/w1ndys/easy-qfnu-kjs/internal/stats
+            - github.com/w1ndys/easy-qfnu-kjs/internal/store
+            - github.com/w1ndys/easy-qfnu-kjs/internal/config
