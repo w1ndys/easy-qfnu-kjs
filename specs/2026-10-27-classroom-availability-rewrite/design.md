@@ -91,7 +91,8 @@ backend/internal/clean/         纯变换：字典投影、房名规范化、周
 backend/internal/pipeline/      编排：任务规划、单轮互斥、续跑、阶段推进、归属冲突裁决
 backend/internal/publish/       发布校验 + 单事务版本切换
 backend/internal/store/         仓储、迁移执行、批量写入
-backend/internal/query/         只读查询：空教室聚合、全天状态、新鲜度
+backend/internal/query/         只读查询：空教室聚合、全天状态、新鲜度、大屏聚合
+backend/internal/stats/         访问统计：异步记账、小时聚合、UV 去重、清理过期
 backend/internal/api/           HTTP 层：public/admin handlers + 中间件（会话、CSRF、限流、request_id）
 backend/internal/config/        非秘密配置读取；秘密项走库
 backend/migrations/             0001 基线及后续迁移，随二进制一起打包
@@ -100,8 +101,8 @@ frontend/                       Vite + React 19 + antd 6，单一构建、两套
 frontend/src/api/               请求封装、错误码 → 文案、request_id 透传
 frontend/src/lib/               时段默认、日期与周次换算、房名后缀、格式化
 frontend/src/components/        通用展示组件：状态格、空态、过期提示
-frontend/src/layouts/           PublicLayout（移动优先）、AdminLayout（桌面优先）
-frontend/src/pages/public/      首页、空教室、全天状态、404
+frontend/src/layouts/           PublicLayout（移动优先）、AdminLayout（桌面优先）、ScreenLayout（大屏优先，暗色无导航）
+frontend/src/pages/public/      首页、空教室、全天状态、数据大屏、404
 frontend/src/pages/admin/       初始化、登录、总览、运行详情、设置、对比回退、异常、告警
 frontend/src/theme/             antd 主题：品牌色与状态视觉映射
 ```
@@ -117,10 +118,11 @@ frontend/src/theme/             antd 主题：品牌色与状态视觉映射
 单向依赖，用 `golangci-lint` 的 depguard 钉在 CI 里，越层即失败：
 
 ```
-api      → query, publish, pipeline, store, model
+api      → query, publish, pipeline, stats, store, model
 pipeline → upstream, parser, clean, store, model
 publish  → store, model
-query    → store, model
+query    → store, model, stats
+stats    → store, model   （记账与聚合查询）
 parser   → model            （纯函数，禁止 import store / upstream）
 clean    → model            （纯函数，禁止 import store / upstream）
 model    → 标准库
@@ -137,6 +139,50 @@ model    → 标准库
 | GET | `/api/context` | — | `{date, term, week, weekday, in_calendar}` |
 | GET | `/api/meta` | — | 版本、字典、轴、教学楼列表、逐周新鲜度 |
 | GET | `/api/query` | `view=availability\|day`、`keyword`、`date_offset`、`building`、`start_node`、`end_node`、`limit`、`offset` | 空教室或全天状态 |
+| GET | `/api/screen` | — | 数据大屏聚合：规模、版本、逐周新鲜度、最近轮次、异常计数、占用分布 |
+
+大屏接口只读聚合，服务端缓存 30 秒。响应形状：
+
+```json
+{
+  "scale": { "rooms": 2481, "buildings": 26, "term": "2026-2027-1", "week": 5, "window": [5, 8] },
+  "release": { "release_id": "20261023T071012.123456Z", "generated_at": "2026-10-23T07:10:12Z" },
+  "weeks": [{ "week": 5, "published": true, "last_success_at": "...", "stale": false }],
+  "last_run": { "status": "partial", "started_at": "...", "duration_ms": 1830000, "attr_conflict": true },
+  "anomalies": { "unknown_cells": 12, "composite_cells": 51, "attr_conflicts": 2 },
+  "occupancy": {
+    "by_building": [{ "building_id": "Q10", "name": "综合教学楼", "cells": 14700, "occupied": 3821, "rate": 0.26 }],
+    "by_weekday_block": [[0.42, 0.38, 0.31, 0.22, 0.11], "...7 行，每行 5 个大节"]
+  }
+}
+```
+
+同一接口还返回访问统计块（口径见 Requirement 34）：
+
+```json
+{
+  "traffic": {
+    "pv": { "today": 1284, "d7": 8931, "d30": 37220 },
+    "uv": { "today": 263, "d7": 1512, "d30": 5401 }
+  },
+  "leaderboard": {
+    "buildings": [{ "building_id": "Q10", "name": "综合教学楼", "hits": 612 }],
+    "rooms": [{ "room_id": "0899", "name": "F126", "hits": 148 }],
+    "keywords": [{ "text": "综合楼", "hits": 94 }]
+  },
+  "peaks": {
+    "heatmap": [[0, 0, 3, 12, "..."], "...24 列 × 7 行"],
+    "top": [{ "weekday": 1, "hour": 8, "share": 0.11 }]
+  },
+  "trend": [{ "day": "2026-10-21", "pv": 1180 }],
+  "node_distribution": [{ "node": "01", "hits": 4210 }]
+}
+```
+
+- 只含状态、时间与计数：不返回 `error_code`、`error_message`、账号、页面片段。
+- 访问统计只给聚合数字与 Top 10 榜单，不提供逐条查询记录与个人维度历史。
+- 无当前版本时返回 200 与 `release: null` 加 `empty: true`，页面显示「暂无数据」。
+- 占用率口径与查询一致：`available` 按字典投影，未知与复合计入已占用。
 
 参数约束：`date_offset` 0..10；`building` 空表示全部；`start_node`/`end_node` 01..12 且起点不晚于终点；`limit` 1..200 默认 50；`offset ≥ 0`。服务端不感知时钟，默认区间只在前端（Requirement 19）。
 
@@ -275,6 +321,32 @@ CREATE TABLE sync_task (
 CREATE UNIQUE INDEX sync_task_week ON sync_task (run_id, building_id, week) WHERE kind = 'week_matrix';
 CREATE UNIQUE INDEX sync_task_cell ON sync_task (run_id, building_id, room_id, weekday, block) WHERE kind = 'cell_detail';
 
+-- 访问统计：只存小时级计数与 UV 去重摘要，保留 90 天
+CREATE TABLE stat_hour (
+  day date NOT NULL, hour smallint NOT NULL,
+  weekday smallint NOT NULL, pv integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, hour));
+
+CREATE TABLE stat_visitor (
+  day date NOT NULL, hour smallint NOT NULL, visitor_hash text NOT NULL,
+  PRIMARY KEY (day, hour, visitor_hash));
+
+CREATE TABLE stat_building_day (
+  day date NOT NULL, building_id text NOT NULL, hits integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, building_id));
+
+CREATE TABLE stat_room_day (
+  day date NOT NULL, room_id text NOT NULL, hits integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, room_id));
+
+CREATE TABLE stat_keyword_day (
+  day date NOT NULL, keyword text NOT NULL, hits integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, keyword));
+
+CREATE TABLE stat_node_day (
+  day date NOT NULL, node char(2) NOT NULL, hits integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, node));
+
 CREATE TABLE alert_log (dedupe_key text PRIMARY KEY, last_sent_at timestamptz NOT NULL, send_count integer NOT NULL DEFAULT 1);
 CREATE TABLE schema_migration (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
 ```
@@ -297,6 +369,13 @@ CREATE TABLE schema_migration (version text PRIMARY KEY, applied_at timestamptz 
 10. **服务端无时钟依赖**：查询路径不读取当前时间用于节次判定；默认区间只属于前端。
 11. **密钥不可重生**：不存在覆盖加密密钥的接口；初始化只生成一次。
 12. **状态与标记分离**：`status` 取值恒为五档之一；归属冲突只体现在 `attr_conflict_count`/`has_attr_conflict`。
+13. **大屏只读**：`/api/screen` 不接受写操作，响应不含错误码、错误原文与账号；失败只呈现状态与时间。
+14. **分布口径一致**：大屏占用率与公开查询用同一字典投影，未知与复合计入已占用。
+15. **大屏缓存 30 秒**：同一时间窗内的重复轮询复用同一份聚合结果。
+16. **统计无个人痕迹**：统计表只含计数与 `visitor_hash`；IP、User-Agent、来源页、查询原文一律不入库。
+17. **UV 日切去重**：同一 `(day, visitor_hash)` 只贡献一次，换日重新计；按小时拆分的 UV 由 `stat_visitor` 行数求得。
+18. **记账不阻断查询**：统计写入异步批量执行，失败只记日志，查询响应与状态码不受影响。
+19. **统计保留 90 天**：按日清理 `day < today-90` 的记录，清理失败不影响查询与采集。
 
 ## Error Handling
 
@@ -325,7 +404,10 @@ CREATE TABLE schema_migration (version text PRIMARY KEY, applied_at timestamptz 
 - **规划与续跑**：给定窗口与矩阵结果，断言任务清单的唯一性、必需/可选分类、从第一个 pending 继续、失败不重试。
 - **发布**：事务内失败回滚、只留两版、极旧版本删除后 `collect_run.release_id` 为空、归属快照随版本切换。
 - **仓储集成**：对真实 PostgreSQL 17 跑迁移与查询（docker 起库），覆盖唯一索引与部分索引行为。
-- **契约测试**：公开三个端点与管理工作流的请求/响应形状、错误码、越界参数。
+- **契约测试**：公开四个端点（含大屏）与管理工作流的请求/响应形状、错误码、越界参数。
+- **大屏聚合**：分布计数与查询口径一致（CP14）、缓存 30 秒内复用（CP15）、无版本时返回空态而非 500。
+- **统计记账**：假时钟下 PV/UV 累加正确（CP17）、记账失败不影响查询（CP18）、90 天清理（CP19）、表内不出现 IP/UA（CP16）。
+- **排行榜与高峰**：Top 10 排序稳定（同分按名称）、关键词归一化与截断、星期 × 小时热力与峰值占比求和为 1。
 - **前端**：`vitest` 覆盖时段默认、日期换算、空态分支、同名房号后缀；`tsc --noEmit` + `eslint`；关键页面用组件测试而非快照。
 - **回归红线**：`dataListHeader` 误匹配、明细按 `tab1` 找字段、`available` 写死、过期 running 不收敛——每条都要有能复现旧缺陷的用例。
 
