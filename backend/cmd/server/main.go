@@ -76,15 +76,49 @@ func run() int {
 		"version", version,
 	)
 
-	// 查询服务只拿到「按日期查学期周」这一项能力，连接池被闭包挡在里面。
-	queries := query.New(func(ctx context.Context, date time.Time) (model.TermWeek, bool, error) {
+	// 查询服务只拿两项能力：按日期查学期周与按条件查空教室；连接池被闭包挡在里面。
+	weekLookup := func(ctx context.Context, date time.Time) (model.TermWeek, bool, error) {
 		return store.TermWeekAt(ctx, pool, date)
-	})
+	}
+	availabilityLookup := func(ctx context.Context, filter query.AvailabilityFilter) (query.AvailabilityPage, error) {
+		page, err := store.Availability(ctx, pool, store.AvailabilityFilter{
+			Term:      filter.Term,
+			Week:      filter.Week,
+			Weekday:   filter.Weekday,
+			StartNode: filter.StartNode,
+			EndNode:   filter.EndNode,
+			NodeCount: filter.NodeCount,
+			Building:  filter.Building,
+			Keyword:   filter.Keyword,
+			Limit:     filter.Limit,
+			Offset:    filter.Offset,
+		})
+		if err != nil {
+			return query.AvailabilityPage{}, err
+		}
+
+		rooms := make([]query.AvailabilityRoom, 0, len(page.Rooms))
+		for _, room := range page.Rooms {
+			rooms = append(rooms, query.AvailabilityRoom{
+				RoomID:       room.ID,
+				Name:         room.Name,
+				BuildingID:   room.BuildingID,
+				BuildingName: room.BuildingName,
+			})
+		}
+		return query.AvailabilityPage{
+			Total:              page.Total,
+			Rooms:              rooms,
+			HasRelease:         page.HasRelease,
+			WeekHasObservation: page.WeekHasObservation,
+		}, nil
+	}
+	queries := query.New(weekLookup, availabilityLookup)
 
 	// HTTP 服务在独立 goroutine 里跑，主流程只负责等待终止信号。
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.New(log, pool, queries).Handler(),
+		Handler:           api.New(log, pool, queries, queries).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

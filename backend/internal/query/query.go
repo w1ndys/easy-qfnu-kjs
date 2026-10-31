@@ -27,12 +27,13 @@ type ContextInfo struct {
 
 // Service 是公开查询入口，持有数据访问依赖。
 type Service struct {
-	weekLookup WeekLookup // 按日期取学期周，由装配层注入
+	weekLookup   WeekLookup         // 按日期取学期周，由装配层注入
+	availability AvailabilityLookup // 空教室读取，由装配层注入
 }
 
 // New 组装查询服务。
-func New(weekLookup WeekLookup) *Service {
-	return &Service{weekLookup: weekLookup}
+func New(weekLookup WeekLookup, availability AvailabilityLookup) *Service {
+	return &Service{weekLookup: weekLookup, availability: availability}
 }
 
 // Context 计算某一天属于哪个学期第几周、星期几、是否在教学周内。

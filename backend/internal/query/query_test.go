@@ -56,7 +56,7 @@ func TestContextWeekday(t *testing.T) {
 			if err != nil {
 				t.Fatalf("解析时间失败: %v", err)
 			}
-			svc := New(fakeLookup(5, "2026-2027-1", "2026-10-19"))
+			svc := New(fakeLookup(5, "2026-2027-1", "2026-10-19"), nil)
 			info, err := svc.Context(t.Context(), now)
 			if err != nil {
 				t.Fatalf("期望成功，实际 err=%v", err)
@@ -77,7 +77,7 @@ func TestContextWeekday(t *testing.T) {
 // TestContextOutsideTerm 覆盖不在学期周的日期：返回空字段而不是错误。
 func TestContextOutsideTerm(t *testing.T) {
 	now := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
-	info, err := New(missingLookup()).Context(t.Context(), now)
+	info, err := New(missingLookup(), nil).Context(t.Context(), now)
 	if err != nil {
 		t.Fatalf("期望成功，实际 err=%v", err)
 	}
@@ -92,7 +92,7 @@ func TestContextOutsideTerm(t *testing.T) {
 // TestContextError 覆盖数据访问失败：错误原样上抛。
 func TestContextError(t *testing.T) {
 	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC)
-	if _, err := New(brokenLookup()).Context(t.Context(), now); err == nil {
+	if _, err := New(brokenLookup(), nil).Context(t.Context(), now); err == nil {
 		t.Fatal("期望返回错误，实际 nil")
 	}
 }
