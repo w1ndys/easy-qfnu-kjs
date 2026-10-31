@@ -13,6 +13,11 @@ const ViewDay = "day"
 // 它属于查询侧的兜底标签，不登记进版本化字典：字典只描述真实存在的格子状态。
 const NodeLabelNoData = "无数据"
 
+// HintDayNoData 是 day 视图独有的第四档页顶提示：房间可归属、该周有观测，
+// 但这间教室在这一天的全部小节都没有观测，整页没有一格可读。
+// 它不进空教室的三档口径：空教室没有「单日」这一层，多一档只会让前端多一个死分支。
+const HintDayNoData = "day_no_data"
+
 // DayParams 是全天状态查询的业务入参。
 type DayParams struct {
 	DateOffset int    // 目标日期相对今天的天数，业务日期按 Asia/Shanghai 解释
@@ -32,7 +37,7 @@ type DayNode struct {
 }
 
 // DayResult 是 /api/query?view=day 的 data 载荷。
-// 房间字段沿用空教室的命名，避免两套契约；hint 与 availability 共用同一套三档语义。
+// 房间字段沿用空教室的命名，避免两套契约；hint 前三档沿用空教室口径，第四档是 day 独有的「该日无数据」。
 type DayResult struct {
 	RoomID       string            `json:"room_id"`        // 请求指定的房间身份
 	Name         string            `json:"name"`           // 房间展示名；房间不可归属时为空
@@ -75,7 +80,7 @@ type DayRoom struct {
 type DayLookup func(ctx context.Context, filter DayFilter) (DayPage, error)
 
 // DayStatus 返回某间教室某一天 12 小节的逐节状态。
-// 空态（无版本、学期外、该周无观测、房间不可归属）一律成功返回，由 hint 说明原因。
+// 空态（无版本、学期外、该周无观测、房间不可归属、该日全无观测）一律成功返回，由 hint 说明原因。
 func (s *Service) DayStatus(ctx context.Context, now time.Time, params DayParams) (DayResult, error) {
 	date := targetDate(now, params.DateOffset)
 	result := DayResult{
@@ -138,8 +143,11 @@ func dayNodes(nodes []DayNode) []DayNode {
 	return out
 }
 
-// dayHint 按空态原因选择页顶提示，沿用空教室的三档口径。
-// 房间可归属且该周有观测时不给提示：个别小节缺观测由逐节「无数据」表达，不算整页空态。
+// dayHint 按空态原因选择页顶提示：前三档沿用空教室口径，第四档是 day 独有的「该日无数据」。
+// 顺序即优先级：没有可查的版本或周次时轮不到房间与逐节日志发言，
+// 房间不可归属时也不去解释一个不存在的房间当天有没有数据。
+// 房间可归属且该周有观测时，只有整日全部小节都没有观测才给提示；
+// 个别小节缺观测由逐节「无数据」表达，不算整页空态。
 func dayHint(page DayPage) *AvailabilityHint {
 	switch {
 	case !page.HasRelease:
@@ -148,7 +156,24 @@ func dayHint(page DayPage) *AvailabilityHint {
 		return &AvailabilityHint{Code: HintWeekNoSchedule, Message: "该周疑似无排课"}
 	case page.Room == nil:
 		return &AvailabilityHint{Code: HintNoMatch, Message: "没有符合条件的教室"}
+	case dayHasNoData(page.Nodes):
+		return &AvailabilityHint{Code: HintDayNoData, Message: "该日无数据"}
 	default:
 		return nil
 	}
+}
+
+// dayHasNoData 判定这一天是否整日无观测：节点集合非空，且每一节都 has_data=false。
+// 空集合不算「该日无数据」：那说明轴上根本没取到节点，不是「这一天没课」，
+// 不能让提示替一份缺失的轴背锅。
+func dayHasNoData(nodes []DayNode) bool {
+	if len(nodes) == 0 {
+		return false
+	}
+	for _, node := range nodes {
+		if node.HasData {
+			return false
+		}
+	}
+	return true
 }

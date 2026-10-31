@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/query"
 )
 
@@ -473,6 +475,166 @@ func TestQueryDayEmptyStateIsOKWithHint(t *testing.T) {
 	}
 	if got.Data.Hint == nil || got.Data.Hint.Code != query.HintNoMatch {
 		t.Fatalf("期望提示 %q，实际 %+v", query.HintNoMatch, got.Data.Hint)
+	}
+}
+
+// dayStorageNodes 造 12 节存储层节点，missing 里的小节编号标为无观测。
+func dayStorageNodes(missing ...string) []query.DayNode {
+	skip := make(map[string]bool, len(missing))
+	for _, node := range missing {
+		skip[node] = true
+	}
+	nodes := make([]query.DayNode, 0, 12)
+	for i := 1; i <= 12; i++ {
+		code := fmt.Sprintf("%02d", i)
+		node := query.DayNode{
+			Node: code, Block: "0102",
+			StateKey: "free", Label: "空闲", Available: true, HasData: true,
+		}
+		if skip[code] {
+			node.StateKey, node.Label, node.Available, node.HasData = "", "", false, false
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes
+}
+
+// dayStorageNodesAllMissing 造 12 节全无观测的存储层节点。
+func dayStorageNodesAllMissing() []query.DayNode {
+	codes := make([]string, 0, 12)
+	for i := 1; i <= 12; i++ {
+		codes = append(codes, fmt.Sprintf("%02d", i))
+	}
+	return dayStorageNodes(codes...)
+}
+
+// TestQueryDayHintForEmptyState 用真实的 query 服务装配 day 分支，
+// 覆盖「query 判空态 → api 序列化」的完整链路，而不是只验证替身透传：
+// 该日全缺 → day_no_data；部分缺 → 无 hint；该周无观测 → week_no_schedule；
+// 房间不可归属 → no_match；无版本 → no_data。
+func TestQueryDayHintForEmptyState(t *testing.T) {
+	weekInCalendar := func(_ context.Context, _ time.Time) (model.TermWeek, bool, error) {
+		return model.TermWeek{
+			Term:       "2026-2027-1",
+			Week:       5,
+			Monday:     time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC),
+			InCalendar: true,
+		}, true, nil
+	}
+	room := &query.DayRoom{RoomID: "0899", Name: "F126", BuildingID: "Q10", BuildingName: "综合教学楼"}
+
+	cases := []struct {
+		name      string
+		page      query.DayPage
+		wantCode  string // 空串表示响应里不该出现 hint
+		wantMsg   string
+		wantNodes int
+	}{
+		{
+			name: "该日全缺给出该日无数据",
+			page: query.DayPage{
+				HasRelease: true, WeekHasObservation: true,
+				Room: room, Nodes: dayStorageNodesAllMissing(),
+			},
+			wantCode: query.HintDayNoData, wantMsg: "该日无数据", wantNodes: 12,
+		},
+		{
+			name: "部分缺不给提示",
+			page: query.DayPage{
+				HasRelease: true, WeekHasObservation: true,
+				Room: room, Nodes: dayStorageNodes("02", "11"),
+			},
+			wantNodes: 12,
+		},
+		{
+			name: "该周无观测仍是 week_no_schedule",
+			page: query.DayPage{
+				HasRelease: true, WeekHasObservation: false,
+				Room: room, Nodes: dayStorageNodesAllMissing(),
+			},
+			wantCode: query.HintWeekNoSchedule, wantMsg: "该周疑似无排课", wantNodes: 12,
+		},
+		{
+			name:      "房间不可归属仍是 no_match",
+			page:      query.DayPage{HasRelease: true, WeekHasObservation: true},
+			wantCode:  query.HintNoMatch,
+			wantMsg:   "没有符合条件的教室",
+			wantNodes: 0,
+		},
+		{
+			name:      "无版本仍是 no_data",
+			page:      query.DayPage{HasRelease: false},
+			wantCode:  query.HintNoData,
+			wantMsg:   "没有已发布的数据",
+			wantNodes: 0,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			page := c.page
+			// 真实查询服务 + 预设的存储结果：hint 由 query 层判定，api 只负责序列化。
+			srv := New(quietLogger(), nil, nil, nil, query.New(weekInCalendar, nil,
+				func(_ context.Context, _ query.DayFilter) (query.DayPage, error) {
+					return page, nil
+				}))
+			srv.clock = fixedQueryClock
+
+			rec := serveQuery(t, srv, url.Values{"view": {"day"}, "room_id": {"0899"}})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("空态期望 200，实际 %d，body=%s", rec.Code, rec.Body.String())
+			}
+
+			var got struct {
+				Code int `json:"code"`
+				Data struct {
+					RoomID string                  `json:"room_id"`
+					Nodes  []json.RawMessage       `json:"nodes"`
+					Hint   *query.AvailabilityHint `json:"hint"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("响应不是合法 JSON: %v, body=%s", err, rec.Body.String())
+			}
+			if got.Code != 0 {
+				t.Fatalf("空态业务码期望 0，实际 %d", got.Code)
+			}
+			if got.Data.RoomID != "0899" {
+				t.Fatalf("应回显请求房号，实际 %q", got.Data.RoomID)
+			}
+			// nodes 必须是数组而不是 null，前端不该为两种空值写两套兜底。
+			if got.Data.Nodes == nil {
+				t.Fatalf("nodes 必须是空数组而不是 null，body=%s", rec.Body.String())
+			}
+			if len(got.Data.Nodes) != c.wantNodes {
+				t.Fatalf("节点数期望 %d，实际 %d", c.wantNodes, len(got.Data.Nodes))
+			}
+
+			if c.wantCode == "" {
+				if got.Data.Hint != nil {
+					t.Fatalf("期望不给提示，实际 %+v", got.Data.Hint)
+				}
+				return
+			}
+			if got.Data.Hint == nil || got.Data.Hint.Code != c.wantCode {
+				t.Fatalf("期望提示 %q，实际 %+v", c.wantCode, got.Data.Hint)
+			}
+			if got.Data.Hint.Message != c.wantMsg {
+				t.Fatalf("提示文案不符: 实际 %q，期望 %q", got.Data.Hint.Message, c.wantMsg)
+			}
+			// 整日无数据时，逐节仍按无数据形状下发，不能因为给了 hint 就把格子抹掉。
+			if c.wantCode == query.HintDayNoData {
+				for i, raw := range got.Data.Nodes {
+					var node query.DayNode
+					if err := json.Unmarshal(raw, &node); err != nil {
+						t.Fatalf("第 %d 节不是合法对象: %v", i+1, err)
+					}
+					if node.HasData || node.StateKey != "" || node.Label != query.NodeLabelNoData || node.Available {
+						t.Fatalf("第 %d 节应无数据，实际 %+v", i+1, node)
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -127,6 +127,123 @@ func TestDayStatusMarksMissingNodesAsNoData(t *testing.T) {
 	}
 }
 
+// dayAllMissing 造出 01..12 全部缺观测的节点集合。
+func dayAllMissing() []DayNode {
+	missing := make(map[string]bool, 12)
+	for i := 1; i <= 12; i++ {
+		missing[nodeCode(i)] = true
+	}
+	return dayFixtureNodes(missing)
+}
+
+// TestDayStatusAllNodesMissingCarriesDayNoDataHint 覆盖 PRD 3.6 的「该日无数据」整页空态：
+// 房间可归属、该周有观测，但这间教室这一天 12 节全无观测，要给出明确的第四档提示，
+// 而不是让用户对着一屏「无数据」猜是没排课还是查询失败。
+func TestDayStatusAllNodesMissingCarriesDayNoDataHint(t *testing.T) {
+	fake := &fakeDay{page: DayPage{
+		HasRelease:         true,
+		WeekHasObservation: true,
+		Room:               dayFixtureRoom(),
+		Nodes:              dayAllMissing(),
+	}}
+	svc := New(availabilityWeekLookup(nil), nil, fake.lookup)
+
+	got, err := svc.DayStatus(t.Context(), availabilityNow(), DayParams{RoomID: "0899"})
+	if err != nil {
+		t.Fatalf("空态不应返回错误，实际 err=%v", err)
+	}
+	if got.Hint == nil || got.Hint.Code != HintDayNoData {
+		t.Fatalf("期望提示 %q，实际 %+v", HintDayNoData, got.Hint)
+	}
+	if got.Hint.Message != "该日无数据" {
+		t.Fatalf("提示文案不符: %q", got.Hint.Message)
+	}
+	// 提示归提示，轴仍是已知的：12 节照常返回，逐节仍标无数据。
+	if len(got.Nodes) != 12 {
+		t.Fatalf("节点数期望 12，实际 %d", len(got.Nodes))
+	}
+	for _, node := range got.Nodes {
+		if node.HasData || node.StateKey != "" || node.Label != NodeLabelNoData || node.Available {
+			t.Fatalf("整日无观测时每节都应无数据，实际 %+v", node)
+		}
+	}
+	// 房间信息不能因为整日无观测就丢：前端要显示「哪间教室」「哪天」。
+	if got.Name != "F126" || got.BuildingID != "Q10" || got.BuildingName != "综合教学楼" {
+		t.Fatalf("房间字段不符: %+v", got)
+	}
+}
+
+// TestDayStatusHintPriority 断言 day 视图四档提示的优先级与边界：
+// 前三档不能被 day_no_data 抢走，部分小节有观测时也不能给整页空态提示。
+func TestDayStatusHintPriority(t *testing.T) {
+	cases := []struct {
+		name    string
+		page    DayPage
+		want    string // 空串表示不给提示
+		wantMsg string
+	}{
+		{
+			name: "无版本优先于其余空态",
+			page: DayPage{HasRelease: false, WeekHasObservation: true, Room: dayFixtureRoom()},
+			want: HintNoData, wantMsg: "没有已发布的数据",
+		},
+		{
+			name: "该周无观测仍走 week_no_schedule",
+			page: DayPage{HasRelease: true, WeekHasObservation: false, Room: dayFixtureRoom(), Nodes: dayAllMissing()},
+			want: HintWeekNoSchedule, wantMsg: "该周疑似无排课",
+		},
+		{
+			name: "房间不可归属仍是 no_match",
+			page: DayPage{HasRelease: true, WeekHasObservation: true, Room: nil},
+			want: HintNoMatch, wantMsg: "没有符合条件的教室",
+		},
+		{
+			name: "全部小节无观测才给 day_no_data",
+			page: DayPage{HasRelease: true, WeekHasObservation: true, Room: dayFixtureRoom(), Nodes: dayAllMissing()},
+			want: HintDayNoData, wantMsg: "该日无数据",
+		},
+		{
+			name: "部分小节有观测不给提示",
+			page: DayPage{
+				HasRelease:         true,
+				WeekHasObservation: true,
+				Room:               dayFixtureRoom(),
+				Nodes:              dayFixtureNodes(map[string]bool{"02": true, "09": true}),
+			},
+			want: "",
+		},
+		{
+			name: "轴缺失不算该日无数据",
+			page: DayPage{HasRelease: true, WeekHasObservation: true, Room: dayFixtureRoom()},
+			want: "",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeDay{page: c.page}
+			svc := New(availabilityWeekLookup(nil), nil, fake.lookup)
+
+			got, err := svc.DayStatus(t.Context(), availabilityNow(), DayParams{RoomID: "0899"})
+			if err != nil {
+				t.Fatalf("空态不应返回错误，实际 err=%v", err)
+			}
+			if c.want == "" {
+				if got.Hint != nil {
+					t.Fatalf("期望不给提示，实际 %+v", got.Hint)
+				}
+				return
+			}
+			if got.Hint == nil || got.Hint.Code != c.want {
+				t.Fatalf("期望提示 %q，实际 %+v", c.want, got.Hint)
+			}
+			if got.Hint.Message != c.wantMsg {
+				t.Fatalf("提示文案不符: 实际 %q，期望 %q", got.Hint.Message, c.wantMsg)
+			}
+		})
+	}
+}
+
 // TestDayStatusBuildingMismatchReturnsEmpty 覆盖 Requirement 16.3：
 // 房间不属于所选楼时按空态处理，不返回别的楼的数据。
 func TestDayStatusBuildingMismatchReturnsEmpty(t *testing.T) {
