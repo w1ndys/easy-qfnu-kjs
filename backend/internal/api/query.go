@@ -12,16 +12,21 @@ import (
 	"github.com/w1ndys/easy-qfnu-kjs/internal/query"
 )
 
-// queryAvailability 处理 /api/query 的空教室分支。
-// 9.3 只实现 availability；view 枚举与日期窗口的完整校验留给 9.5。
-func (s *Server) queryAvailability(w http.ResponseWriter, r *http.Request) {
-	view := strings.TrimSpace(r.URL.Query().Get("view"))
-	// 缺省 view 暂按 availability 处理；day 与其他值在 9.4/9.5 补齐前先按参数错误挡住。
-	if view != "" && view != query.ViewAvailability {
+// query 按 view 分发 /api/query：缺省与 availability 走空教室，day 走全天状态。
+// view 枚举与日期窗口的完整校验留给 9.5。
+func (s *Server) query(w http.ResponseWriter, r *http.Request) {
+	switch view := strings.TrimSpace(r.URL.Query().Get("view")); view {
+	case "", query.ViewAvailability:
+		s.queryAvailability(w, r)
+	case query.ViewDay:
+		s.queryDay(w, r)
+	default:
 		s.fail(w, http.StatusBadRequest, 40001, "参数错误")
-		return
 	}
+}
 
+// queryAvailability 处理 /api/query 的空教室分支。
+func (s *Server) queryAvailability(w http.ResponseWriter, r *http.Request) {
 	params, err := parseAvailabilityParams(r)
 	if err != nil {
 		s.fail(w, http.StatusBadRequest, 40001, err.Error())
@@ -47,6 +52,56 @@ func (s *Server) queryAvailability(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ok(w, result)
+}
+
+// queryDay 处理 /api/query 的全天状态分支：一天一间教室的 12 小节状态。
+func (s *Server) queryDay(w http.ResponseWriter, r *http.Request) {
+	params, err := parseDayParams(r)
+	if err != nil {
+		s.fail(w, http.StatusBadRequest, 40001, err.Error())
+		return
+	}
+
+	if s.day == nil {
+		s.log.Error("全天状态查询未装配")
+		s.fail(w, http.StatusInternalServerError, 50000, "内部错误")
+		return
+	}
+
+	result, err := s.day.DayStatus(r.Context(), s.currentTime(), params)
+	// 与空教室一致：客户端断开不写响应、不打 ERROR。
+	if errors.Is(err, context.Canceled) {
+		s.log.Info("客户端已断开，放弃本次响应")
+		return
+	}
+	if err != nil {
+		s.log.Error("全天状态查询失败", "err", err)
+		s.fail(w, http.StatusInternalServerError, 50000, "内部错误")
+		return
+	}
+	s.ok(w, result)
+}
+
+// parseDayParams 只解析全天状态需要的参数；日期窗口与 view 枚举的完整校验由 9.5 接管。
+func parseDayParams(r *http.Request) (query.DayParams, error) {
+	values := r.URL.Query()
+
+	dateOffset, err := parseOptionalInt(values.Get("date_offset"), 0)
+	if err != nil {
+		return query.DayParams{}, fmt.Errorf("date_offset 必须是整数")
+	}
+
+	roomID := strings.TrimSpace(values.Get("room_id"))
+	// 全天状态必须指向一间确定的教室；缺房间标识时无法返回任何有意义的格子。
+	if roomID == "" {
+		return query.DayParams{}, fmt.Errorf("room_id 不能为空")
+	}
+
+	return query.DayParams{
+		DateOffset: dateOffset,
+		RoomID:     roomID,
+		Building:   strings.TrimSpace(values.Get("building")),
+	}, nil
 }
 
 // parseAvailabilityParams 做本任务需要的最小参数解析；越界规则由 9.5 统一接管。

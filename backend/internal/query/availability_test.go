@@ -47,7 +47,7 @@ func availabilityNow() time.Time {
 // TestAvailabilityPassesRangeAndPagingToStore 断言区间、楼、关键词与分页原样下传。
 func TestAvailabilityPassesRangeAndPagingToStore(t *testing.T) {
 	fake := &fakeAvailability{page: AvailabilityPage{Total: 1}}
-	svc := New(availabilityWeekLookup(nil), fake.lookup)
+	svc := New(availabilityWeekLookup(nil), fake.lookup, nil)
 
 	_, err := svc.Availability(t.Context(), availabilityNow(), AvailabilityParams{
 		DateOffset: 2,
@@ -83,7 +83,7 @@ func TestAvailabilityPassesRangeAndPagingToStore(t *testing.T) {
 func TestAvailabilityDateOffsetLandsOnTargetDate(t *testing.T) {
 	var gotDate time.Time
 	fake := &fakeAvailability{page: AvailabilityPage{Total: 0}}
-	svc := New(availabilityWeekLookup(&gotDate), fake.lookup)
+	svc := New(availabilityWeekLookup(&gotDate), fake.lookup, nil)
 
 	if _, err := svc.Availability(t.Context(), availabilityNow(), AvailabilityParams{DateOffset: 2}); err != nil {
 		t.Fatalf("期望成功，实际 err=%v", err)
@@ -105,7 +105,7 @@ func TestAvailabilityMapsRoomAndTotal(t *testing.T) {
 		HasRelease:         true,
 		WeekHasObservation: true,
 	}}
-	svc := New(availabilityWeekLookup(nil), fake.lookup)
+	svc := New(availabilityWeekLookup(nil), fake.lookup, nil)
 
 	got, err := svc.Availability(t.Context(), availabilityNow(), AvailabilityParams{StartNode: "01", EndNode: "03", NodeCount: 3})
 	if err != nil {
@@ -136,7 +136,7 @@ func TestAvailabilityEmptyResultCarriesWeekNoScheduleHint(t *testing.T) {
 		HasRelease:         true,
 		WeekHasObservation: false,
 	}}
-	svc := New(availabilityWeekLookup(nil), fake.lookup)
+	svc := New(availabilityWeekLookup(nil), fake.lookup, nil)
 
 	got, err := svc.Availability(t.Context(), availabilityNow(), AvailabilityParams{StartNode: "01", EndNode: "03", NodeCount: 3})
 	if err != nil {
@@ -164,7 +164,7 @@ func TestAvailabilityEmptyResultCarriesNoMatchHint(t *testing.T) {
 		HasRelease:         true,
 		WeekHasObservation: true,
 	}}
-	svc := New(availabilityWeekLookup(nil), fake.lookup)
+	svc := New(availabilityWeekLookup(nil), fake.lookup, nil)
 
 	got, err := svc.Availability(t.Context(), availabilityNow(), AvailabilityParams{StartNode: "01", EndNode: "03", NodeCount: 3})
 	if err != nil {
@@ -179,7 +179,7 @@ func TestAvailabilityEmptyResultCarriesNoMatchHint(t *testing.T) {
 // 不返回 40401，而是空列表 + 无数据提示，交给 9.5 再做统一空态。
 func TestAvailabilityNoReleaseReturnsEmptyDataHint(t *testing.T) {
 	fake := &fakeAvailability{page: AvailabilityPage{Total: 0, HasRelease: false}}
-	svc := New(availabilityWeekLookup(nil), fake.lookup)
+	svc := New(availabilityWeekLookup(nil), fake.lookup, nil)
 
 	got, err := svc.Availability(t.Context(), availabilityNow(), AvailabilityParams{StartNode: "01", EndNode: "03", NodeCount: 3})
 	if err != nil {
@@ -193,7 +193,7 @@ func TestAvailabilityNoReleaseReturnsEmptyDataHint(t *testing.T) {
 // TestAvailabilityOutsideCalendarReturnsEmptyHint 覆盖日期不在学期周：不查存储，直接空态。
 func TestAvailabilityOutsideCalendarReturnsEmptyHint(t *testing.T) {
 	fake := &fakeAvailability{page: AvailabilityPage{Total: 1}}
-	svc := New(missingLookup(), fake.lookup)
+	svc := New(missingLookup(), fake.lookup, nil)
 
 	got, err := svc.Availability(t.Context(), availabilityNow(), AvailabilityParams{StartNode: "01", EndNode: "03", NodeCount: 3})
 	if err != nil {
@@ -213,7 +213,7 @@ func TestAvailabilityOutsideCalendarReturnsEmptyHint(t *testing.T) {
 // TestAvailabilityKeepsTotalWhenPageEmpty 覆盖分页越界：总数仍按分页前返回，且不误判为空态。
 func TestAvailabilityKeepsTotalWhenPageEmpty(t *testing.T) {
 	fake := &fakeAvailability{page: AvailabilityPage{Total: 3, Rooms: nil, HasRelease: true, WeekHasObservation: true}}
-	svc := New(availabilityWeekLookup(nil), fake.lookup)
+	svc := New(availabilityWeekLookup(nil), fake.lookup, nil)
 
 	got, err := svc.Availability(t.Context(), availabilityNow(), AvailabilityParams{StartNode: "01", EndNode: "03", NodeCount: 3, Limit: 50, Offset: 99})
 	if err != nil {
@@ -234,13 +234,13 @@ func TestAvailabilityKeepsTotalWhenPageEmpty(t *testing.T) {
 func TestAvailabilityErrorPropagation(t *testing.T) {
 	boom := errors.New("boom")
 
-	if _, err := New(brokenLookup(), (&fakeAvailability{}).lookup).Availability(
+	if _, err := New(brokenLookup(), (&fakeAvailability{}).lookup, nil).Availability(
 		t.Context(), availabilityNow(), AvailabilityParams{StartNode: "01", EndNode: "03", NodeCount: 3}); err == nil {
 		t.Fatal("学期周错误应上抛，实际 nil")
 	}
 
 	fake := &fakeAvailability{err: boom}
-	if _, err := New(availabilityWeekLookup(nil), fake.lookup).Availability(
+	if _, err := New(availabilityWeekLookup(nil), fake.lookup, nil).Availability(
 		t.Context(), availabilityNow(), AvailabilityParams{StartNode: "01", EndNode: "03", NodeCount: 3}); !errors.Is(err, boom) {
 		t.Fatalf("存储错误应上抛，实际 %v", err)
 	}

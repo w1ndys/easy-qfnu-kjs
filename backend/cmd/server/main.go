@@ -113,12 +113,52 @@ func run() int {
 			WeekHasObservation: page.WeekHasObservation,
 		}, nil
 	}
-	queries := query.New(weekLookup, availabilityLookup)
+	dayLookup := func(ctx context.Context, filter query.DayFilter) (query.DayPage, error) {
+		page, err := store.DayStatus(ctx, pool, store.DayFilter{
+			Term:     filter.Term,
+			Week:     filter.Week,
+			Weekday:  filter.Weekday,
+			RoomID:   filter.RoomID,
+			Building: filter.Building,
+		})
+		if err != nil {
+			return query.DayPage{}, err
+		}
+
+		nodes := make([]query.DayNode, 0, len(page.Nodes))
+		for _, node := range page.Nodes {
+			nodes = append(nodes, query.DayNode{
+				Node:      node.Node,
+				Block:     node.Block,
+				StateKey:  node.StateKey,
+				Label:     node.Label,
+				Available: node.Available,
+				HasData:   node.HasData,
+			})
+		}
+
+		result := query.DayPage{
+			HasRelease:         page.HasRelease,
+			WeekHasObservation: page.WeekHasObservation,
+			Nodes:              nodes,
+		}
+		// 房间不可归属时保持 nil，让查询层拿到明确的空态信号。
+		if page.Room != nil {
+			result.Room = &query.DayRoom{
+				RoomID:       page.Room.ID,
+				Name:         page.Room.Name,
+				BuildingID:   page.Room.BuildingID,
+				BuildingName: page.Room.BuildingName,
+			}
+		}
+		return result, nil
+	}
+	queries := query.New(weekLookup, availabilityLookup, dayLookup)
 
 	// HTTP 服务在独立 goroutine 里跑，主流程只负责等待终止信号。
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.New(log, pool, queries, queries).Handler(),
+		Handler:           api.New(log, pool, queries, queries, queries).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

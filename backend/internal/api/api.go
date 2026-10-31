@@ -26,22 +26,29 @@ type AvailabilityProvider interface {
 	Availability(ctx context.Context, now time.Time, params query.AvailabilityParams) (query.AvailabilityResult, error)
 }
 
+// DayProvider 提供全天状态查询；由 query 服务实现，测试里可用替身。
+type DayProvider interface {
+	DayStatus(ctx context.Context, now time.Time, params query.DayParams) (query.DayResult, error)
+}
+
 // Server 持有 API 需要的依赖，公开与管理路由都挂到它上面。
 type Server struct {
 	log          *slog.Logger         // 结构化日志器
 	health       Pinger               // 依赖探活，通常是连接池
 	ctxSvc       ContextProvider      // 页面上下文查询
 	availability AvailabilityProvider // 空教室查询
+	day          DayProvider          // 全天状态查询
 	clock        func() time.Time     // 时间来源，测试可替换
 }
 
 // New 组装 API 依赖；路由在 Handler 里一次性挂好。
-func New(log *slog.Logger, health Pinger, ctxSvc ContextProvider, availability AvailabilityProvider) *Server {
+func New(log *slog.Logger, health Pinger, ctxSvc ContextProvider, availability AvailabilityProvider, day DayProvider) *Server {
 	return &Server{
 		log:          log,
 		health:       health,
 		ctxSvc:       ctxSvc,
 		availability: availability,
+		day:          day,
 		clock:        time.Now,
 	}
 }
@@ -52,7 +59,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("GET /api/context", s.contextInfo)
-	mux.HandleFunc("GET /api/query", s.queryAvailability)
+	mux.HandleFunc("GET /api/query", s.query)
 	return mux
 }
 

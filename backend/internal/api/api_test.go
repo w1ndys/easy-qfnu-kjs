@@ -35,7 +35,7 @@ func quietLogger() *slog.Logger {
 
 // TestHealthz 覆盖存活探针：不查依赖，恒返回 200。
 func TestHealthz(t *testing.T) {
-	srv := New(quietLogger(), nil, nil, nil)
+	srv := New(quietLogger(), nil, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
@@ -49,7 +49,7 @@ func TestHealthz(t *testing.T) {
 
 // TestReadyzUnavailable 覆盖就绪探针的失败路径：连不上库时应返回 503。
 func TestReadyzUnavailable(t *testing.T) {
-	srv := New(quietLogger(), failingPinger{}, nil, nil)
+	srv := New(quietLogger(), failingPinger{}, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 
@@ -63,7 +63,7 @@ func TestReadyzUnavailable(t *testing.T) {
 
 // TestReadyzReady 覆盖就绪探针的成功路径。
 func TestReadyzReady(t *testing.T) {
-	srv := New(quietLogger(), okPinger{}, nil, nil)
+	srv := New(quietLogger(), okPinger{}, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 
@@ -77,7 +77,7 @@ func TestReadyzReady(t *testing.T) {
 
 // TestProbeMethodRestricted 覆盖路径方法约束：POST 不应被当成探针接受。
 func TestProbeMethodRestricted(t *testing.T) {
-	srv := New(quietLogger(), nil, nil, nil)
+	srv := New(quietLogger(), nil, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/healthz", nil))
 
@@ -100,7 +100,7 @@ func (f fakeCtx) Context(context.Context, time.Time) (query.ContextInfo, error) 
 // TestContextInfoOK 覆盖 /api/context 的成功响应形状。
 func TestContextInfoOK(t *testing.T) {
 	want := query.ContextInfo{Date: "2026-10-28", Term: "2026-2027-1", Week: 6, Weekday: 3, InCalendar: true}
-	srv := New(quietLogger(), nil, fakeCtx{info: want}, nil)
+	srv := New(quietLogger(), nil, fakeCtx{info: want}, nil, nil)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/context", nil))
 
@@ -126,7 +126,7 @@ func TestContextInfoOK(t *testing.T) {
 
 // TestContextInfoFailure 覆盖查询失败：500 与业务码 50000，且不泄露内部细节。
 func TestContextInfoFailure(t *testing.T) {
-	srv := New(quietLogger(), nil, fakeCtx{err: errors.New("db down")}, nil)
+	srv := New(quietLogger(), nil, fakeCtx{err: errors.New("db down")}, nil, nil)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/context", nil))
 
@@ -153,7 +153,7 @@ func TestContextInfoFailure(t *testing.T) {
 func TestContextInfoCanceled(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	srv := New(logger, nil, fakeCtx{err: context.Canceled}, nil)
+	srv := New(logger, nil, fakeCtx{err: context.Canceled}, nil, nil)
 
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/context", nil))
@@ -175,7 +175,7 @@ func TestContextInfoCanceled(t *testing.T) {
 
 // TestContextInfoJSONKeys 按契约键名断言，防止漏写 json tag 时字段名变成驼峰。
 func TestContextInfoJSONKeys(t *testing.T) {
-	srv := New(quietLogger(), nil, fakeCtx{info: query.ContextInfo{Date: "2026-10-28", Week: 6, Weekday: 3}}, nil)
+	srv := New(quietLogger(), nil, fakeCtx{info: query.ContextInfo{Date: "2026-10-28", Week: 6, Weekday: 3}}, nil, nil)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/context", nil))
 
