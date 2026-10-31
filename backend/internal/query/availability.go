@@ -7,7 +7,8 @@ import (
 	"time"
 )
 
-// 查询契约的默认值与边界。完整参数校验归 9.5；这里先给出让 handler 安全工作的最小集合。
+// 节次区间的契约。请求侧的分页、关键词等边界统一在 api 层定义，
+// 这里只保留查询自身需要的视图名与小节默认值。
 const (
 	// ViewAvailability 是 /api/query 的空教室视图。
 	ViewAvailability = "availability"
@@ -15,12 +16,6 @@ const (
 	DefaultStartNode = "01"
 	// DefaultEndNode 是省略 end_node 时的结束节次，沿用既有契约的 11。
 	DefaultEndNode = "11"
-	// DefaultLimit 是省略 limit 时的每页条数。
-	DefaultLimit = 50
-	// MaxLimit 是每页条数的上界，防止一次把全库拉走。
-	MaxLimit = 200
-	// MaxKeywordRunes 是关键词的最大字符数，按字符而不是字节计。
-	MaxKeywordRunes = 32
 )
 
 // 页顶提示的稳定标记。前端按 code 映射文案，message 只作兜底与排障。
@@ -120,7 +115,7 @@ func normalizeWidth(text string) string {
 }
 
 // ParseNodeRange 解析并校验小节区间，省略时用默认的 01..11。
-// 完整的参数错误码映射归 9.5；这里返回错误供 handler 转成 40001。
+// 这是 01..12 与起点不晚于终点的单点实现；返回的错误由 api 层统一映射成 40001。
 func ParseNodeRange(startRaw, endRaw string) (string, string, int, error) {
 	start := strings.TrimSpace(startRaw)
 	// 省略起点时沿用既有契约默认的 01。

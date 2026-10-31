@@ -176,7 +176,7 @@ func TestQueryAvailabilityDefaults(t *testing.T) {
 		StartNode:  query.DefaultStartNode,
 		EndNode:    query.DefaultEndNode,
 		NodeCount:  11,
-		Limit:      query.DefaultLimit,
+		Limit:      defaultLimit,
 		Offset:     0,
 	}
 	if fake.gotParams != want {
@@ -184,22 +184,96 @@ func TestQueryAvailabilityDefaults(t *testing.T) {
 	}
 }
 
-// TestQueryAvailabilityRejectsInvalidParams 覆盖缺失/非法参数的安全处理：
-// 一律 40001，绝不 panic，也不进入查询服务。
-func TestQueryAvailabilityRejectsInvalidParams(t *testing.T) {
+// TestQueryAvailabilityParamBoundaries 覆盖每个参数的边界值都放行并原样透传：
+// date_offset 0..10、节次 01..12、limit 1..200、offset 0、keyword 32 字符（Requirement 18.1–18.2）。
+func TestQueryAvailabilityParamBoundaries(t *testing.T) {
 	cases := []struct {
 		name   string
 		values url.Values
+		want   query.AvailabilityParams
 	}{
-		{name: "未知视图", values: url.Values{"view": {"unknown"}}},
-		{name: "日期偏移非整数", values: url.Values{"date_offset": {"abc"}}},
-		{name: "起始节次 00", values: url.Values{"start_node": {"00"}}},
-		{name: "起始晚于结束", values: url.Values{"start_node": {"05"}, "end_node": {"03"}}},
-		{name: "limit 非整数", values: url.Values{"limit": {"abc"}}},
-		{name: "limit 为 0", values: url.Values{"limit": {"0"}}},
-		{name: "limit 超上界", values: url.Values{"limit": {"201"}}},
-		{name: "offset 为负", values: url.Values{"offset": {"-1"}}},
-		{name: "关键词超长", values: url.Values{"keyword": {strings.Repeat("a", query.MaxKeywordRunes+1)}}},
+		{
+			name: "上界组合",
+			values: url.Values{
+				"date_offset": {"10"},
+				"start_node":  {"01"},
+				"end_node":    {"12"},
+				"limit":       {"200"},
+				"offset":      {"0"},
+				"keyword":     {strings.Repeat("a", maxKeywordRunes)},
+				"building":    {" Q10 "},
+			},
+			want: query.AvailabilityParams{
+				DateOffset: 10,
+				Building:   "Q10",
+				Keyword:    strings.Repeat("a", maxKeywordRunes),
+				StartNode:  "01",
+				EndNode:    "12",
+				NodeCount:  12,
+				Limit:      200,
+				Offset:     0,
+			},
+		},
+		{
+			name: "下界组合",
+			values: url.Values{
+				"date_offset": {"0"},
+				"start_node":  {"01"},
+				"end_node":    {"01"},
+				"limit":       {"1"},
+				"offset":      {"0"},
+			},
+			want: query.AvailabilityParams{
+				DateOffset: 0,
+				StartNode:  "01",
+				EndNode:    "01",
+				NodeCount:  1,
+				Limit:      1,
+				Offset:     0,
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeAvailabilityProvider{result: query.AvailabilityResult{Items: []query.AvailabilityRoom{}}}
+			srv := New(quietLogger(), nil, nil, fake, nil)
+			srv.clock = fixedQueryClock
+
+			rec := serveQuery(t, srv, c.values)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("边界值应放行，实际 %d，body=%s", rec.Code, rec.Body.String())
+			}
+			if fake.calls != 1 {
+				t.Fatalf("边界值应进入查询服务一次，实际 %d 次", fake.calls)
+			}
+			if fake.gotParams != c.want {
+				t.Fatalf("参数透传不符:\n实际 %+v\n期望 %+v", fake.gotParams, c.want)
+			}
+		})
+	}
+}
+
+// TestQueryAvailabilityRejectsInvalidParams 覆盖每个参数的越界值：
+// 一律 40001 + 可读文案，绝不 panic，也不进入查询服务（Requirement 18.1–18.2）。
+func TestQueryAvailabilityRejectsInvalidParams(t *testing.T) {
+	cases := []struct {
+		name    string
+		values  url.Values
+		message string
+	}{
+		{name: "未知视图", values: url.Values{"view": {"unknown"}}, message: "view 只接受 availability 或 day"},
+		{name: "日期偏移非整数", values: url.Values{"date_offset": {"abc"}}, message: "date_offset 必须是整数"},
+		{name: "日期偏移越上界 11", values: url.Values{"date_offset": {"11"}}, message: "date_offset 取值 0..10"},
+		{name: "日期偏移为负 -1", values: url.Values{"date_offset": {"-1"}}, message: "date_offset 取值 0..10"},
+		{name: "起始节次 00", values: url.Values{"start_node": {"00"}}, message: "start_node 必须是 01..12"},
+		{name: "结束节次 13", values: url.Values{"end_node": {"13"}}, message: "end_node 必须是 01..12"},
+		{name: "起始晚于结束", values: url.Values{"start_node": {"05"}, "end_node": {"03"}}, message: "start_node 不能大于 end_node"},
+		{name: "limit 非整数", values: url.Values{"limit": {"abc"}}, message: "limit 取值 1..200"},
+		{name: "limit 为 0", values: url.Values{"limit": {"0"}}, message: "limit 取值 1..200"},
+		{name: "limit 超上界", values: url.Values{"limit": {"201"}}, message: "limit 取值 1..200"},
+		{name: "offset 为负", values: url.Values{"offset": {"-1"}}, message: "offset 不能为负"},
+		{name: "关键词超长", values: url.Values{"keyword": {strings.Repeat("a", maxKeywordRunes+1)}}, message: "keyword 最长 32 个字符"},
 	}
 
 	for _, c := range cases {
@@ -221,6 +295,9 @@ func TestQueryAvailabilityRejectsInvalidParams(t *testing.T) {
 			}
 			if got.Code != 40001 || got.Message == "" {
 				t.Fatalf("期望业务码 40001 与非空描述，实际 %+v", got)
+			}
+			if got.Message != c.message {
+				t.Fatalf("错误文案期望 %q，实际 %q", c.message, got.Message)
 			}
 			if fake.calls != 0 {
 				t.Fatalf("非法参数不应进入查询服务，实际调用 %d 次", fake.calls)
@@ -399,15 +476,20 @@ func TestQueryDayOK(t *testing.T) {
 	}
 }
 
-// TestQueryDayRequiresRoomID 覆盖缺房间标识与非法日期偏移：一律 40001，且不进入查询服务。
+// TestQueryDayRequiresRoomID 覆盖缺房间标识、超长房号与非法日期偏移：
+// 一律 40001 + 可读文案，且不进入查询服务（Requirement 18.1–18.2）。
 func TestQueryDayRequiresRoomID(t *testing.T) {
 	cases := []struct {
-		name   string
-		values url.Values
+		name    string
+		values  url.Values
+		message string
 	}{
-		{name: "缺少房间标识", values: url.Values{"view": {"day"}}},
-		{name: "房间标识为空", values: url.Values{"view": {"day"}, "room_id": {"   "}}},
-		{name: "日期偏移非整数", values: url.Values{"view": {"day"}, "room_id": {"0899"}, "date_offset": {"abc"}}},
+		{name: "缺少房间标识", values: url.Values{"view": {"day"}}, message: "room_id 不能为空"},
+		{name: "房间标识为空", values: url.Values{"view": {"day"}, "room_id": {"   "}}, message: "room_id 不能为空"},
+		{name: "房间标识超长", values: url.Values{"view": {"day"}, "room_id": {strings.Repeat("9", maxRoomIDRunes+1)}}, message: "room_id 最长 32 个字符"},
+		{name: "日期偏移非整数", values: url.Values{"view": {"day"}, "room_id": {"0899"}, "date_offset": {"abc"}}, message: "date_offset 必须是整数"},
+		{name: "日期偏移越上界 11", values: url.Values{"view": {"day"}, "room_id": {"0899"}, "date_offset": {"11"}}, message: "date_offset 取值 0..10"},
+		{name: "日期偏移为负 -1", values: url.Values{"view": {"day"}, "room_id": {"0899"}, "date_offset": {"-1"}}, message: "date_offset 取值 0..10"},
 	}
 
 	for _, c := range cases {
@@ -430,8 +512,61 @@ func TestQueryDayRequiresRoomID(t *testing.T) {
 			if got.Code != 40001 || got.Message == "" {
 				t.Fatalf("期望业务码 40001 与非空描述，实际 %+v", got)
 			}
+			if got.Message != c.message {
+				t.Fatalf("错误文案期望 %q，实际 %q", c.message, got.Message)
+			}
 			if fake.calls != 0 {
 				t.Fatalf("非法参数不应进入查询服务，实际调用 %d 次", fake.calls)
+			}
+		})
+	}
+}
+
+// TestQueryDayParamBoundaries 覆盖全天状态的边界值都放行并原样透传：
+// date_offset 0 与 10、32 字符房号、带空白的房号与楼（Requirement 18.1）。
+func TestQueryDayParamBoundaries(t *testing.T) {
+	cases := []struct {
+		name   string
+		values url.Values
+		want   query.DayParams
+	}{
+		{
+			name:   "日期偏移上界 10",
+			values: url.Values{"view": {"day"}, "room_id": {"0899"}, "date_offset": {"10"}},
+			want:   query.DayParams{DateOffset: 10, RoomID: "0899"},
+		},
+		{
+			name:   "日期偏移下界 0",
+			values: url.Values{"view": {"day"}, "room_id": {"0899"}, "date_offset": {"0"}},
+			want:   query.DayParams{DateOffset: 0, RoomID: "0899"},
+		},
+		{
+			name:   "房号 32 字符",
+			values: url.Values{"view": {"day"}, "room_id": {strings.Repeat("9", maxRoomIDRunes)}},
+			want:   query.DayParams{RoomID: strings.Repeat("9", maxRoomIDRunes)},
+		},
+		{
+			name:   "房号与楼去空白",
+			values: url.Values{"view": {"day"}, "room_id": {" 0899 "}, "building": {" Q10 "}},
+			want:   query.DayParams{RoomID: "0899", Building: "Q10"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeDayProvider{result: dayResultFixture()}
+			srv := New(quietLogger(), nil, nil, nil, fake)
+			srv.clock = fixedQueryClock
+
+			rec := serveQuery(t, srv, c.values)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("边界值应放行，实际 %d，body=%s", rec.Code, rec.Body.String())
+			}
+			if fake.calls != 1 {
+				t.Fatalf("边界值应进入查询服务一次，实际 %d 次", fake.calls)
+			}
+			if fake.gotParams != c.want {
+				t.Fatalf("参数透传不符:\n实际 %+v\n期望 %+v", fake.gotParams, c.want)
 			}
 		})
 	}
@@ -723,5 +858,126 @@ func TestQueryDayCanceled(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "客户端已断开") {
 		t.Fatalf("取消场景应留一条 info，实际日志 %s", logBuf.String())
+	}
+}
+
+// TestQueryEmptyStateIsOKWithHint 覆盖 Requirement 18.4：
+// 无当前版本、日期不在学期周、该周无观测都必须返回 HTTP 200 + code 0 + 空数据 + 页顶提示，
+// 而不是 40401；两个视图共用同一口径。
+func TestQueryEmptyStateIsOKWithHint(t *testing.T) {
+	inCalendar := func(_ context.Context, _ time.Time) (model.TermWeek, bool, error) {
+		return model.TermWeek{
+			Term:       "2026-2027-1",
+			Week:       5,
+			Monday:     time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC),
+			InCalendar: true,
+		}, true, nil
+	}
+	outOfCalendar := func(context.Context, time.Time) (model.TermWeek, bool, error) {
+		return model.TermWeek{}, false, nil
+	}
+	room := &query.DayRoom{RoomID: "0899", Name: "F126", BuildingID: "Q10", BuildingName: "综合教学楼"}
+
+	noReleaseAvailability := func(context.Context, query.AvailabilityFilter) (query.AvailabilityPage, error) {
+		return query.AvailabilityPage{HasRelease: false}, nil
+	}
+	weekNoObservationAvailability := func(context.Context, query.AvailabilityFilter) (query.AvailabilityPage, error) {
+		return query.AvailabilityPage{HasRelease: true, WeekHasObservation: false}, nil
+	}
+	noReleaseDay := func(context.Context, query.DayFilter) (query.DayPage, error) {
+		return query.DayPage{HasRelease: false}, nil
+	}
+	weekNoObservationDay := func(context.Context, query.DayFilter) (query.DayPage, error) {
+		return query.DayPage{
+			HasRelease:         true,
+			WeekHasObservation: false,
+			Room:               room,
+			Nodes:              dayStorageNodesAllMissing(),
+		}, nil
+	}
+
+	cases := []struct {
+		name         string
+		values       url.Values
+		weekLookup   query.WeekLookup
+		availability query.AvailabilityLookup
+		day          query.DayLookup
+		wantView     string // 用来断言对应视图的空数组字段
+		wantHint     string
+		wantMessage  string
+	}{
+		{
+			name: "空教室无当前版本", values: url.Values{}, weekLookup: inCalendar,
+			availability: noReleaseAvailability, wantView: query.ViewAvailability,
+			wantHint: query.HintNoData, wantMessage: "没有已发布的数据",
+		},
+		{
+			name: "空教室非学期周", values: url.Values{}, weekLookup: outOfCalendar,
+			wantView: query.ViewAvailability, wantHint: query.HintNoData, wantMessage: "该日期没有可查询的数据",
+		},
+		{
+			name: "空教室该周无观测", values: url.Values{}, weekLookup: inCalendar,
+			availability: weekNoObservationAvailability, wantView: query.ViewAvailability,
+			wantHint: query.HintWeekNoSchedule, wantMessage: "该周疑似无排课",
+		},
+		{
+			name: "全天状态无当前版本", values: url.Values{"view": {"day"}, "room_id": {"0899"}}, weekLookup: inCalendar,
+			day: noReleaseDay, wantView: query.ViewDay,
+			wantHint: query.HintNoData, wantMessage: "没有已发布的数据",
+		},
+		{
+			name: "全天状态非学期周", values: url.Values{"view": {"day"}, "room_id": {"0899"}}, weekLookup: outOfCalendar,
+			wantView: query.ViewDay, wantHint: query.HintNoData, wantMessage: "该日期没有可查询的数据",
+		},
+		{
+			name: "全天状态该周无观测", values: url.Values{"view": {"day"}, "room_id": {"0899"}}, weekLookup: inCalendar,
+			day: weekNoObservationDay, wantView: query.ViewDay,
+			wantHint: query.HintWeekNoSchedule, wantMessage: "该周疑似无排课",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc := query.New(c.weekLookup, c.availability, c.day)
+			srv := New(quietLogger(), nil, nil, svc, svc)
+			srv.clock = fixedQueryClock
+
+			rec := serveQuery(t, srv, c.values)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("空态期望 200，实际 %d，body=%s", rec.Code, rec.Body.String())
+			}
+			var got struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+				Data    struct {
+					Items []json.RawMessage       `json:"items"`
+					Nodes []json.RawMessage       `json:"nodes"`
+					Hint  *query.AvailabilityHint `json:"hint"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("响应不是合法 JSON: %v", err)
+			}
+			// 空态不是「无数据错误」：业务码必须是 0，不能退化成 40401。
+			if got.Code != 0 {
+				t.Fatalf("空态业务码期望 0，实际 %d，body=%s", got.Code, rec.Body.String())
+			}
+			if got.Data.Hint == nil || got.Data.Hint.Code != c.wantHint {
+				t.Fatalf("期望提示 %q，实际 %+v", c.wantHint, got.Data.Hint)
+			}
+			if got.Data.Hint.Message != c.wantMessage {
+				t.Fatalf("提示文案不符: 实际 %q，期望 %q", got.Data.Hint.Message, c.wantMessage)
+			}
+			// 空态数据必须是数组而不是 null，前端不该为两种空值写两套兜底。
+			if c.wantView == query.ViewAvailability {
+				if got.Data.Items == nil || len(got.Data.Items) != 0 {
+					t.Fatalf("空教室空态 items 必须是空数组，实际 %#v", got.Data.Items)
+				}
+				return
+			}
+			if got.Data.Nodes == nil {
+				t.Fatalf("全天状态空态 nodes 必须是数组，实际 null")
+			}
+		})
 	}
 }
