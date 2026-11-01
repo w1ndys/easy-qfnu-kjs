@@ -36,6 +36,11 @@ type MetaProvider interface {
 	Meta(ctx context.Context, now time.Time) (query.MetaResult, error)
 }
 
+// ScreenProvider 提供数据大屏聚合；由 query 服务实现，测试里可用替身。
+type ScreenProvider interface {
+	Screen(ctx context.Context, now time.Time) (query.ScreenResult, error)
+}
+
 // Server 持有 API 需要的依赖，公开与管理路由都挂到它上面。
 type Server struct {
 	log          *slog.Logger         // 结构化日志器
@@ -44,6 +49,7 @@ type Server struct {
 	availability AvailabilityProvider // 空教室查询
 	day          DayProvider          // 全天状态查询
 	meta         MetaProvider         // 版本与字典等元信息
+	screen       ScreenProvider       // 数据大屏聚合
 	clock        func() time.Time     // 时间来源，测试可替换
 	limiter      *rateLimiter         // 公开查询的按来源限流器
 	trustProxy   bool                 // 是否信任前置反代给出的来源头
@@ -63,6 +69,11 @@ func WithTrustedProxy(enabled bool) Option {
 // WithMeta 装配 /api/meta 的数据来源；不传时该端点按内部错误处理。
 func WithMeta(provider MetaProvider) Option {
 	return func(s *Server) { s.meta = provider }
+}
+
+// WithScreen 装配 /api/screen 的数据来源；不传时该端点按内部错误处理。
+func WithScreen(provider ScreenProvider) Option {
+	return func(s *Server) { s.screen = provider }
 }
 
 // New 组装 API 依赖；路由在 Handler 里一次性挂好。
@@ -93,6 +104,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/context", s.rateLimited(s.contextInfo))
 	mux.Handle("GET /api/meta", s.rateLimited(s.metaInfo))
 	mux.Handle("GET /api/query", s.rateLimited(s.query))
+	mux.Handle("GET /api/screen", s.rateLimited(s.screenInfo))
 	return mux
 }
 

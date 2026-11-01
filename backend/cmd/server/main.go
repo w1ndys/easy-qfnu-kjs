@@ -228,7 +228,50 @@ func run() int {
 		}
 		return mapped, nil
 	}
-	metaService := query.NewMeta(metaLookup, query.NewFreshness(freshnessLookup))
+	// 逐周新鲜度只有一份实现：meta 与 screen 共用同一个服务实例（9.6 的 Weeks）。
+	freshnessService := query.NewFreshness(freshnessLookup)
+	metaService := query.NewMeta(metaLookup, freshnessService)
+
+	// 大屏端点：规模/版本/轮次/占用来自存储层，逐周新鲜度与访问统计分别复用 9.6 与 9.9 的实现。
+	// 30 秒缓存由 query.ScreenService 自己持有，装配层不再传 TTL（Requirement 33.7、CP15）。
+	statsReader := stats.NewReader(func(ctx context.Context, windows store.StatWindows, topN int) (store.StatFacts, error) {
+		return store.ReadStatFacts(ctx, pool, windows, topN)
+	})
+	screenLookup := func(ctx context.Context) (query.ScreenFacts, error) {
+		facts, err := store.Screen(ctx, pool)
+		if err != nil {
+			return query.ScreenFacts{}, err
+		}
+
+		mapped := query.ScreenFacts{
+			Occupancy: make([]query.ScreenOccupancyCell, 0, len(facts.Occupancy)),
+		}
+		// 无当前版本时保持 nil，由查询层输出 release:null + empty:true。
+		if facts.Release != nil {
+			mapped.Release = &query.ScreenReleaseFacts{
+				ReleaseID:   facts.Release.ID,
+				GeneratedAt: facts.Release.GeneratedAt,
+				Term:        facts.Release.Term,
+				TotalWeeks:  facts.Release.TotalWeeks,
+				Rooms:       facts.Release.Rooms,
+				Buildings:   facts.Release.Buildings,
+			}
+		}
+		mapped.Published = screenRunFacts(facts.Published)
+		mapped.LastRun = screenRunFacts(facts.LastRun)
+		for _, cell := range facts.Occupancy {
+			mapped.Occupancy = append(mapped.Occupancy, query.ScreenOccupancyCell{
+				BuildingID:   cell.BuildingID,
+				BuildingName: cell.BuildingName,
+				Weekday:      cell.Weekday,
+				BlockOrdinal: cell.BlockOrdinal,
+				Cells:        cell.Cells,
+				Occupied:     cell.Occupied,
+			})
+		}
+		return mapped, nil
+	}
+	screenService := query.NewScreen(screenLookup, freshnessService, statsReader, weekLookup)
 
 	// 访问统计：记账在查询响应写出之后入队，后台批量落库，失败只记日志（Requirement 34.1、CP18）。
 	// 清理任务与查询、采集共用连接池但互不阻塞，按日删除 90 天前的记录（Requirement 34.10）。
@@ -250,6 +293,7 @@ func run() int {
 		Handler: api.New(log, pool, queries, queries, queries,
 			api.WithTrustedProxy(cfg.TrustProxyHeaders),
 			api.WithMeta(metaService),
+			api.WithScreen(screenService),
 			api.WithStats(statsRecorder),
 		).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -278,6 +322,24 @@ func run() int {
 	statsRecorder.Wait()
 	statsCleaner.Wait()
 	return 0
+}
+
+// screenRunFacts 把存储层的一轮同步事实映射成查询层形状；nil 原样透传，表示没有轮次。
+// 只映射状态、时间、窗口与计数：错误码与错误原文不在任何一侧的结构体里（Requirement 33.6、CP13）。
+func screenRunFacts(run *store.ScreenRun) *query.ScreenRunFacts {
+	if run == nil {
+		return nil
+	}
+	return &query.ScreenRunFacts{
+		Status:            run.Status,
+		StartedAt:         run.StartedAt,
+		FinishedAt:        run.FinishedAt,
+		WindowStart:       run.WindowStart,
+		WindowEnd:         run.WindowEnd,
+		UnknownCells:      run.UnknownCells,
+		CompositeCells:    run.CompositeCells,
+		AttrConflictCount: run.AttrConflictCount,
+	}
 }
 
 // statsBatchWriter 把连接池适配成统计写入入口，避免 internal/stats 直接持有驱动类型。
