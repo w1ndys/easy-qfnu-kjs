@@ -49,7 +49,8 @@ func TestSnapshotUsesShanghaiBusinessDate(t *testing.T) {
 	assertRange(t, "热力", windows.Peak, "2026-10-27", "2026-11-02")
 }
 
-// TestSnapshotPeakWindowSwitching 覆盖热力窗口在近 7 日与近 30 日之间切换（PRD「高峰时段分析」）。
+// TestSnapshotPeakWindowSwitching 覆盖热力与三张 Top 10 共用的窗口在近 7 日与近 30 日之间切换
+// （PRD「高峰时段分析」），同时确认 PV/UV 的近 7 日与近 30 日窗口不跟着动。
 func TestSnapshotPeakWindowSwitching(t *testing.T) {
 	now := time.Date(2026, 11, 2, 9, 0, 0, 0, shanghai)
 
@@ -59,6 +60,9 @@ func TestSnapshotPeakWindowSwitching(t *testing.T) {
 		t.Fatalf("读取访问统计失败: %v", err)
 	}
 	assertRange(t, "近 30 日热力", windows.Peak, "2026-10-04", "2026-11-02")
+	// 热力窗口只改变自身：PV/UV 与节次分布的近 7 日、近 30 日窗口保持原口径。
+	assertRange(t, "近 7 日", windows.D7, "2026-10-27", "2026-11-02")
+	assertRange(t, "近 30 日", windows.D30, "2026-10-04", "2026-11-02")
 
 	// 非法取值按默认 7 天处理，不报错也不返回空窗口；换一个日期确认窗口跟着走。
 	later := time.Date(2026, 12, 1, 9, 0, 0, 0, shanghai)

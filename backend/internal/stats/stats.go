@@ -18,11 +18,10 @@ const (
 	TopN = 10
 	// PeakTopN 是峰值时段个数：访问量最高的前三个小时段（Requirement 34.6）。
 	PeakTopN = 3
-	// LeaderboardDays 是排行榜的统计窗口。
-	// Requirement 34.5 只要求「Top 10」而没有给窗口；这里取近 7 日，与公开页默认口径一致。
-	LeaderboardDays = 7
+	// TrafficDays7 是近 7 日 PV/UV 与节次分布的统计窗口，与热力窗口的取值无关。
+	TrafficDays7 = 7
 	// TrendDays 是逐日趋势的窗口：近 30 日（Requirement 34.7）。
-	// 近 7 日口径由这份序列的最后 LeaderboardDays 天表达，不必再返回第二份数据。
+	// 近 7 日口径由这份序列的最后 TrafficDays7 天表达，不必再返回第二份数据。
 	TrendDays = 30
 	// PeakDays7 是热力与峰值窗口的近 7 日口径（PRD「高峰时段分析」的切换之一）。
 	PeakDays7 = 7

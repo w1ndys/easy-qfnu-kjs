@@ -14,8 +14,8 @@ type FactsLookup func(ctx context.Context, windows store.StatWindows, topN int) 
 
 // ReadParams 是读取访问统计的口径参数。
 type ReadParams struct {
-	// PeakDays 是星期 × 小时热力与峰值占比的窗口，只取 7 或 30（PRD「近 7 日与近 30 日切换」）。
-	// 其它值按默认 7 天处理。
+	// PeakDays 是星期 × 小时热力、峰值占比与三张 Top 10 的窗口，只取 7 或 30
+	// （PRD「近 7 日与近 30 日切换」）。其它值按默认 7 天处理。
 	PeakDays int
 }
 
@@ -58,11 +58,12 @@ func (r *Reader) Snapshot(ctx context.Context, now time.Time, params ReadParams)
 
 // buildWindows 由「今天」推出读取需要的四段窗口。
 // 今日只含当天；近 7 日与近 30 日按闭区间含今天，所以偏移分别是 6 与 29 天。
+// 热力、峰值与三张 Top 10 共用 Peak 窗口，长度随 peakDays 在 7 与 30 之间切换。
 func buildWindows(now time.Time, peakDays int) store.StatWindows {
 	today := dayOf(now)
 	return store.StatWindows{
 		Today: store.StatRange{From: today, To: today},
-		D7:    store.StatRange{From: today.AddDate(0, 0, -(LeaderboardDays - 1)), To: today},
+		D7:    store.StatRange{From: today.AddDate(0, 0, -(TrafficDays7 - 1)), To: today},
 		D30:   store.StatRange{From: today.AddDate(0, 0, -(TrendDays - 1)), To: today},
 		Peak:  store.StatRange{From: today.AddDate(0, 0, -(peakDays - 1)), To: today},
 	}

@@ -326,9 +326,9 @@ type StatRange struct {
 // 拆成四段而不是在读取函数里算：窗口口径属于 internal/stats，仓储只按给定区间取值。
 type StatWindows struct {
 	Today StatRange // 今日
-	D7    StatRange // 近 7 日：PV/UV 与排行榜共用
+	D7    StatRange // 近 7 日：PV/UV 与节次分布共用
 	D30   StatRange // 近 30 日：PV/UV 与逐日趋势共用
-	Peak  StatRange // 热力与峰值窗口：近 7 日或近 30 日
+	Peak  StatRange // 热力（含峰值）与三张 Top 10 榜单共用：近 7 日或近 30 日
 }
 
 // StatPVUV 是一段窗口的 PV 与 UV。
@@ -424,13 +424,15 @@ func ReadStatFacts(ctx context.Context, q statQuerier, windows StatWindows, topN
 	if facts.Days, err = statTrend(ctx, q, windows.D30); err != nil {
 		return StatFacts{}, err
 	}
-	if facts.Buildings, err = statBuildingTop(ctx, q, windows.D7, topN); err != nil {
+	// 三张榜单与热力共用 Peak 窗口：切近 7 日还是近 30 日由调用方给的区间决定。
+	// 节次分布仍按 D7 取值，不随热力窗口切换。
+	if facts.Buildings, err = statBuildingTop(ctx, q, windows.Peak, topN); err != nil {
 		return StatFacts{}, err
 	}
-	if facts.Rooms, err = statRoomTop(ctx, q, windows.D7, topN); err != nil {
+	if facts.Rooms, err = statRoomTop(ctx, q, windows.Peak, topN); err != nil {
 		return StatFacts{}, err
 	}
-	if facts.Keywords, err = statKeywordTop(ctx, q, windows.D7, topN); err != nil {
+	if facts.Keywords, err = statKeywordTop(ctx, q, windows.Peak, topN); err != nil {
 		return StatFacts{}, err
 	}
 	if facts.Nodes, err = statNodes(ctx, q, windows.D7); err != nil {

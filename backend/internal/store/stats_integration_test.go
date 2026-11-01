@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -139,8 +140,8 @@ func TestReadStatFactsWindowsAndLeaderboards(t *testing.T) {
 	ctx, pool := openStatsTestDB(t)
 
 	today := statsDay(time.November, 3)
-	recent := statsDay(time.November, 2) // 近 7 日内
-	older := statsDay(time.October, 20)  // 近 7 日外、近 30 日内
+	recent := statsDay(time.November, 2) // 热力窗口内（本用例取近 7 日），也是近 7 日内
+	older := statsDay(time.October, 20)  // 热力窗口外、近 30 日内
 
 	// 白名单与房间目录提供榜单展示名。
 	mustExec(ctx, t, pool, "UPDATE settings SET value = $1 WHERE key = 'building_whitelist'",
@@ -155,7 +156,7 @@ VALUES ('0899', 'F126', 'F126', 'Q10', '综合教学楼')`)
 			t.Fatalf("写入统计失败: %v", err)
 		}
 	}
-	// 近 7 日内的命中：楼、房、关键词、节次各计一次。
+	// 热力窗口内（本用例等于近 7 日）的命中：楼、房、关键词、节次各计一次。
 	write(StatsBatch{
 		Hours:     []StatHourPV{{Day: recent, Hour: 8, Weekday: 1, PV: 2}},
 		Visitors:  []StatVisitorKey{{Day: recent, Hour: 8, Hash: "hash-recent"}},
@@ -164,7 +165,7 @@ VALUES ('0899', 'F126', 'F126', 'Q10', '综合教学楼')`)
 		Keywords:  []StatKeywordHits{{Day: recent, Keyword: "f126", Hits: 2}},
 		Nodes:     []StatNodeHits{{Day: recent, Node: "01", Hits: 2}},
 	})
-	// 近 7 日外的命中：只影响 30 日口径与趋势，不进排行榜。
+	// 热力窗口外的命中：只影响 30 日口径与趋势，不进热力、三张榜单与节次分布。
 	write(StatsBatch{
 		Hours:     []StatHourPV{{Day: older, Hour: 12, Weekday: 2, PV: 5}},
 		Visitors:  []StatVisitorKey{{Day: older, Hour: 12, Hash: "hash-old"}},
@@ -195,16 +196,16 @@ VALUES ('0899', 'F126', 'F126', 'Q10', '综合教学楼')`)
 	}
 
 	if len(facts.Buildings) != 1 || facts.Buildings[0] != (StatBuildingHit{ID: "Q10", Name: "综合教学楼", Hits: 2}) {
-		t.Fatalf("教学楼榜应只含近 7 日的 Q10，实际 %+v", facts.Buildings)
+		t.Fatalf("教学楼榜应只含热力窗口内的 Q10，实际 %+v", facts.Buildings)
 	}
 	if len(facts.Rooms) != 1 || facts.Rooms[0] != (StatRoomHit{ID: "0899", Name: "F126", Hits: 2}) {
-		t.Fatalf("教室榜应只含近 7 日的 0899 且带房名，实际 %+v", facts.Rooms)
+		t.Fatalf("教室榜应只含热力窗口内的 0899 且带房名，实际 %+v", facts.Rooms)
 	}
 	if len(facts.Keywords) != 1 || facts.Keywords[0] != (StatKeywordHit{Text: "f126", Hits: 2}) {
-		t.Fatalf("关键词榜应只含近 7 日的 f126，实际 %+v", facts.Keywords)
+		t.Fatalf("关键词榜应只含热力窗口内的 f126，实际 %+v", facts.Keywords)
 	}
 	if len(facts.Nodes) != 1 || facts.Nodes[0] != (StatNodeHit{Node: "01", Hits: 2}) {
-		t.Fatalf("节次分布应只含近 7 日的 01，实际 %+v", facts.Nodes)
+		t.Fatalf("节次分布应只含近 7 日窗口内的 01，实际 %+v", facts.Nodes)
 	}
 
 	if len(facts.Days) != 2 {
@@ -265,6 +266,123 @@ func TestReadStatFactsBuildingLeaderboardOnlyWhitelisted(t *testing.T) {
 	}
 	if len(facts.Buildings) != 0 {
 		t.Fatalf("白名单为空时楼榜应为空，实际 %+v", facts.Buildings)
+	}
+}
+
+// TestReadStatFactsLeaderboardFollowsPeakWindow 覆盖三张 Top 10 的窗口跟随热力窗口切换：
+// 同一批事实在近 7 日与近 30 日下给出不同榜单；窗口按闭区间，首日算在内、前一天不算。
+func TestReadStatFactsLeaderboardFollowsPeakWindow(t *testing.T) {
+	ctx, pool := openStatsTestDB(t)
+
+	today := statsDay(time.November, 3)
+	before30 := today.AddDate(0, 0, -30)  // 10 月 4 日：30 日窗口前一天
+	first30 := today.AddDate(0, 0, -29)   // 10 月 5 日：30 日窗口首日
+	tenDaysAgo := today.AddDate(0, 0, -9) // 10 月 25 日：只在 30 日窗口内
+	before7 := today.AddDate(0, 0, -7)    // 10 月 27 日：7 日窗口前一天
+	first7 := today.AddDate(0, 0, -6)     // 10 月 28 日：7 日窗口首日
+
+	// 白名单与房间目录提供榜单展示名；Q13 也在白名单内，用来确认 30 日窗口不会多算一天。
+	mustExec(ctx, t, pool, "UPDATE settings SET value = $1 WHERE key = 'building_whitelist'",
+		`[{"jxlbh":"Q10","name":"综合教学楼"},{"jxlbh":"Q11","name":"实验楼"},`+
+			`{"jxlbh":"Q12","name":"文科楼"},{"jxlbh":"Q13","name":"理科楼"},{"jxlbh":"Q14","name":"信息楼"}]`)
+	for _, room := range []struct{ id, name string }{
+		{"0899", "F126"},
+		{"0999", "F104"},
+		{"0888", "F103"},
+		{"0777", "F102"},
+		{"0666", "F101"},
+	} {
+		mustExec(ctx, t, pool, `
+INSERT INTO room (room_id, name, name_raw, building_id, building_name)
+VALUES ($1, $2, $2, 'Q10', '综合教学楼')`, room.id, room.name)
+	}
+
+	seeds := []struct {
+		day      time.Time
+		building string
+		roomID   string
+		keyword  string
+		node     string
+		hits     int
+	}{
+		{before30, "Q13", "0999", "old", "03", 9},  // 30 日窗口外：榜单与节次都不该出现
+		{first30, "Q12", "0888", "wf", "02", 4},    // 30 日窗口首日：闭区间含
+		{tenDaysAgo, "Q11", "0777", "sz", "02", 5}, // 7 日窗口外、30 日窗口内
+		{before7, "Q14", "0666", "new", "02", 8},   // 7 日窗口外、30 日窗口内
+		{first7, "Q10", "0899", "f126", "01", 2},   // 7 日窗口首日：闭区间含
+	}
+	for _, seed := range seeds {
+		if err := WriteStats(ctx, pool, StatsBatch{
+			Buildings: []StatDayHits{{Day: seed.day, Key: seed.building, Hits: seed.hits}},
+			Rooms:     []StatDayHits{{Day: seed.day, Key: seed.roomID, Hits: seed.hits}},
+			Keywords:  []StatKeywordHits{{Day: seed.day, Keyword: seed.keyword, Hits: seed.hits}},
+			Nodes:     []StatNodeHits{{Day: seed.day, Node: seed.node, Hits: seed.hits}},
+		}); err != nil {
+			t.Fatalf("写入 %s 的统计失败: %v", seed.day.Format(time.DateOnly), err)
+		}
+	}
+
+	read := func(peakDays int) StatFacts {
+		t.Helper()
+		facts, err := ReadStatFacts(ctx, pool, StatWindows{
+			Today: statsWindow(today, today),
+			D7:    statsWindow(today.AddDate(0, 0, -6), today),
+			D30:   statsWindow(today.AddDate(0, 0, -29), today),
+			Peak:  statsWindow(today.AddDate(0, 0, -(peakDays-1)), today),
+		}, 10)
+		if err != nil {
+			t.Fatalf("读取 %d 日窗口统计失败: %v", peakDays, err)
+		}
+		return facts
+	}
+
+	week := read(7)
+	month := read(30)
+
+	// 近 7 日榜单只有 7 日窗口首日那条：before7 的 Q14（8 次）落在窗口外。
+	if want := []StatBuildingHit{{ID: "Q10", Name: "综合教学楼", Hits: 2}}; !reflect.DeepEqual(week.Buildings, want) {
+		t.Fatalf("近 7 日教学楼榜期望 %+v，实际 %+v", want, week.Buildings)
+	}
+	if want := []StatRoomHit{{ID: "0899", Name: "F126", Hits: 2}}; !reflect.DeepEqual(week.Rooms, want) {
+		t.Fatalf("近 7 日教室榜期望 %+v，实际 %+v", want, week.Rooms)
+	}
+	if want := []StatKeywordHit{{Text: "f126", Hits: 2}}; !reflect.DeepEqual(week.Keywords, want) {
+		t.Fatalf("近 7 日关键词榜期望 %+v，实际 %+v", want, week.Keywords)
+	}
+
+	// 近 30 日榜单收进 7 日窗口外的命中，但仍排除 30 日窗口外的 Q13。
+	if want := []StatBuildingHit{
+		{ID: "Q14", Name: "信息楼", Hits: 8},
+		{ID: "Q11", Name: "实验楼", Hits: 5},
+		{ID: "Q12", Name: "文科楼", Hits: 4},
+		{ID: "Q10", Name: "综合教学楼", Hits: 2},
+	}; !reflect.DeepEqual(month.Buildings, want) {
+		t.Fatalf("近 30 日教学楼榜期望 %+v，实际 %+v", want, month.Buildings)
+	}
+	if want := []StatRoomHit{
+		{ID: "0666", Name: "F101", Hits: 8},
+		{ID: "0777", Name: "F102", Hits: 5},
+		{ID: "0888", Name: "F103", Hits: 4},
+		{ID: "0899", Name: "F126", Hits: 2},
+	}; !reflect.DeepEqual(month.Rooms, want) {
+		t.Fatalf("近 30 日教室榜期望 %+v，实际 %+v", want, month.Rooms)
+	}
+	if want := []StatKeywordHit{
+		{Text: "new", Hits: 8},
+		{Text: "sz", Hits: 5},
+		{Text: "wf", Hits: 4},
+		{Text: "f126", Hits: 2},
+	}; !reflect.DeepEqual(month.Keywords, want) {
+		t.Fatalf("近 30 日关键词榜期望 %+v，实际 %+v", want, month.Keywords)
+	}
+
+	// 节次分布不走热力窗口：两次读取都只含近 7 日窗口内的 01。
+	wantNodes := []StatNodeHit{{Node: "01", Hits: 2}}
+	if !reflect.DeepEqual(week.Nodes, wantNodes) {
+		t.Fatalf("近 7 日节次分布期望 %+v，实际 %+v", wantNodes, week.Nodes)
+	}
+	if !reflect.DeepEqual(month.Nodes, wantNodes) {
+		t.Fatalf("切到近 30 日热力窗口后节次分布仍应取近 7 日，期望 %+v，实际 %+v", wantNodes, month.Nodes)
 	}
 }
 
