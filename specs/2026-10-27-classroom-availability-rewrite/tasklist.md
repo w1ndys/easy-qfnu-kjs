@@ -159,8 +159,9 @@
     - 假时钟下 PV/UV 累加与日切去重（CP17）；记账失败不影响查询（CP18）
     - 统计表内不出现 IP、UA、来源页与查询原文（CP16）
     - Top 10 同分排序稳定、关键词归一化与截断、峰值占比合计为 1
-  - [ ] 9.11 公开 API 契约测试
+  - [x] 9.11 公开 API 契约测试
     - 四个端点（context、meta、query、screen）的响应形状、错误码、越界参数全覆盖
+      - screen 待 9.8 后补：9.8 尚未实现，本次只覆盖 context、meta、query（availability 与 day 两个 view）
     - CP10：请求中的节次区间决定结果，与请求时刻无关
     - 该周全空时返回结果并附带疑似无排课提示（Requirement 18.3）
 
