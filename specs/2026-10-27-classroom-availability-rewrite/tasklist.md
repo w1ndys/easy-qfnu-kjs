@@ -1,17 +1,17 @@
 # 需求实施计划
 
 - [ ] 1. M0 仓库基线清理与工程骨架
-  - [ ] 1.1 归档旧实现并清空主线
+  - [x] 1.1 归档旧实现并清空主线
     - 新建归档分支 `legacy/go-collector` 保存旧 `internal/`、`cmd/migrate`、`deploy/`、`docs/contract/*`、`docs/product-requirements.md`、`docs/upstream.md`、`specs/collector-full-sync/*`
     - 在主线删除上述内容，保留 `docs/prd.md`、`docs/pitfalls.md`、`docs/upstream-api.md`、`docs/decisions/`（design D3）
     - 同步修正 `docs/prd.md` 附录 B 的旧文档指向为归档分支
   - [ ] 1.2 建立目录结构与模块定义
     - 建顶层 `backend/` 与 `frontend/` 两个自足工程；后端目录为 `backend/{cmd/server,internal/{model,upstream,parser,clean,pipeline,publish,store,query,api,config},migrations}`（design 目录结构）
-    - `backend/go.mod` 写 `go 1.26.10` + `toolchain go1.26.10`，引入 pgx、cron、HTML 解析库与 x/text；`frontend/package.json` 初始化 React 19 + antd 6 工程
+    - `backend/go.mod` 写 `go 1.26.10`（不写 toolchain 行），引入 pgx、cron、HTML 解析库与 x/text；`frontend/package.json` 初始化 React 19 + antd 6 工程
     - `compose.yaml`、`Dockerfile.backend`、`Dockerfile.frontend`、`Taskfile.yml` 放仓库根目录；构建上下文仍为 `./backend` 与 `./frontend`，两个工程目录内不放 Dockerfile（design D2）
     - `model` 定义跨层结构体与错误码；`parser`、`clean` 只 import `model`，不 import `store`/`upstream`（design 依赖方向）
     - 在 `.golangci.yml` 配 depguard 规则，把 design 的依赖方向写成可执行约束，越层即 lint 失败
-  - [ ] 1.3 迁移基线与执行器
+  - [x] 1.3 迁移基线与执行器
     - 在 `backend/migrations/` 写 `0001` 基线：字典/轴、学期日历、room、admin_user、settings、release、release_room_building、observation、occupancy_detail、collect_run、collect_run_week、sync_task、alert_log、schema_migration（design 数据模型）
     - 种子：`dict` v1（`fully_free` 只进 `dict_state`）、`axis` v1、默认 cron 与空白名单
     - 迁移执行器在服务启动前跑完，失败退出（Requirement 31.2）
@@ -125,7 +125,7 @@
   - 确保所有测试通过,如有疑问请询问用户
 
 - [ ] 9. 公开 API
-  - [ ] 9.1 查询服务骨架
+  - [x] 9.1 查询服务骨架
     - 在 `backend/internal/query/` 实现只读查询，handler 只做参数解析、校验与序列化（design 依赖方向）
   - [ ] 9.2 context 与 meta
     - `context` 返回日期、学期、周次、星期、是否教学周（Requirement 17.1）
@@ -141,7 +141,7 @@
     - 无当前版本、非学期周、该周无观测返回无数据空态（Requirement 18.4）
   - [x] 9.6 新鲜度与过期
     - 以该周最近一次成功抓取时间为起点，8 天阈值；partial 不算失败（Requirement 17.3–17.4）
-  - [ ] 9.7 限流与缓存
+  - [x] 9.7 限流与缓存
     - 按来源每分钟上限拒绝超额请求（Requirement 32.1）
     - 相同查询复用缓存，新鲜度与空态与实时查询一致（Requirement 32.2）
   - [ ] 9.8 数据大屏接口

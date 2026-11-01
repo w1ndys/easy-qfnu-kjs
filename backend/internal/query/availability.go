@@ -158,7 +158,31 @@ func nodeNumber(node string) (int, bool) {
 }
 
 // Availability 返回某天某区间内每一节都可用、且落在筛选范围内的教室。
+// 开启 WithCache 时，相同查询在 TTL 内复用上一次的结果：空态与页顶提示随结果一并返回，
+// 命中缓存不重算也不查存储，所以新鲜度与空态跟缓存时刻的实时查询完全一致（Requirement 32.2）。
 func (s *Service) Availability(ctx context.Context, now time.Time, params AvailabilityParams) (AvailabilityResult, error) {
+	// 未装配缓存时保持 9.3 起的实时路径，连业务日期都不多解析一次。
+	if s.availabilityCache == nil {
+		return s.queryAvailability(ctx, now, params)
+	}
+
+	// 键用解析后的业务日期而不是只认 offset：跨零点后同一个 offset 指向另一天。
+	key := availabilityCacheKey(targetDate(now, params.DateOffset), params)
+	if cached, ok := s.availabilityCache.get(key, now); ok {
+		return cloneAvailabilityResult(cached), nil
+	}
+
+	result, err := s.queryAvailability(ctx, now, params)
+	// 失败不入缓存：瞬时故障若被缓存，一次抖动会被放大成整个窗口不可用。
+	if err != nil {
+		return result, err
+	}
+	s.availabilityCache.put(key, cloneAvailabilityResult(result), now)
+	return result, nil
+}
+
+// queryAvailability 是空教室查询的实时实现；命中缓存时不走这里。
+func (s *Service) queryAvailability(ctx context.Context, now time.Time, params AvailabilityParams) (AvailabilityResult, error) {
 	date := targetDate(now, params.DateOffset)
 	result := AvailabilityResult{Date: date.Format(time.DateOnly), Items: make([]AvailabilityRoom, 0)}
 

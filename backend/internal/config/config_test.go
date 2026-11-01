@@ -64,3 +64,41 @@ func TestLoad(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadTrustProxyHeaders 覆盖来源信任开关：默认信任前置反代，可显式关闭，非法值拒绝启动。
+func TestLoadTrustProxyHeaders(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    bool
+		wantErr bool
+	}{
+		{name: "未设置时默认信任反代", raw: "", want: true},
+		{name: "显式开启", raw: "true", want: true},
+		{name: "显式关闭", raw: "false", want: false},
+		{name: "用 0 关闭", raw: "0", want: false},
+		{name: "非法值拒绝启动", raw: "yes", wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://u:p@127.0.0.1:5432/db")
+			t.Setenv("TRUST_PROXY_HEADERS", c.raw)
+
+			cfg, err := Load()
+			// 期望失败的分支一律校验错误可被 ErrConfigInvalid 识别。
+			if c.wantErr {
+				if !errors.Is(err, model.ErrConfigInvalid) {
+					t.Fatalf("期望 ErrConfigInvalid，实际 err=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("期望成功，实际 err=%v", err)
+			}
+			if cfg.TrustProxyHeaders != c.want {
+				t.Fatalf("TrustProxyHeaders 期望 %v，实际 %v", c.want, cfg.TrustProxyHeaders)
+			}
+		})
+	}
+}

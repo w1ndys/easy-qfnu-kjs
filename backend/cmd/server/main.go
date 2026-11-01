@@ -73,6 +73,7 @@ func run() int {
 		"ocr_timeout", cfg.OCRTimeout.String(),
 		"db_host", dsn.Host,
 		"db_name", strings.TrimPrefix(dsn.Path, "/"),
+		"trust_proxy_headers", cfg.TrustProxyHeaders,
 		"version", version,
 	)
 
@@ -153,12 +154,14 @@ func run() int {
 		}
 		return result, nil
 	}
-	queries := query.New(weekLookup, availabilityLookup, dayLookup)
+	queries := query.New(weekLookup, availabilityLookup, dayLookup, query.WithCache(query.DefaultCacheTTL))
 
 	// HTTP 服务在独立 goroutine 里跑，主流程只负责等待终止信号。
+	// 限流的来源判定与查询缓存都在装配层决定：来源是否可信取决于部署拓扑（design D2），
+	// 缓存窗口见 Requirement 32.2。
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.New(log, pool, queries, queries, queries).Handler(),
+		Handler:           api.New(log, pool, queries, queries, queries, api.WithTrustedProxy(cfg.TrustProxyHeaders)).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

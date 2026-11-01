@@ -30,11 +30,19 @@ type Service struct {
 	weekLookup   WeekLookup         // 按日期取学期周，由装配层注入
 	availability AvailabilityLookup // 空教室读取，由装配层注入
 	day          DayLookup          // 全天状态读取，由装配层注入
+
+	// 两个缓存表默认都是 nil：不传 WithCache 时完全走实时查询，9.3–9.6 的行为不变。
+	availabilityCache *ttlCache[AvailabilityResult] // 空教室结果缓存
+	dayCache          *ttlCache[DayResult]          // 全天状态结果缓存
 }
 
-// New 组装查询服务。
-func New(weekLookup WeekLookup, availability AvailabilityLookup, day DayLookup) *Service {
-	return &Service{weekLookup: weekLookup, availability: availability, day: day}
+// New 组装查询服务；可选装配项用 Option 传入，目前只有 WithCache。
+func New(weekLookup WeekLookup, availability AvailabilityLookup, day DayLookup, opts ...Option) *Service {
+	s := &Service{weekLookup: weekLookup, availability: availability, day: day}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Context 计算某一天属于哪个学期第几周、星期几、是否在教学周内。

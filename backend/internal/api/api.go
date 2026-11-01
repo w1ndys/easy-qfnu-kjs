@@ -39,27 +39,47 @@ type Server struct {
 	availability AvailabilityProvider // 空教室查询
 	day          DayProvider          // 全天状态查询
 	clock        func() time.Time     // 时间来源，测试可替换
+	limiter      *rateLimiter         // 公开查询的按来源限流器
+	trustProxy   bool                 // 是否信任前置反代给出的来源头
+}
+
+// Option 是 API 层的可选装配项；不传时按默认口径工作：60 次/分钟、信任前置反代。
+type Option func(*Server)
+
+// WithTrustedProxy 声明 server 是否部署在可信反代之后。
+// 只有为 true 时才读取 X-Forwarded-For / X-Real-IP 作为限流来源；
+// 为 false 时只用直连对端地址，供 server 直接暴露给客户端的部署使用。
+func WithTrustedProxy(enabled bool) Option {
+	return func(s *Server) { s.trustProxy = enabled }
 }
 
 // New 组装 API 依赖；路由在 Handler 里一次性挂好。
-func New(log *slog.Logger, health Pinger, ctxSvc ContextProvider, availability AvailabilityProvider, day DayProvider) *Server {
-	return &Server{
+func New(log *slog.Logger, health Pinger, ctxSvc ContextProvider, availability AvailabilityProvider, day DayProvider, opts ...Option) *Server {
+	s := &Server{
 		log:          log,
 		health:       health,
 		ctxSvc:       ctxSvc,
 		availability: availability,
 		day:          day,
 		clock:        time.Now,
+		limiter:      newRateLimiter(rateLimitMaxPerWindow, rateLimitWindow),
+		// design D2 的部署拓扑是 web 反代 /api 到 server，默认按可信反代取来源。
+		trustProxy: true,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Handler 返回挂好路由的 mux，测试可直接用 httptest 打它。
+// 公开查询统一先过限流再进 handler：命中查询缓存也照样占一次配额。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
-	mux.HandleFunc("GET /api/context", s.contextInfo)
-	mux.HandleFunc("GET /api/query", s.query)
+	mux.Handle("GET /api/context", s.rateLimited(s.contextInfo))
+	mux.Handle("GET /api/query", s.rateLimited(s.query))
 	return mux
 }
 

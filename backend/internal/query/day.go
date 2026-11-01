@@ -81,7 +81,30 @@ type DayLookup func(ctx context.Context, filter DayFilter) (DayPage, error)
 
 // DayStatus 返回某间教室某一天 12 小节的逐节状态。
 // 空态（无版本、学期外、该周无观测、房间不可归属、该日全无观测）一律成功返回，由 hint 说明原因。
+// 开启 WithCache 时，相同查询在 TTL 内复用上一次的结果，其中也包括这些空态提示（Requirement 32.2）。
 func (s *Service) DayStatus(ctx context.Context, now time.Time, params DayParams) (DayResult, error) {
+	// 未装配缓存时保持 9.4 起的实时路径。
+	if s.dayCache == nil {
+		return s.queryDay(ctx, now, params)
+	}
+
+	// 与空教室一致：键带上解析后的业务日期，跨零点后同一 offset 不会命中昨天的结果。
+	key := dayCacheKey(targetDate(now, params.DateOffset), params)
+	if cached, ok := s.dayCache.get(key, now); ok {
+		return cloneDayResult(cached), nil
+	}
+
+	result, err := s.queryDay(ctx, now, params)
+	// 失败不入缓存，理由同空教室：错误不能粘住一个窗口。
+	if err != nil {
+		return result, err
+	}
+	s.dayCache.put(key, cloneDayResult(result), now)
+	return result, nil
+}
+
+// queryDay 是全天状态查询的实时实现；命中缓存时不走这里。
+func (s *Service) queryDay(ctx context.Context, now time.Time, params DayParams) (DayResult, error) {
 	date := targetDate(now, params.DateOffset)
 	result := DayResult{
 		RoomID: params.RoomID,
