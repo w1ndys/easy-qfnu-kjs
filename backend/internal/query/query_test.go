@@ -89,6 +89,31 @@ func TestContextOutsideTerm(t *testing.T) {
 	}
 }
 
+// TestContextNonTeachingWeek 覆盖落在学期周里但该周被标为非教学周：
+// 与「不在学期周」同口径，term/week/weekday 置零、in_calendar 为 false，只保留日期。
+func TestContextNonTeachingWeek(t *testing.T) {
+	nonTeaching := func(_ context.Context, _ time.Time) (model.TermWeek, bool, error) {
+		return model.TermWeek{
+			Term:       "2026-2027-1",
+			Week:       5,
+			Monday:     time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC),
+			InCalendar: false,
+		}, true, nil
+	}
+
+	now := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	info, err := New(nonTeaching, nil, nil).Context(t.Context(), now)
+	if err != nil {
+		t.Fatalf("期望成功，实际 err=%v", err)
+	}
+	if info.Term != "" || info.Week != 0 || info.Weekday != 0 || info.InCalendar {
+		t.Fatalf("非教学周应置零，实际 %+v", info)
+	}
+	if info.Date != "2026-10-21" {
+		t.Fatalf("日期仍应给出，实际 %s", info.Date)
+	}
+}
+
 // TestContextError 覆盖数据访问失败：错误原样上抛。
 func TestContextError(t *testing.T) {
 	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC)

@@ -19,9 +19,9 @@ type WeekLookup func(ctx context.Context, date time.Time) (model.TermWeek, bool,
 // ContextInfo 是页面上下文的对外形状。
 type ContextInfo struct {
 	Date       string `json:"date"`        // 业务日期，YYYY-MM-DD，按 Asia/Shanghai 解释
-	Term       string `json:"term"`        // 学期标识；不在学期周时为空
-	Week       int    `json:"week"`        // 教学周序号；不在学期周时为 0
-	Weekday    int    `json:"weekday"`     // 星期，1=周一 … 7=周日；不在学期周时为 0
+	Term       string `json:"term"`        // 学期标识；不在教学周时为空
+	Week       int    `json:"week"`        // 教学周序号；不在教学周时为 0
+	Weekday    int    `json:"weekday"`     // 星期，1=周一 … 7=周日；不在教学周时为 0
 	InCalendar bool   `json:"in_calendar"` // 该日是否落在教学周内
 }
 
@@ -57,7 +57,9 @@ func (s *Service) Context(ctx context.Context, now time.Time) (ContextInfo, erro
 
 	info := ContextInfo{Date: date.Format(time.DateOnly)}
 	// 没有学期周覆盖说明这天在学期之外（寒暑假等），按空字段返回而不是报错。
-	if !ok {
+	// 有学期周但该周被标为非教学周也走这条：口径与空教室/全天状态的置零口径一致，
+	// 学期、周次、星期都不给出，只保留日期。
+	if !ok || !tw.InCalendar {
 		return info, nil
 	}
 

@@ -1187,7 +1187,8 @@ func TestContractEmptyStateIsNot404(t *testing.T) {
 		data := contractSuccessData(t, rec)
 		assertContractKeys(t, "context data", data, contextKeys...)
 		got := contractTypedData[query.ContextInfo](t, rec)
-		want := query.ContextInfo{Date: "2026-10-21", Term: "2026-2027-1", Week: 5, Weekday: 3, InCalendar: false}
+		// 非教学周与「不在学期周」同口径：term/week/weekday 置零，in_calendar 为 false。
+		want := query.ContextInfo{Date: "2026-10-21"}
 		if got != want {
 			t.Fatalf("非教学周上下文不符：实际 %+v，期望 %+v", got, want)
 		}
