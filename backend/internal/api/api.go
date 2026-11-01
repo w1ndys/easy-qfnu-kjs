@@ -31,6 +31,11 @@ type DayProvider interface {
 	DayStatus(ctx context.Context, now time.Time, params query.DayParams) (query.DayResult, error)
 }
 
+// MetaProvider 提供版本、字典、轴与逐周新鲜度；由 query 服务实现，测试里可用替身。
+type MetaProvider interface {
+	Meta(ctx context.Context, now time.Time) (query.MetaResult, error)
+}
+
 // Server 持有 API 需要的依赖，公开与管理路由都挂到它上面。
 type Server struct {
 	log          *slog.Logger         // 结构化日志器
@@ -38,6 +43,7 @@ type Server struct {
 	ctxSvc       ContextProvider      // 页面上下文查询
 	availability AvailabilityProvider // 空教室查询
 	day          DayProvider          // 全天状态查询
+	meta         MetaProvider         // 版本与字典等元信息
 	clock        func() time.Time     // 时间来源，测试可替换
 	limiter      *rateLimiter         // 公开查询的按来源限流器
 	trustProxy   bool                 // 是否信任前置反代给出的来源头
@@ -51,6 +57,11 @@ type Option func(*Server)
 // 为 false 时只用直连对端地址，供 server 直接暴露给客户端的部署使用。
 func WithTrustedProxy(enabled bool) Option {
 	return func(s *Server) { s.trustProxy = enabled }
+}
+
+// WithMeta 装配 /api/meta 的数据来源；不传时该端点按内部错误处理。
+func WithMeta(provider MetaProvider) Option {
+	return func(s *Server) { s.meta = provider }
 }
 
 // New 组装 API 依赖；路由在 Handler 里一次性挂好。
@@ -79,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.Handle("GET /api/context", s.rateLimited(s.contextInfo))
+	mux.Handle("GET /api/meta", s.rateLimited(s.metaInfo))
 	mux.Handle("GET /api/query", s.rateLimited(s.query))
 	return mux
 }

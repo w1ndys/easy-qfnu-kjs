@@ -156,12 +156,83 @@ func run() int {
 	}
 	queries := query.New(weekLookup, availabilityLookup, dayLookup, query.WithCache(query.DefaultCacheTTL))
 
+	// meta 端点：版本/字典/轴/白名单直接来自存储层，逐周新鲜度复用 9.6 的查询服务。
+	metaLookup := func(ctx context.Context) (query.MetaFacts, error) {
+		facts, err := store.Meta(ctx, pool)
+		if err != nil {
+			return query.MetaFacts{}, err
+		}
+
+		mapped := query.MetaFacts{
+			DictStates: make([]query.MetaDictStateFacts, 0, len(facts.DictStates)),
+			AxisNodes:  make([]query.MetaAxisNode, 0, len(facts.AxisNodes)),
+			Buildings:  make([]query.MetaBuilding, 0, len(facts.Buildings)),
+		}
+		// 无当前版本时保持 nil，由查询层输出空态。
+		if facts.Release != nil {
+			mapped.Release = &query.MetaReleaseFacts{
+				ReleaseID:   facts.Release.ID,
+				GeneratedAt: facts.Release.GeneratedAt,
+				Term:        facts.Release.Term,
+				TotalWeeks:  facts.Release.TotalWeeks,
+				DictVersion: facts.Release.DictVersion,
+				AxisVersion: facts.Release.AxisVersion,
+			}
+		}
+		for _, state := range facts.DictStates {
+			mapped.DictStates = append(mapped.DictStates, query.MetaDictStateFacts{
+				StateKey:  state.StateKey,
+				Label:     state.Label,
+				Available: state.Available,
+			})
+		}
+		for _, node := range facts.AxisNodes {
+			mapped.AxisNodes = append(mapped.AxisNodes, query.MetaAxisNode{
+				Node:         node.Node,
+				Ordinal:      node.Ordinal,
+				Block:        node.Block,
+				BlockOrdinal: node.BlockOrdinal,
+			})
+		}
+		for _, building := range facts.Buildings {
+			mapped.Buildings = append(mapped.Buildings, query.MetaBuilding{
+				BuildingID: building.ID,
+				Name:       building.Name,
+			})
+		}
+		return mapped, nil
+	}
+	freshnessLookup := func(ctx context.Context, params query.FreshnessParams) (query.FreshnessFacts, error) {
+		facts, err := store.Freshness(ctx, pool, store.FreshnessRange{
+			Term:     params.Term,
+			FromWeek: params.FromWeek,
+			ToWeek:   params.ToWeek,
+		})
+		if err != nil {
+			return query.FreshnessFacts{}, err
+		}
+
+		mapped := query.FreshnessFacts{
+			Weeks:         make([]query.WeekFacts, 0, len(facts.Weeks)),
+			LastRunStatus: facts.LastRunStatus,
+		}
+		for _, week := range facts.Weeks {
+			mapped.Weeks = append(mapped.Weeks, query.WeekFacts{
+				Week:          week.Week,
+				Published:     week.Published,
+				LastSuccessAt: week.LastSuccessAt,
+			})
+		}
+		return mapped, nil
+	}
+	metaService := query.NewMeta(metaLookup, query.NewFreshness(freshnessLookup))
+
 	// HTTP 服务在独立 goroutine 里跑，主流程只负责等待终止信号。
 	// 限流的来源判定与查询缓存都在装配层决定：来源是否可信取决于部署拓扑（design D2），
 	// 缓存窗口见 Requirement 32.2。
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.New(log, pool, queries, queries, queries, api.WithTrustedProxy(cfg.TrustProxyHeaders)).Handler(),
+		Handler:           api.New(log, pool, queries, queries, queries, api.WithTrustedProxy(cfg.TrustProxyHeaders), api.WithMeta(metaService)).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

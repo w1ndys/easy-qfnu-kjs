@@ -127,7 +127,7 @@
 - [ ] 9. 公开 API
   - [x] 9.1 查询服务骨架
     - 在 `backend/internal/query/` 实现只读查询，handler 只做参数解析、校验与序列化（design 依赖方向）
-  - [ ] 9.2 context 与 meta
+  - [x] 9.2 context 与 meta
     - `context` 返回日期、学期、周次、星期、是否教学周（Requirement 17.1）
     - `meta` 返回版本标识、生成时间、字典、轴、白名单楼列表与逐周新鲜度（Requirement 17.2、17.5）
   - [x] 9.3 空教室查询
