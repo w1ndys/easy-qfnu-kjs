@@ -45,6 +45,8 @@ func (s *Server) queryAvailability(w http.ResponseWriter, r *http.Request, param
 		return
 	}
 	s.ok(w, result)
+	// 记账在响应写出之后投递：查询先返回，统计失败只影响统计（Requirement 34.1、CP18）。
+	s.recordAvailability(r, params)
 }
 
 // queryDay 处理 /api/query 的全天状态分支：一天一间教室的 12 小节状态。
@@ -67,4 +69,6 @@ func (s *Server) queryDay(w http.ResponseWriter, r *http.Request, params query.D
 		return
 	}
 	s.ok(w, result)
+	// 与空教室一致：响应先返回，记账失败不改状态码与响应体（CP18）。
+	s.recordDay(r, params)
 }

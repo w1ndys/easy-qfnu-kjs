@@ -15,10 +15,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/w1ndys/easy-qfnu-kjs/internal/api"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/config"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/query"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/stats"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
 )
 
@@ -227,12 +230,28 @@ func run() int {
 	}
 	metaService := query.NewMeta(metaLookup, query.NewFreshness(freshnessLookup))
 
+	// 访问统计：记账在查询响应写出之后入队，后台批量落库，失败只记日志（Requirement 34.1、CP18）。
+	// 清理任务与查询、采集共用连接池但互不阻塞，按日删除 90 天前的记录（Requirement 34.10）。
+	// 部署级盐由 2.2 的秘密管理提供，本任务尚未落库，这里显式传 nil（只按天加盐）。
+	//
+	// 统计后台用自己的生命周期：进程信号先停 HTTP，等在途请求把记账投递完，再停记账与清理。
+	// 直接复用信号的 ctx 会让记账在 HTTP 收尾期间就退出，收尾期间投递的记账会滞留在队列里。
+	statsCtx, stopStats := context.WithCancel(context.Background())
+	statsRecorder := stats.NewRecorder(log, statsBatchWriter{pool: pool}, stats.WithVisitorSalt(nil))
+	statsCleaner := stats.NewCleaner(log, statsBatchDeleter{pool: pool})
+	go statsRecorder.Run(statsCtx)
+	go statsCleaner.Run(statsCtx)
+
 	// HTTP 服务在独立 goroutine 里跑，主流程只负责等待终止信号。
 	// 限流的来源判定与查询缓存都在装配层决定：来源是否可信取决于部署拓扑（design D2），
 	// 缓存窗口见 Requirement 32.2。
 	server := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           api.New(log, pool, queries, queries, queries, api.WithTrustedProxy(cfg.TrustProxyHeaders), api.WithMeta(metaService)).Handler(),
+		Addr: cfg.ListenAddr,
+		Handler: api.New(log, pool, queries, queries, queries,
+			api.WithTrustedProxy(cfg.TrustProxyHeaders),
+			api.WithMeta(metaService),
+			api.WithStats(statsRecorder),
+		).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
@@ -244,14 +263,41 @@ func run() int {
 	log.Info("HTTP 监听", "addr", cfg.ListenAddr)
 
 	<-ctx.Done()
-	// 收到终止信号不等同步任务，只给在途只读请求 5 秒收尾，超时直接断开。
-	log.Info("收到终止信号，立即退出")
+	// 收到终止信号不等同步任务，只给在途只读请求 5 秒收尾，超时直接断开；
+	// 之后还要等统计后台把最后一批写完才返回。
+	log.Info("收到终止信号，开始收尾")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Warn("HTTP 关闭未在宽限内完成", "err", err)
 	}
+	// HTTP 收尾之后才停记账：收尾期间投递的记账仍会被接收。
+	// 记账退出前会用不受取消影响的上下文写完最后一批，所以必须等它退出再返回，
+	// 连接池在 run 返回后才关，先等一等才不会丢掉最后一批计数。
+	stopStats()
+	statsRecorder.Wait()
+	statsCleaner.Wait()
 	return 0
+}
+
+// statsBatchWriter 把连接池适配成统计写入入口，避免 internal/stats 直接持有驱动类型。
+type statsBatchWriter struct {
+	pool *pgxpool.Pool
+}
+
+// WriteStats 实现 stats.BatchWriter。
+func (w statsBatchWriter) WriteStats(ctx context.Context, batch store.StatsBatch) error {
+	return store.WriteStats(ctx, w.pool, batch)
+}
+
+// statsBatchDeleter 把连接池适配成统计清理入口。
+type statsBatchDeleter struct {
+	pool *pgxpool.Pool
+}
+
+// DeleteStatsBefore 实现 stats.Deleter。
+func (d statsBatchDeleter) DeleteStatsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	return store.DeleteStatsBefore(ctx, d.pool, cutoff)
 }
 
 // newLogger 按配置级别构造结构化日志器；w 由调用方给出，便于测试注入。

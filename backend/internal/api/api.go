@@ -47,6 +47,7 @@ type Server struct {
 	clock        func() time.Time     // 时间来源，测试可替换
 	limiter      *rateLimiter         // 公开查询的按来源限流器
 	trustProxy   bool                 // 是否信任前置反代给出的来源头
+	recorder     StatsRecorder        // 访问统计记账入口；nil 表示不记账
 }
 
 // Option 是 API 层的可选装配项；不传时按默认口径工作：60 次/分钟、信任前置反代。
