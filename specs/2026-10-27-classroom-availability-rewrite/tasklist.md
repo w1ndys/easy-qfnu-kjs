@@ -45,7 +45,7 @@
     - `GET /` → 验证码 → `POST logon&flag=sess` 取 `scode#sxh` → 生成 `encoded` → `POST logonLdap` → `GET jsMain.jsp` 校验成功标识（Requirement 2.1–2.4）
     - 验证码交 OCR，`code=200` 判成功，失败换图重试累计 ≤3 次
     - 密码错误立即失败、不重试；会话失效只重登录一次
-  - [ ] 3.3 学期与周历请求
+  - [x] 3.3 学期与周历请求
     - 学期页取学期编号与 `kbjcmsid`；周历页取「第 X 周 / Y 周」并做 `1 ≤ X ≤ Y` 校验（Requirement 3.1、3.3）
   - [ ] 3.4 楼列表与周矩阵请求
     - 楼列表按校区取 `dm`/`dmmc`；矩阵请求按楼筛选 + 周次，每楼每周一次（Requirement 4.1、5.1）

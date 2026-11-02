@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"image"
@@ -31,6 +32,11 @@ const (
 	fixtureSessionLost  = `<html><title>登录</title>用户登录</html>`
 	fixtureBusinessPath = "/jsxsd/kbxx/jsjy_query"
 	fixtureBusinessOK   = "<html>学期页 2026-2027-1</html>"
+	// fixtureTermPage 是学期页夹具：学期编号与 id/name 为 kbjcmsid 的隐藏输入。
+	fixtureTermPage = `<html><body><div>2026-2027-1</div>` +
+		`<input type="hidden" id="kbjcmsid" name="kbjcmsid" value="20251"></body></html>`
+	// fixtureWeekCalendar 是周历页夹具：紧凑写法的「第 X 周 / Y 周」。
+	fixtureWeekCalendar = `<html><body><div>第5周 /16周</div></body></html>`
 )
 
 // loginRequest 记录一次上游或 OCR 请求的关键字段，供断言请求顺序、表单与 Cookie 会话。
@@ -72,6 +78,9 @@ type loginFixture struct {
 	businessBodies []string
 	businessHook   func(call int) string
 	businessN      int
+
+	weekCalendarBodies []string
+	weekCalendarN      int
 }
 
 // newLoginFixture 装配两个 httptest 服务并注册清理。
@@ -79,13 +88,14 @@ func newLoginFixture(t *testing.T) *loginFixture {
 	t.Helper()
 
 	f := &loginFixture{
-		t:              t,
-		captchaImages:  make([][]byte, 0, 4),
-		ocrBodies:      []string{`{"code":200,"message":"Success","data":"` + fixtureCaptchaCode + `"}`},
-		sessBody:       fixtureSessBody,
-		logonBodies:    []string{fixtureLoginOK},
-		jsMainBody:     "<html><title>教学一体化服务平台</title></html>",
-		businessBodies: []string{fixtureBusinessOK},
+		t:                  t,
+		captchaImages:      make([][]byte, 0, 4),
+		ocrBodies:          []string{`{"code":200,"message":"Success","data":"` + fixtureCaptchaCode + `"}`},
+		sessBody:           fixtureSessBody,
+		logonBodies:        []string{fixtureLoginOK},
+		jsMainBody:         "<html><title>教学一体化服务平台</title></html>",
+		businessBodies:     []string{fixtureBusinessOK},
+		weekCalendarBodies: []string{fixtureWeekCalendar},
 	}
 	for seed := range 4 {
 		f.captchaImages = append(f.captchaImages, captchaJPEG(t, seed))
@@ -170,6 +180,13 @@ func (f *loginFixture) handleUpstream(w http.ResponseWriter, r *http.Request) {
 		} else {
 			body = bodies[min(call, len(bodies)-1)]
 		}
+		_, _ = io.WriteString(w, body)
+	case weekCalendarPath:
+		f.mu.Lock()
+		call := f.weekCalendarN
+		f.weekCalendarN++
+		body := f.weekCalendarBodies[min(call, len(f.weekCalendarBodies)-1)]
+		f.mu.Unlock()
 		_, _ = io.WriteString(w, body)
 	default:
 		http.NotFound(w, r)
@@ -427,6 +444,55 @@ func TestLoginExhaustsOCRAttempts(t *testing.T) {
 	}
 	if len(f.ocrSnapshot()) != maxLoginAttempts {
 		t.Fatalf("期望 %d 次 OCR 调用，实际 %d 次", maxLoginAttempts, len(f.ocrSnapshot()))
+	}
+}
+
+// TestLoginStopsOnParentContextCancel 覆盖父 ctx 取消分支（3.2 minor）：
+// 验证码阶段的错误必须原样交回调用方，不能被当成可重试的验证码失败、
+// 耗尽 3 次后再误报 model.ErrUpstreamOCRFailed。
+func TestLoginStopsOnParentContextCancel(t *testing.T) {
+	f := newLoginFixture(t)
+	c := newTestClient(t, f.srv.URL, WithMinInterval(0))
+
+	started := make(chan struct{})
+	var once sync.Once
+	var ocrCalls atomic.Int64
+	c.ocrHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		ocrCalls.Add(1)
+		once.Do(func() { close(started) })
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- c.Login(ctx, f.loginOptions()) }()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("登录未进入 OCR 阶段")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("父 ctx 取消应返回 context.Canceled，实际 err=%v", err)
+		}
+		if errors.Is(err, model.ErrUpstreamOCRFailed) {
+			t.Fatalf("父 ctx 取消不能混成 OCR 失败，实际 err=%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("父 ctx 取消后登录未返回")
+	}
+
+	if got := ocrCalls.Load(); got != 1 {
+		t.Fatalf("取消后不应重试 OCR，实际调用 %d 次", got)
+	}
+	if verifycode, logonLDAP, jsMain := f.counts(); verifycode != 1 || logonLDAP != 0 || jsMain != 0 {
+		t.Fatalf("取消后不应再取验证码或提交，实际 验证码/提交/校验 = %d/%d/%d",
+			verifycode, logonLDAP, jsMain)
 	}
 }
 

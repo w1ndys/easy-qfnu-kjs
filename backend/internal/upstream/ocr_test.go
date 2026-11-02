@@ -3,8 +3,10 @@ package upstream
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,6 +125,31 @@ func TestRecognizeCaptchaRequiresCode200AndData(t *testing.T) {
 				t.Fatalf("识别文本期望 %q，实际 %q", tc.want, got)
 			}
 		})
+	}
+}
+
+// TestRecognizeCaptchaDropsUpstreamMessage 覆盖第三方原文不进错误串（3.2 minor）：
+// OCR 服务的 message 可能很长或夹带请求内容，错误消息只保留业务 code 供排障。
+func TestRecognizeCaptchaDropsUpstreamMessage(t *testing.T) {
+	const upstreamMessage = `上游错误原文：<script>alert(1)</script> internal-detail`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w,
+			`{"code":503,"message":"`+upstreamMessage+`","data":""}`)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, "http://upstream.test", WithMinInterval(0))
+	_, err := c.recognizeCaptcha(t.Context(), srv.URL+ocrPath, []byte{0xFF, 0xD8, 0xFF})
+	if !errors.Is(err, errOCR) {
+		t.Fatalf("期望 OCR 失败原因，实际 err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "code=503") {
+		t.Fatalf("错误串应保留业务 code 供排障，实际 err=%v", err)
+	}
+	for _, forbidden := range []string{"internal-detail", "<script>", "上游错误原文"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("错误串不能带第三方原文片段 %q，实际 err=%v", forbidden, err)
+		}
 	}
 }
 

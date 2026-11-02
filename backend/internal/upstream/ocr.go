@@ -40,11 +40,11 @@ func WithOCRTimeout(timeout time.Duration) Option {
 }
 
 // ocrResult 是 ddddocr-fastapi 的响应体。
-// Message 只用于错误消息；Data 是识别文本，不写日志、不进错误消息。
+// 只解出 code 与 data：message 是第三方服务的原文，可能很长或夹带请求内容，
+// 一律不解析、不进错误消息，避免原文进日志（Requirement 30.2）。
 type ocrResult struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	Data    string `json:"data"`
+	Code int    `json:"code"`
+	Data string `json:"data"`
 }
 
 // buildOCRURL 校验 OCR base URL 并拼出识别端点；保留 base 自带的路径前缀。
@@ -96,7 +96,8 @@ func (c *Client) recognizeCaptcha(ctx context.Context, ocrURL string, image []by
 		return "", fmt.Errorf("%w: 响应不是约定的 JSON: %w", errOCR, err)
 	}
 	if result.Code != ocrSuccessCode {
-		return "", fmt.Errorf("%w: 业务 code=%d message=%q", errOCR, result.Code, result.Message)
+		// 只保留业务 code：message 是第三方原文，不能拼进错误串。
+		return "", fmt.Errorf("%w: 业务 code=%d", errOCR, result.Code)
 	}
 	text := strings.TrimSpace(result.Data)
 	if text == "" {

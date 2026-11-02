@@ -90,6 +90,11 @@ func (c *Client) loginLocked(ctx context.Context, opts LoginOptions) error {
 	for attempt := 1; attempt <= maxLoginAttempts; attempt++ {
 		code, captchaErr := c.fetchCaptchaCode(ctx, ocrURL)
 		if captchaErr != nil {
+			// 调用方 ctx 已结束：这不是验证码或 OCR 失败，换图重试也不会变好，
+			// 必须原样交回 context 错误，而不是耗尽 3 次后误报 ErrUpstreamOCRFailed。
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			// OCR 失败或验证码不是图片：换一张图再试，尝试次数照算。
 			lastCaptchaErr = captchaErr
 			continue

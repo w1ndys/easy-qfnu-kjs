@@ -34,6 +34,12 @@ var ErrUpstreamAuthFailed = errors.New("上游账号或密码错误")
 // 上层据此映射 error_code=ocr_failed（Requirement 2.3）。
 var ErrUpstreamOCRFailed = errors.New("验证码识别失败")
 
+// ErrUpstreamCalendarInvalid 表示学期页或周历页的正文不符合预期：
+// 学期编号、kbjcmsid 或「第 X 周 / Y 周」缺失，或周次不满足 1 ≤ X ≤ Y。
+// 这是数据级失败，拿同一份页面重试不会变好；上层据此结束本轮并保持学期日历不变
+// （Requirement 3.4），不要当作网络错误重试。
+var ErrUpstreamCalendarInvalid = errors.New("学期或周历内容非法")
+
 // ErrStatsFailed 表示一次访问统计的写入或清理失败。
 // 统计是旁路数据：失败只记日志，不改变查询响应与 HTTP 状态码（CP18）。
 var ErrStatsFailed = errors.New("访问统计失败")
