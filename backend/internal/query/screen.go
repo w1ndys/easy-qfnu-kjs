@@ -506,6 +506,11 @@ func cloneScreenResult(result ScreenResult) ScreenResult {
 	}
 	if result.LastRun != nil {
 		lastRun := *result.LastRun
+		// DurationMS 是指针：只复制结构体会让缓存的耗时与返回值共享同一个 int64。
+		if result.LastRun.DurationMS != nil {
+			duration := *result.LastRun.DurationMS
+			lastRun.DurationMS = &duration
+		}
 		clone.LastRun = &lastRun
 	}
 	clone.Scale.Window = cloneInts(result.Scale.Window)

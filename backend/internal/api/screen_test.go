@@ -293,11 +293,18 @@ func TestScreenJSONKeys(t *testing.T) {
 }
 
 // TestScreenEmptyState 覆盖无当前版本：HTTP 200、code 0、release:null 与 empty:true，
-// 不返回 40401，也不把 weeks 与占用分布序列化成 null。
+// 不返回 40401，也不把空块序列化成 null。
+// 夹具按 query.emptyScreenResult 的形状造：traffic 与 peaks 是对象，
+// 「不是 null」落在它们的数组成员（榜单、peak.top、热力矩阵）与计数零值上。
 func TestScreenEmptyState(t *testing.T) {
 	matrix := make([][]float64, 7)
 	for weekday := range matrix {
 		matrix[weekday] = make([]float64, 5)
+	}
+	// 空态热力仍是固定 7 × 24 的全零矩阵，前端不必切换形状。
+	heatmap := make([][]int, 7)
+	for weekday := range heatmap {
+		heatmap[weekday] = make([]int, 24)
 	}
 	fake := &fakeScreenProvider{result: query.ScreenResult{
 		Scale: query.ScreenScale{Window: []int{}},
@@ -307,6 +314,12 @@ func TestScreenEmptyState(t *testing.T) {
 			ByBuilding:     []query.ScreenBuildingOccupancy{},
 			ByWeekdayBlock: matrix,
 		},
+		Leaderboard: stats.Leaderboard{
+			Buildings: []stats.BuildingHit{},
+			Rooms:     []stats.RoomHit{},
+			Keywords:  []stats.KeywordHit{},
+		},
+		Peaks:            stats.Peaks{Heatmap: heatmap, Top: []stats.Peak{}},
 		Trend:            []stats.TrendPoint{},
 		NodeDistribution: []stats.NodeHit{},
 	}}
@@ -341,6 +354,61 @@ func TestScreenEmptyState(t *testing.T) {
 	if buildings, ok := occupancy["by_building"].([]any); !ok || len(buildings) != 0 {
 		t.Fatalf("空态 by_building 期望空数组，实际 %v", occupancy["by_building"])
 	}
+
+	// 访问统计块在空态下也不能是 null：数组给 []，计数给 0。
+	assertEmptyArray := func(name string, raw any) {
+		t.Helper()
+		items, ok := raw.([]any)
+		if !ok {
+			t.Fatalf("%s 期望 []（而不是 null），实际 %v", name, raw)
+		}
+		if len(items) != 0 {
+			t.Fatalf("%s 期望空数组，实际 %v", name, items)
+		}
+	}
+
+	traffic, ok := data["traffic"].(map[string]any)
+	if !ok {
+		t.Fatalf("空态 traffic 期望对象，实际 %v", data["traffic"])
+	}
+	for _, kind := range []string{"pv", "uv"} {
+		counts, ok := traffic[kind].(map[string]any)
+		if !ok {
+			t.Fatalf("空态 traffic.%s 期望对象，实际 %v", kind, traffic[kind])
+		}
+		for _, window := range []string{"today", "d7", "d30"} {
+			if counts[window] != float64(0) {
+				t.Fatalf("空态 traffic.%s.%s 期望 0，实际 %v", kind, window, counts[window])
+			}
+		}
+	}
+
+	leaderboard, ok := data["leaderboard"].(map[string]any)
+	if !ok {
+		t.Fatalf("空态 leaderboard 期望对象，实际 %v", data["leaderboard"])
+	}
+	for _, key := range []string{"buildings", "rooms", "keywords"} {
+		assertEmptyArray("leaderboard."+key, leaderboard[key])
+	}
+
+	peaks, ok := data["peaks"].(map[string]any)
+	if !ok {
+		t.Fatalf("空态 peaks 期望对象，实际 %v", data["peaks"])
+	}
+	assertEmptyArray("peaks.top", peaks["top"])
+	rows, ok := peaks["heatmap"].([]any)
+	if !ok || len(rows) != 7 {
+		t.Fatalf("空态 peaks.heatmap 期望 7 行，实际 %v", peaks["heatmap"])
+	}
+	for weekday, row := range rows {
+		cells, ok := row.([]any)
+		if !ok || len(cells) != 24 {
+			t.Fatalf("空态热力第 %d 行期望 24 列，实际 %v", weekday+1, row)
+		}
+	}
+
+	assertEmptyArray("trend", data["trend"])
+	assertEmptyArray("node_distribution", data["node_distribution"])
 }
 
 // TestScreenNoErrorDetails 覆盖 Requirement 33.6 与 CP13：

@@ -152,6 +152,45 @@ func TestSnapshotEmptyFactsReturnsEmptySlices(t *testing.T) {
 	}
 }
 
+// TestSnapshotThirtyDayWindowBoundaries 覆盖近 30 日窗口的闭区间边界（Requirement 34.7）：
+// 今天与今天减 29 天在内，今天减 30 天不在；趋势序列恰好 30 项，不能多补一天。
+func TestSnapshotThirtyDayWindowBoundaries(t *testing.T) {
+	now := time.Date(2026, 11, 30, 9, 0, 0, 0, shanghai)
+	// 仓储把 date 扫成 UTC 零点，整形按年月日取，不涉及时区换算。
+	firstDay := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)   // 今天减 29 天：窗口内
+	beforeDay := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC) // 今天减 30 天：窗口外
+
+	var windows store.StatWindows
+	reader := newFactsReader(t, store.StatFacts{Days: []store.StatDayPV{
+		{Day: beforeDay, PV: 9},
+		{Day: firstDay, PV: 4},
+	}}, &windows)
+
+	snapshot, err := reader.Snapshot(context.Background(), now, ReadParams{PeakDays: PeakDays30})
+	if err != nil {
+		t.Fatalf("读取访问统计失败: %v", err)
+	}
+
+	assertRange(t, "近 30 日", windows.D30, "2026-11-01", "2026-11-30")
+	// 三张榜单与热力共用同一段 30 日窗口，边界必须一致。
+	assertRange(t, "近 30 日热力", windows.Peak, "2026-11-01", "2026-11-30")
+
+	if len(snapshot.Trend) != TrendDays {
+		t.Fatalf("趋势应固定 %d 天，实际 %d 天", TrendDays, len(snapshot.Trend))
+	}
+	if got := snapshot.Trend[0]; got.Day != "2026-11-01" || got.PV != 4 {
+		t.Fatalf("趋势首日应是窗口内最早的一天（今天减 29 天）且 PV=4，实际 %+v", got)
+	}
+	if got := snapshot.Trend[len(snapshot.Trend)-1]; got.Day != "2026-11-30" {
+		t.Fatalf("趋势末日应是今天，实际 %+v", got)
+	}
+	for _, point := range snapshot.Trend {
+		if point.Day == "2026-10-31" || point.PV == 9 {
+			t.Fatalf("今天减 30 天不在窗口内，不该出现在趋势里：%+v", point)
+		}
+	}
+}
+
 // TestTrendFillsMissingDays 覆盖逐日趋势补零与跨时区日期解释（Requirement 34.7）。
 func TestTrendFillsMissingDays(t *testing.T) {
 	now := time.Date(2026, 11, 2, 9, 0, 0, 0, shanghai)

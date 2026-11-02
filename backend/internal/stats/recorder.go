@@ -204,11 +204,14 @@ func (r *Recorder) drain() []record {
 }
 
 // flush 聚合并写出一批记账；失败只记日志，不向上返回（CP18）。
+// 写入上下文先摘掉父 ctx 的取消信号再套超时：Run 的 ctx 在关闭流程里会被取消，
+// 而「正在写这一批」不该随信号一起中断——那会让整批记账在退出瞬间凭空消失。
+// 仍在超时之内，库真挂住时后台 goroutine 不会被永久占用。
 func (r *Recorder) flush(ctx context.Context, records []record) {
 	if len(records) == 0 {
 		return
 	}
-	writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 	defer cancel()
 
 	if err := r.writer.WriteStats(writeCtx, buildBatch(records)); err != nil {
@@ -231,13 +234,12 @@ func (r *Recorder) finish() {
 }
 
 // flushFinal 用不受 ctx 取消影响的上下文写完最后一批：退出前不再因为信号而丢数据。
+// 取消信号的摘除在 flush 里统一做，这里给一个没有父 ctx 的根即可。
 func (r *Recorder) flushFinal(records []record) {
 	if len(records) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-	defer cancel()
-	r.flush(ctx, records)
+	r.flush(context.Background(), records)
 }
 
 // buildBatch 把一批记账折成落库增量：

@@ -571,6 +571,128 @@ func TestScreenCacheSeparatesPeakDays(t *testing.T) {
 	}
 }
 
+// TestScreenCacheKeyNormalizesPeakDays 覆盖归一化后的峰值窗口才进缓存键：
+// 0（零值）与 7 是同一个口径，不该各占一条缓存、更不该命中到 30 日那份结果。
+func TestScreenCacheKeyNormalizesPeakDays(t *testing.T) {
+	now := screenNow()
+	if got, want := screenCacheKey(now, screenPeakDays(0)), screenCacheKey(now, screenPeakDays(stats.PeakDays7)); got != want {
+		t.Fatalf("零值应与近 7 日共用缓存键，实际 %+v / %+v", got, want)
+	}
+
+	harness := newScreenTestService(fullScreenFacts(), screenFreshnessFacts(), screenSnapshotFixture())
+	// 先按零值（默认）取一次，再显式要 7 日：同一业务日期、同一 TTL 内只该聚合一次。
+	if _, err := harness.svc.Screen(t.Context(), now, ScreenParams{}); err != nil {
+		t.Fatalf("默认窗口查询失败: %v", err)
+	}
+	if _, err := harness.svc.Screen(t.Context(), now.Add(time.Second), ScreenParams{PeakDays: stats.PeakDays7}); err != nil {
+		t.Fatalf("近 7 日查询失败: %v", err)
+	}
+	if harness.lookup.calls != 1 {
+		t.Fatalf("零值与 7 日应命中同一条缓存，实际聚合 %d 次", harness.lookup.calls)
+	}
+	if harness.traffic.calls != 1 || harness.traffic.gotParam.PeakDays != stats.PeakDays7 {
+		t.Fatalf("访问统计应按近 7 日只读一次，实际 %d 次、窗口 %d", harness.traffic.calls, harness.traffic.gotParam.PeakDays)
+	}
+}
+
+// TestScreenEmptyStateIsCached 覆盖空态也进缓存：没有当前版本时同样 30 秒复用，
+// 空态不是「失败」，不该让大屏轮询每次都打到存储。
+func TestScreenEmptyStateIsCached(t *testing.T) {
+	harness := newScreenTestService(ScreenFacts{}, screenFreshnessFacts(), screenSnapshotFixture())
+	now := screenNow()
+
+	first, err := harness.svc.Screen(t.Context(), now, ScreenParams{})
+	if err != nil {
+		t.Fatalf("空态查询失败: %v", err)
+	}
+	if !first.Empty {
+		t.Fatal("无当前版本时应是空态")
+	}
+	second, err := harness.svc.Screen(t.Context(), now.Add(29*time.Second), ScreenParams{})
+	if err != nil {
+		t.Fatalf("空态缓存命中不应失败: %v", err)
+	}
+	if harness.lookup.calls != 1 {
+		t.Fatalf("空态也应缓存 30 秒，实际聚合 %d 次", harness.lookup.calls)
+	}
+	if !second.Empty || !reflect.DeepEqual(first, second) {
+		t.Fatalf("空态缓存结果不一致:\n首次 %+v\n缓存 %+v", first, second)
+	}
+}
+
+// TestScreenCacheHitIsIsolatedFromCallerMutation 覆盖缓存命中的深拷贝隔离：
+// 调用方（这里是 handler 之后的任何一层）改写返回值里的切片、指针，
+// 都不能影响下一次命中；DurationMS 这个 *int64 也在隔离范围内。
+func TestScreenCacheHitIsIsolatedFromCallerMutation(t *testing.T) {
+	harness := newScreenTestService(fullScreenFacts(), screenFreshnessFacts(), screenSnapshotFixture())
+	now := screenNow()
+
+	first, err := harness.svc.Screen(t.Context(), now, ScreenParams{})
+	if err != nil {
+		t.Fatalf("首次查询失败: %v", err)
+	}
+	// 篡改首次返回值的每一块可变数据：指针、切片、二维矩阵都覆盖到。
+	*first.LastRun.DurationMS = 9999
+	first.Weeks[0].Week = 99
+	*first.Weeks[0].LastSuccessAt = time.Time{}
+	first.Scale.Window[0] = 99
+	first.Occupancy.ByWeekdayBlock[0][0] = 9.9
+	first.Occupancy.ByBuilding[0].Cells = 9999
+	first.Peaks.Heatmap[0][8] = 9999
+	first.Peaks.Top[0].Share = 0.99
+	first.Leaderboard.Buildings[0].Hits = 9999
+	first.Leaderboard.Rooms[0].Hits = 9999
+	first.Leaderboard.Keywords[0].Hits = 9999
+	first.Trend[0].PV = 9999
+	first.NodeDistribution[0].Hits = 9999
+
+	second, err := harness.svc.Screen(t.Context(), now.Add(time.Second), ScreenParams{})
+	if err != nil {
+		t.Fatalf("缓存命中查询失败: %v", err)
+	}
+	if harness.lookup.calls != 1 {
+		t.Fatalf("一秒后应命中缓存，实际聚合 %d 次", harness.lookup.calls)
+	}
+	if got := *second.LastRun.DurationMS; got != 1830000 {
+		t.Fatalf("缓存里的耗时被返回值改写污染，实际 %d", got)
+	}
+	if second.Weeks[0].Week != 5 || second.Weeks[0].LastSuccessAt == nil || !second.Weeks[0].LastSuccessAt.Equal(*freshAt(-time.Hour)) {
+		t.Fatalf("缓存里的逐周新鲜度被改写污染: %+v", second.Weeks[0])
+	}
+	if !reflect.DeepEqual(second.Scale.Window, []int{5, 8}) {
+		t.Fatalf("缓存里的采集窗口被改写污染: %v", second.Scale.Window)
+	}
+	if second.Occupancy.ByWeekdayBlock[0][0] != 0.4 || second.Occupancy.ByBuilding[0].Cells != 20 {
+		t.Fatalf("缓存里的占用分布被改写污染: %+v / %v", second.Occupancy.ByBuilding, second.Occupancy.ByWeekdayBlock[0][0])
+	}
+	if second.Peaks.Heatmap[0][8] != 118 || second.Peaks.Top[0].Share != 0.11 {
+		t.Fatalf("缓存里的热力与峰值被改写污染: %d / %v", second.Peaks.Heatmap[0][8], second.Peaks.Top[0].Share)
+	}
+	if second.Leaderboard.Buildings[0].Hits != 612 || second.Leaderboard.Rooms[0].Hits != 148 ||
+		second.Leaderboard.Keywords[0].Hits != 94 {
+		t.Fatalf("缓存里的榜单被改写污染: %+v", second.Leaderboard)
+	}
+	if second.Trend[0].PV != 1180 || second.NodeDistribution[0].Hits != 4210 {
+		t.Fatalf("缓存里的趋势或节次分布被改写污染: %+v / %+v", second.Trend, second.NodeDistribution)
+	}
+
+	// 命中返回的也是副本：再篡改一次，第三次命中仍要拿到原件。
+	*second.LastRun.DurationMS = 8888
+	second.Peaks.Heatmap[0][8] = 8888
+	second.Weeks = append(second.Weeks, WeekFreshness{Week: 100})
+	third, err := harness.svc.Screen(t.Context(), now.Add(2*time.Second), ScreenParams{})
+	if err != nil {
+		t.Fatalf("第二次缓存命中失败: %v", err)
+	}
+	if harness.lookup.calls != 1 {
+		t.Fatalf("两次篡改都不该让缓存失效，实际聚合 %d 次", harness.lookup.calls)
+	}
+	if *third.LastRun.DurationMS != 1830000 || third.Peaks.Heatmap[0][8] != 118 || len(third.Weeks) != 4 {
+		t.Fatalf("缓存被命中返回值的改写污染: 耗时 %d、热力 %d、周数 %d",
+			*third.LastRun.DurationMS, third.Peaks.Heatmap[0][8], len(third.Weeks))
+	}
+}
+
 // TestScreenCacheSkipsFailures 覆盖「失败不入缓存」：一次抖动之后仍能返回成功结果。
 func TestScreenCacheSkipsFailures(t *testing.T) {
 	harness := newScreenTestService(fullScreenFacts(), screenFreshnessFacts(), screenSnapshotFixture())

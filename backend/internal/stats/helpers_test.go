@@ -79,6 +79,60 @@ func (w *fakeWriter) waitForFlush(t *testing.T) {
 	}
 }
 
+// blockingWriter 是「写到一半」的写入替身：进入 WriteStats 后挂住，直到测试放行。
+// 用来模拟「关闭信号到来时这一批已经在写」：用例先取消再放行，
+// 断言写入仍然完成，且写上下文没有被父 ctx 的取消信号带走。
+type blockingWriter struct {
+	started chan struct{} // 第一次进入 WriteStats 时关闭
+	release chan struct{} // 测试关闭它来放行
+	once    sync.Once
+
+	mu            sync.Mutex
+	batches       []store.StatsBatch
+	ctxErrAtWrite error // 写入完成时看到的 ctx 状态
+}
+
+// newBlockingWriter 造一个会挂住写入的替身。
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+// WriteStats 实现 BatchWriter：先发「已开始」信号，再等测试放行。
+func (w *blockingWriter) WriteStats(ctx context.Context, batch store.StatsBatch) error {
+	w.once.Do(func() { close(w.started) })
+	<-w.release
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.batches = append(w.batches, batch)
+	w.ctxErrAtWrite = ctx.Err()
+	return nil
+}
+
+// batchCount 返回已写完的批数。
+func (w *blockingWriter) batchCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.batches)
+}
+
+// lastBatch 返回最近写完的一批增量；没有写入时返回零值。
+func (w *blockingWriter) lastBatch() store.StatsBatch {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.batches) == 0 {
+		return store.StatsBatch{}
+	}
+	return w.batches[len(w.batches)-1]
+}
+
+// writeCtxErr 返回最近一次写入完成时写上下文的状态。
+func (w *blockingWriter) writeCtxErr() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ctxErrAtWrite
+}
+
 // fakeDeleter 是清理替身：记录每次删除的边界，可注入错误。
 type fakeDeleter struct {
 	mu      sync.Mutex

@@ -332,6 +332,56 @@ func TestRecorderKeepsNoRawIdentifiers(t *testing.T) {
 	}
 }
 
+// TestRecorderInFlightFlushSurvivesCancel 覆盖关闭时「正在写的那一批」不被取消（CP18）：
+// stopStats 会取消 Run 的 ctx，但已经在写的批次必须照常写完，
+// 否则每次重启都会把最后一批已离开队列的记账整段丢掉。
+func TestRecorderInFlightFlushSurvivesCancel(t *testing.T) {
+	now := time.Date(2026, 11, 2, 10, 0, 0, 0, shanghai)
+	writer := newBlockingWriter()
+	recorder := NewRecorder(quietLogger(), writer,
+		WithClock(func() time.Time { return now }),
+		WithQueueSize(8),
+		// 批量阈值 1：第一条记账立刻进入写入并挂住，等待用例取消。
+		WithBatchSize(1),
+		WithFlushInterval(time.Hour),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		recorder.Run(ctx)
+	}()
+
+	recorder.Record(Visit{VisitorID: "v1"})
+	select {
+	case <-writer.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待在途写入开始超时")
+	}
+
+	// 写入已经在进行，这时候才来取消信号：旧实现会把这一批的写上下文一起取消。
+	cancel()
+	close(writer.release)
+
+	recorder.Wait()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ctx 结束后 Run 应退出")
+	}
+
+	if got := writer.batchCount(); got != 1 {
+		t.Fatalf("在途的这一批应写完，实际 %d 批", got)
+	}
+	if err := writer.writeCtxErr(); err != nil {
+		t.Fatalf("在途写入的上下文不该被取消，实际 %v", err)
+	}
+	if got := pvByHour(writer.lastBatch())[10]; got != 1 {
+		t.Fatalf("在途批次应是 10 时的 1 次访问，实际 %d 次", got)
+	}
+}
+
 // TestRecorderDropsWhenQueueFullWithoutBlocking 覆盖队列满时不阻塞查询（CP18）。
 func TestRecorderDropsWhenQueueFullWithoutBlocking(t *testing.T) {
 	now := time.Date(2026, 11, 2, 10, 0, 0, 0, shanghai)
@@ -467,5 +517,6 @@ func TestBuildBatchKeepsDuplicateVisitorsOncePerHour(t *testing.T) {
 // 编译期断言：测试替身满足对外接口。
 var (
 	_ BatchWriter = (*fakeWriter)(nil)
+	_ BatchWriter = (*blockingWriter)(nil)
 	_ Deleter     = (*fakeDeleter)(nil)
 )

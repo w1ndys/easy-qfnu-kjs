@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/query"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/stats"
@@ -213,6 +215,63 @@ func TestNonQueryEndpointsDoNotRecord(t *testing.T) {
 	}
 	if got := len(recorder.snapshot()); got != 0 {
 		t.Fatalf("context 与 meta 不应记账，实际记了 %d 次", got)
+	}
+}
+
+// TestKeywordLimitMatchesStatsTruncation 覆盖关键词入口上限与统计截断的联动（Requirement 34.5）：
+// /api/query 的 keyword 上限按字符计，长度与 stats.MaxKeywordRunes 相同；
+// 恰好到上限的合法输入进统计后不被截断，超一个字符的输入在入口就被拒绝、根本不记账。
+func TestKeywordLimitMatchesStatsTruncation(t *testing.T) {
+	if maxKeywordRunes != stats.MaxKeywordRunes {
+		t.Fatalf("入口上限 %d 与统计侧截断 %d 必须一致，否则要么白截、要么放过超长键",
+			maxKeywordRunes, stats.MaxKeywordRunes)
+	}
+
+	// 恰好 32 个字符（中文按字符计，不是字节）。
+	atLimit := strings.Repeat("教", maxKeywordRunes)
+	recorder := &captureRecorder{}
+	srv := New(quietLogger(), nil, nil,
+		&fakeAvailabilityProvider{result: query.AvailabilityResult{Date: "2026-10-23"}}, nil,
+		WithStats(recorder))
+	srv.clock = fixedQueryClock
+
+	values := url.Values{}
+	values.Set("keyword", atLimit)
+	rec := serveQueryWith(t, srv, values, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("上限内的关键词期望 200，实际 %d，body=%s", rec.Code, rec.Body.String())
+	}
+	visits := recorder.snapshot()
+	if len(visits) != 1 {
+		t.Fatalf("一次成功查询应记一次账，实际 %d 次", len(visits))
+	}
+	if visits[0].Keyword != atLimit {
+		t.Fatalf("入口放行的关键词应原样记账，实际 %q（%d 字符）",
+			visits[0].Keyword, utf8.RuneCountInString(visits[0].Keyword))
+	}
+	// 统计侧对同一输入不做任何截断：两边上限一致时，入口允许的最长值正好落满。
+	if got := stats.NormalizeKeyword(visits[0].Keyword); got != atLimit {
+		t.Fatalf("统计归一化不该截断入口允许的关键词，实际 %q", got)
+	}
+
+	// 多一个字符：入口直接 400，不记账；统计侧的截断只兜别的调用方。
+	overLimit := strings.Repeat("教", maxKeywordRunes+1)
+	if got := utf8.RuneCountInString(stats.NormalizeKeyword(overLimit)); got != stats.MaxKeywordRunes {
+		t.Fatalf("统计侧应把超长关键词截到 %d 个字符，实际 %d 个", stats.MaxKeywordRunes, got)
+	}
+
+	recorder = &captureRecorder{}
+	srv = New(quietLogger(), nil, nil,
+		&fakeAvailabilityProvider{result: query.AvailabilityResult{Date: "2026-10-23"}}, nil,
+		WithStats(recorder))
+	srv.clock = fixedQueryClock
+	values.Set("keyword", overLimit)
+	rec = serveQueryWith(t, srv, values, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("超长关键词期望 400，实际 %d，body=%s", rec.Code, rec.Body.String())
+	}
+	if got := len(recorder.snapshot()); got != 0 {
+		t.Fatalf("被入口拒绝的查询不应记账，实际记了 %d 次", got)
 	}
 }
 
