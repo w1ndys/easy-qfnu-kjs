@@ -15,6 +15,8 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
@@ -76,6 +78,18 @@ type Client struct {
 	clock func() time.Time
 	// sleep 是等待实现，测试可快进。
 	sleep func(context.Context, time.Duration) error
+
+	// ocrTimeout 是单次 OCR 识别往返的上限，与上游单次尝试超时分开配置。
+	ocrTimeout time.Duration
+	// ocrHTTPClient 只用于 OCR 服务：它没有 CookieJar，绝不把教务会话发给第三方服务。
+	ocrHTTPClient *http.Client
+
+	// loginMu 串行化登录：并发重登录会互相踢掉同一个教务会话（Requirement 2.6）。
+	// credentials 也由它保护，只在内存里保存，不落盘、不写日志。
+	loginMu     sync.Mutex
+	credentials *LoginOptions
+	// loginSeq 在每次登录成功后自增，用来判定「本次会话失效前是否已有别的调用完成过重登录」。
+	loginSeq atomic.Int64
 }
 
 // Option 调整客户端参数；不传时按 Default* 常量工作。
@@ -129,6 +143,8 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 		minInterval:    DefaultMinInterval,
 		maxRetries:     DefaultMaxRetries,
 		attemptTimeout: DefaultAttemptTimeout,
+		ocrTimeout:     DefaultOCRTimeout,
+		ocrHTTPClient:  &http.Client{},
 		paceGate:       make(chan struct{}, 1),
 		clock:          time.Now,
 		sleep:          waitFor,
@@ -145,6 +161,9 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 	}
 	if c.maxRetries < 0 {
 		return nil, fmt.Errorf("%w: 重试次数不能为负", model.ErrConfigInvalid)
+	}
+	if c.ocrTimeout <= 0 {
+		return nil, fmt.Errorf("%w: OCR 超时必须为正", model.ErrConfigInvalid)
 	}
 
 	// 复制调用方给的客户端再挂 jar：既不修改外部实例，也保证会话只在本 Client 内。

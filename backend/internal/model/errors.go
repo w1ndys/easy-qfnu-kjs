@@ -25,6 +25,15 @@ var ErrUpstreamSessionExpired = errors.New("上游会话失效")
 // 这是任务级错误，由 pipeline 按任务的必需/可选属性决定轮次走向。
 var ErrUpstreamFailed = errors.New("上游请求失败")
 
+// ErrUpstreamAuthFailed 表示上游返回密码错误标记：账号或密码无效。
+// 重试与重登录都不会变好，上层据此立即结束本轮并映射 error_code=auth_failed（Requirement 2.4）。
+var ErrUpstreamAuthFailed = errors.New("上游账号或密码错误")
+
+// ErrUpstreamOCRFailed 表示验证码识别在累计 3 次尝试后仍失败：
+// OCR 服务异常、超时，或 OCR 识别结果被上游判为验证码错误。
+// 上层据此映射 error_code=ocr_failed（Requirement 2.3）。
+var ErrUpstreamOCRFailed = errors.New("验证码识别失败")
+
 // ErrStatsFailed 表示一次访问统计的写入或清理失败。
 // 统计是旁路数据：失败只记日志，不改变查询响应与 HTTP 状态码（CP18）。
 var ErrStatsFailed = errors.New("访问统计失败")
