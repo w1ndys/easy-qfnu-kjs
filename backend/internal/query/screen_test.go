@@ -163,7 +163,7 @@ func screenSnapshotFixture() stats.Snapshot {
 func TestScreenShape(t *testing.T) {
 	harness := newScreenTestService(fullScreenFacts(), screenFreshnessFacts(), screenSnapshotFixture())
 
-	got, err := harness.svc.Screen(t.Context(), screenNow())
+	got, err := harness.svc.Screen(t.Context(), screenNow(), ScreenParams{})
 	if err != nil {
 		t.Fatalf("大屏查询失败: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestScreenShape(t *testing.T) {
 		}
 	}
 
-	// 访问统计块原样来自 9.9 的快照，默认近 7 日窗口。
+	// 访问统计块原样来自 9.9 的快照；未传参数时按默认近 7 日窗口。
 	if harness.traffic.calls != 1 {
 		t.Fatalf("应只读一次访问统计，实际 %d 次", harness.traffic.calls)
 	}
@@ -285,10 +285,38 @@ func TestScreenShape(t *testing.T) {
 	}
 }
 
+// TestScreenPeakDaysPassedToTraffic 覆盖 peak_days 下传：
+// 缺省、显式 7、显式 30 与非法值分别归一成 7/7/30/7 后交给访问统计。
+func TestScreenPeakDaysPassedToTraffic(t *testing.T) {
+	cases := []struct {
+		name   string
+		params ScreenParams
+		want   int
+	}{
+		{name: "缺省", params: ScreenParams{}, want: stats.PeakDays7},
+		{name: "显式 7", params: ScreenParams{PeakDays: stats.PeakDays7}, want: stats.PeakDays7},
+		{name: "显式 30", params: ScreenParams{PeakDays: stats.PeakDays30}, want: stats.PeakDays30},
+		{name: "非法值按默认", params: ScreenParams{PeakDays: 11}, want: stats.DefaultPeakDays},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// 每条用例用独立服务，避免前一条的缓存命中掩盖入参。
+			harness := newScreenTestService(fullScreenFacts(), screenFreshnessFacts(), screenSnapshotFixture())
+			if _, err := harness.svc.Screen(t.Context(), screenNow(), c.params); err != nil {
+				t.Fatalf("大屏查询失败: %v", err)
+			}
+			if harness.traffic.gotParam.PeakDays != c.want {
+				t.Fatalf("peak_days 应下传 %d，实际 %d", c.want, harness.traffic.gotParam.PeakDays)
+			}
+		})
+	}
+}
+
 // TestScreenJSONKeys 按契约键名断言 data 各层，防止漏写 json tag 时字段名变成驼峰。
 func TestScreenJSONKeys(t *testing.T) {
 	harness := newScreenTestService(fullScreenFacts(), screenFreshnessFacts(), screenSnapshotFixture())
-	result, err := harness.svc.Screen(t.Context(), screenNow())
+	result, err := harness.svc.Screen(t.Context(), screenNow(), ScreenParams{})
 	if err != nil {
 		t.Fatalf("大屏查询失败: %v", err)
 	}
@@ -352,7 +380,7 @@ func TestScreenNoErrorDetails(t *testing.T) {
 	facts.LastRun = screenRunFixture("failed", time.Date(2026, 10, 27, 1, 0, 0, 0, time.UTC), 0)
 	harness := newScreenTestService(facts, screenFreshnessFacts(), screenSnapshotFixture())
 
-	result, err := harness.svc.Screen(t.Context(), screenNow())
+	result, err := harness.svc.Screen(t.Context(), screenNow(), ScreenParams{})
 	if err != nil {
 		t.Fatalf("大屏查询失败: %v", err)
 	}
@@ -374,7 +402,7 @@ func TestScreenNoErrorDetails(t *testing.T) {
 func TestScreenEmptyState(t *testing.T) {
 	harness := newScreenTestService(ScreenFacts{}, screenFreshnessFacts(), screenSnapshotFixture())
 
-	got, err := harness.svc.Screen(t.Context(), screenNow())
+	got, err := harness.svc.Screen(t.Context(), screenNow(), ScreenParams{})
 	if err != nil {
 		t.Fatalf("空态不应失败: %v", err)
 	}
@@ -450,12 +478,12 @@ func TestScreenCacheReusesResultWithinTTL(t *testing.T) {
 	harness := newScreenTestService(fullScreenFacts(), screenFreshnessFacts(), screenSnapshotFixture())
 	now := screenNow()
 
-	first, err := harness.svc.Screen(t.Context(), now)
+	first, err := harness.svc.Screen(t.Context(), now, ScreenParams{})
 	if err != nil {
 		t.Fatalf("首次查询失败: %v", err)
 	}
 	// 第 29 秒仍在 30 秒窗口内，必须命中缓存。
-	second, err := harness.svc.Screen(t.Context(), now.Add(29*time.Second))
+	second, err := harness.svc.Screen(t.Context(), now.Add(29*time.Second), ScreenParams{})
 	if err != nil {
 		t.Fatalf("缓存命中不应失败: %v", err)
 	}
@@ -476,10 +504,10 @@ func TestScreenCacheExpiresAtTTL(t *testing.T) {
 	harness := newScreenTestService(fullScreenFacts(), screenFreshnessFacts(), screenSnapshotFixture())
 	now := screenNow()
 
-	if _, err := harness.svc.Screen(t.Context(), now); err != nil {
+	if _, err := harness.svc.Screen(t.Context(), now, ScreenParams{}); err != nil {
 		t.Fatalf("首次查询失败: %v", err)
 	}
-	if _, err := harness.svc.Screen(t.Context(), now.Add(ScreenCacheTTL)); err != nil {
+	if _, err := harness.svc.Screen(t.Context(), now.Add(ScreenCacheTTL), ScreenParams{}); err != nil {
 		t.Fatalf("过期后查询失败: %v", err)
 	}
 
@@ -495,15 +523,51 @@ func TestScreenCacheSeparatesBusinessDate(t *testing.T) {
 	// 上海时区 23:59:50，11 秒后换日，仍在 30 秒 TTL 内。
 	beforeMidnight := time.Date(2026, 10, 28, 15, 59, 50, 0, time.UTC)
 
-	if _, err := harness.svc.Screen(t.Context(), beforeMidnight); err != nil {
+	if _, err := harness.svc.Screen(t.Context(), beforeMidnight, ScreenParams{}); err != nil {
 		t.Fatalf("首次查询失败: %v", err)
 	}
-	if _, err := harness.svc.Screen(t.Context(), beforeMidnight.Add(11*time.Second)); err != nil {
+	if _, err := harness.svc.Screen(t.Context(), beforeMidnight.Add(11*time.Second), ScreenParams{}); err != nil {
 		t.Fatalf("跨零点查询失败: %v", err)
 	}
 
 	if harness.lookup.calls != 2 {
 		t.Fatalf("跨业务日期应重新聚合，实际调用 %d 次", harness.lookup.calls)
+	}
+}
+
+// TestScreenCacheSeparatesPeakDays 断言缓存键含 peak_days：
+// 同一业务日期与同一个 30 秒 TTL 内，7 与 30 是两份不同的热力与峰值，不能共用一条缓存。
+func TestScreenCacheSeparatesPeakDays(t *testing.T) {
+	harness := newScreenTestService(fullScreenFacts(), screenFreshnessFacts(), screenSnapshotFixture())
+	now := screenNow()
+
+	if _, err := harness.svc.Screen(t.Context(), now, ScreenParams{PeakDays: stats.PeakDays7}); err != nil {
+		t.Fatalf("近 7 日查询失败: %v", err)
+	}
+	// 1 秒后切到近 30 日：仍在首次写入的 30 秒 TTL 内，但窗口不同必须重新聚合。
+	if _, err := harness.svc.Screen(t.Context(), now.Add(time.Second), ScreenParams{PeakDays: stats.PeakDays30}); err != nil {
+		t.Fatalf("近 30 日查询失败: %v", err)
+	}
+
+	if harness.lookup.calls != 2 {
+		t.Fatalf("切换峰值窗口应重新聚合，实际调用 %d 次", harness.lookup.calls)
+	}
+	if harness.traffic.calls != 2 {
+		t.Fatalf("切换峰值窗口应重新读一次访问统计，实际 %d 次", harness.traffic.calls)
+	}
+	if harness.traffic.gotParam.PeakDays != stats.PeakDays30 {
+		t.Fatalf("切换后应按近 30 日取数，实际 %d", harness.traffic.gotParam.PeakDays)
+	}
+	if screenCacheKey(now, stats.PeakDays7) == screenCacheKey(now, stats.PeakDays30) {
+		t.Fatal("缓存键必须包含 peak_days")
+	}
+
+	// 退回近 7 日仍在首次写入的 TTL 内，应命中 7 日的那条缓存而不是再聚合一次。
+	if _, err := harness.svc.Screen(t.Context(), now.Add(2*time.Second), ScreenParams{PeakDays: stats.PeakDays7}); err != nil {
+		t.Fatalf("回到近 7 日查询失败: %v", err)
+	}
+	if harness.lookup.calls != 2 {
+		t.Fatalf("同一峰值窗口应复用缓存，实际调用 %d 次", harness.lookup.calls)
 	}
 }
 
@@ -513,12 +577,12 @@ func TestScreenCacheSkipsFailures(t *testing.T) {
 	harness.lookup.err = errors.New("db down")
 	now := screenNow()
 
-	if _, err := harness.svc.Screen(t.Context(), now); err == nil {
+	if _, err := harness.svc.Screen(t.Context(), now, ScreenParams{}); err == nil {
 		t.Fatal("存储失败时应返回错误")
 	}
 
 	harness.lookup.err = nil
-	got, err := harness.svc.Screen(t.Context(), now.Add(time.Second))
+	got, err := harness.svc.Screen(t.Context(), now.Add(time.Second), ScreenParams{})
 	if err != nil {
 		t.Fatalf("恢复后应成功: %v", err)
 	}
@@ -613,7 +677,7 @@ func TestScreenWeekFallbacks(t *testing.T) {
 	harness := newScreenTestService(facts, screenFreshnessFacts(), screenSnapshotFixture())
 	harness.svc.weekLookup = screenWeekLookup("2025-2026-2", 9)
 
-	got, err := harness.svc.Screen(t.Context(), screenNow())
+	got, err := harness.svc.Screen(t.Context(), screenNow(), ScreenParams{})
 	if err != nil {
 		t.Fatalf("大屏查询失败: %v", err)
 	}
@@ -638,7 +702,7 @@ func TestScreenLastRunNil(t *testing.T) {
 	facts.LastRun = nil
 
 	harness := newScreenTestService(facts, screenFreshnessFacts(), screenSnapshotFixture())
-	got, err := harness.svc.Screen(t.Context(), screenNow())
+	got, err := harness.svc.Screen(t.Context(), screenNow(), ScreenParams{})
 	if err != nil {
 		t.Fatalf("大屏查询失败: %v", err)
 	}
@@ -663,7 +727,7 @@ func TestScreenNotWired(t *testing.T) {
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := test.svc.Screen(t.Context(), screenNow()); err == nil {
+			if _, err := test.svc.Screen(t.Context(), screenNow(), ScreenParams{}); err == nil {
 				t.Fatal("装配缺项时应返回错误")
 			}
 		})
@@ -677,7 +741,7 @@ func TestScreenWeeksEmptyWindow(t *testing.T) {
 	facts.Release.TotalWeeks = 0
 
 	harness := newScreenTestService(facts, screenFreshnessFacts(), screenSnapshotFixture())
-	got, err := harness.svc.Screen(t.Context(), screenNow())
+	got, err := harness.svc.Screen(t.Context(), screenNow(), ScreenParams{})
 	if err != nil {
 		t.Fatalf("大屏查询失败: %v", err)
 	}

@@ -38,7 +38,7 @@ type MetaProvider interface {
 
 // ScreenProvider 提供数据大屏聚合；由 query 服务实现，测试里可用替身。
 type ScreenProvider interface {
-	Screen(ctx context.Context, now time.Time) (query.ScreenResult, error)
+	Screen(ctx context.Context, now time.Time, params query.ScreenParams) (query.ScreenResult, error)
 }
 
 // Server 持有 API 需要的依赖，公开与管理路由都挂到它上面。

@@ -18,8 +18,9 @@ const maxCacheEntries = 1024
 // view、date_offset、building、keyword、start_node、end_node、limit、offset、room_id。
 // 额外带上解析后的业务日期：date_offset 只在「今天」不变时才等价，
 // 跨零点后同一个 offset 指向另一天，只按 offset 做键会把昨天的结果当成今天的。
+// 大屏视图另带 peak_days：7 与 30 是两份不同的热力与峰值，不能共用一条缓存。
 type cacheKey struct {
-	view       string // 视图名，区分空教室与全天状态
+	view       string // 视图名，区分空教室、全天状态与大屏
 	date       string // 解析后的业务日期 YYYY-MM-DD
 	dateOffset int    // 原始日期偏移，保留在键里让「同日期不同 offset」的语义可读
 	building   string // 教学楼编号；空串表示全部
@@ -29,6 +30,7 @@ type cacheKey struct {
 	limit      int    // 每页条数
 	offset     int    // 分页偏移
 	roomID     string // 全天状态的房间身份
+	peakDays   int    // 大屏热力与峰值窗口（7/30）；其它视图保持零值
 }
 
 // cacheEntry 是一条带过期时刻的结果；过期时刻由写入时的 now 加 TTL 得到。

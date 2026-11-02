@@ -21,7 +21,7 @@ import (
 // 本文件是公开 API 的契约测试（tasklist 9.11）：装配真实的 api.New 与 query.New，
 // 只把存储层替换成函数替身，覆盖 HTTP → 参数校验 → query 判定 → JSON 的完整链路。
 // 响应键名按 design 的公开 API 契约逐层断言，错误码按错误码表断言；
-// 9.8 的大屏（/api/screen）尚未实现，暂不在本文件覆盖。
+// /api/screen 的契约用例见同包的 screen_test.go（9.8 已实现）。
 
 // contractStore 是契约测试的替身存储层：每个字段对应 query 包的一个注入点。
 // 方法值转接既保留了函数类型的注入方式，又能记录调用次数与入参，

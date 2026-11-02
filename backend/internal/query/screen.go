@@ -142,6 +142,14 @@ type ScreenTrafficReader interface {
 	Snapshot(ctx context.Context, now time.Time, params stats.ReadParams) (stats.Snapshot, error)
 }
 
+// ScreenParams 是 /api/screen 的口径参数。零值等价于默认的近 7 日窗口：
+// 未传参数的调用方（含装配层）不必关心默认值，由 screenPeakDays 统一归一。
+type ScreenParams struct {
+	// PeakDays 是星期 × 小时热力、峰值占比与三张 Top 10 的窗口，只认 7 或 30；
+	// 其它值按默认 7 天处理，与 stats.ReadParams.PeakDays 的语义一致。
+	PeakDays int
+}
+
 // ScreenService 聚合大屏数据：规模、版本、逐周新鲜度、最近轮次、异常计数与占用分布。
 // 逐周新鲜度复用 FreshnessService，访问统计复用 stats.Reader，不另写一套判定与聚合。
 type ScreenService struct {
@@ -164,23 +172,24 @@ func NewScreen(lookup ScreenLookup, freshness *FreshnessService, traffic ScreenT
 	}
 }
 
-// Screen 返回大屏载荷；同一业务日期内 30 秒复用同一份结果（Requirement 33.7、CP15）。
+// Screen 返回大屏载荷；同一业务日期与同一峰值窗口内 30 秒复用同一份结果（Requirement 33.7、CP15）。
 // 只缓存成功结果：失败不入缓存，一次数据库抖动不该让大屏在这个窗口里一直报错。
-func (s *ScreenService) Screen(ctx context.Context, now time.Time) (ScreenResult, error) {
+func (s *ScreenService) Screen(ctx context.Context, now time.Time, params ScreenParams) (ScreenResult, error) {
 	if s.lookup == nil {
 		return ScreenResult{}, fmt.Errorf("大屏查询未装配")
 	}
 
-	// 键含解析后的业务日期：跨零点后「今天」变了，统计窗口与当前周都跟着变；
-	// 接口没有其它查询参数，所以日期就是全部维度（将来暴露参数必须补进键）。
-	key := screenCacheKey(now)
+	// 7 与 30 是两份不同的热力与峰值，必须分开缓存；日期之外再带上归一化后的窗口，
+	// 否则先到的 7 日结果会在 TTL 内被 30 日的请求命中。
+	peakDays := screenPeakDays(params.PeakDays)
+	key := screenCacheKey(now, peakDays)
 	if s.cache != nil {
 		if cached, ok := s.cache.get(key, now); ok {
 			return cloneScreenResult(cached), nil
 		}
 	}
 
-	result, err := s.build(ctx, now)
+	result, err := s.build(ctx, now, peakDays)
 	if err != nil {
 		return ScreenResult{}, err
 	}
@@ -191,7 +200,7 @@ func (s *ScreenService) Screen(ctx context.Context, now time.Time) (ScreenResult
 }
 
 // build 是未命中缓存时的实时聚合。
-func (s *ScreenService) build(ctx context.Context, now time.Time) (ScreenResult, error) {
+func (s *ScreenService) build(ctx context.Context, now time.Time, peakDays int) (ScreenResult, error) {
 	facts, err := s.lookup(ctx)
 	if err != nil {
 		return ScreenResult{}, err
@@ -232,7 +241,7 @@ func (s *ScreenService) build(ctx context.Context, now time.Time) (ScreenResult,
 	result.Anomalies = screenAnomalies(facts.Published)
 	result.Occupancy = screenOccupancy(facts.Occupancy)
 
-	if err := s.applyTraffic(ctx, now, &result); err != nil {
+	if err := s.applyTraffic(ctx, now, peakDays, &result); err != nil {
 		return ScreenResult{}, err
 	}
 	return result, nil
@@ -264,12 +273,12 @@ func (s *ScreenService) screenWeeks(ctx context.Context, now time.Time, release 
 }
 
 // applyTraffic 把 9.9 的访问统计快照拼进大屏。
-// 大屏热力与峰值默认取近 7 日：design 的 /api/screen 没有查询参数，7/30 切换留待接口扩展。
-func (s *ScreenService) applyTraffic(ctx context.Context, now time.Time, result *ScreenResult) error {
+// 热力、峰值与三张 Top 10 的窗口由 peak_days 决定：7 与 30 只换这三块，其余块不变。
+func (s *ScreenService) applyTraffic(ctx context.Context, now time.Time, peakDays int, result *ScreenResult) error {
 	if s.traffic == nil {
 		return fmt.Errorf("访问统计读取未装配")
 	}
-	snapshot, err := s.traffic.Snapshot(ctx, now, stats.ReadParams{PeakDays: stats.DefaultPeakDays})
+	snapshot, err := s.traffic.Snapshot(ctx, now, stats.ReadParams{PeakDays: peakDays})
 	if err != nil {
 		return err
 	}
@@ -281,9 +290,23 @@ func (s *ScreenService) applyTraffic(ctx context.Context, now time.Time, result 
 	return nil
 }
 
-// screenCacheKey 组装大屏缓存键：视图名 + 解析后的业务日期。
-func screenCacheKey(now time.Time) cacheKey {
-	return cacheKey{view: ViewScreen, date: targetDate(now, 0).Format(time.DateOnly)}
+// screenPeakDays 把入参归一成 7 或 30：接口只允许这两个值，零值与非法值按近 7 日处理。
+// 归一化后再进缓存键，避免 0 与 7 各占一条却返回同一份结果。
+func screenPeakDays(days int) int {
+	if days == stats.PeakDays30 {
+		return stats.PeakDays30
+	}
+	return stats.DefaultPeakDays
+}
+
+// screenCacheKey 组装大屏缓存键：视图名 + 解析后的业务日期 + 归一化后的峰值窗口。
+// 日期之外必须带 peak_days：7 与 30 的热力、峰值与 Top 10 不同，不能共用一条缓存。
+func screenCacheKey(now time.Time, peakDays int) cacheKey {
+	return cacheKey{
+		view:     ViewScreen,
+		date:     targetDate(now, 0).Format(time.DateOnly),
+		peakDays: peakDays,
+	}
 }
 
 // screenWindow 把采集窗口整成 [起始周, 结束周]；窗口不完整或非法时给空数组。

@@ -139,7 +139,7 @@ model    → 标准库
 | GET | `/api/context` | — | `{date, term, week, weekday, in_calendar}` |
 | GET | `/api/meta` | — | 版本、字典、轴、教学楼列表、逐周新鲜度 |
 | GET | `/api/query` | `view=availability\|day`、`keyword`、`date_offset`、`building`、`start_node`、`end_node`、`limit`、`offset` | 空教室或全天状态 |
-| GET | `/api/screen` | — | 数据大屏聚合：规模、版本、逐周新鲜度、最近轮次、异常计数、占用分布 |
+| GET | `/api/screen` | `peak_days=7\|30` | 数据大屏聚合：规模、版本、逐周新鲜度、最近轮次、异常计数、占用分布 |
 
 大屏接口只读聚合，服务端缓存 30 秒。响应形状：
 
@@ -184,7 +184,7 @@ model    → 标准库
 - 无当前版本时返回 200 与 `release: null` 加 `empty: true`，页面显示「暂无数据」。
 - 占用率口径与查询一致：`available` 按字典投影，未知与复合计入已占用。
 
-参数约束：`date_offset` 0..10；`building` 空表示全部；`start_node`/`end_node` 01..12 且起点不晚于终点；`limit` 1..200 默认 50；`offset ≥ 0`。服务端不感知时钟，默认区间只在前端（Requirement 19）。
+参数约束：`date_offset` 0..10；`building` 空表示全部；`start_node`/`end_node` 01..12 且起点不晚于终点；`limit` 1..200 默认 50；`offset ≥ 0`；`peak_days` 7 或 30（缺省 7，非法返回 40001，并进入大屏缓存键）。服务端不感知时钟，默认区间只在前端（Requirement 19）。
 
 ### 管理 API
 

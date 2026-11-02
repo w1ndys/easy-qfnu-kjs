@@ -16,24 +16,36 @@ import (
 
 // fakeScreenProvider 记录入参并返回预设结果。
 type fakeScreenProvider struct {
-	result query.ScreenResult
-	err    error
-	calls  int
-	gotNow time.Time
+	result    query.ScreenResult
+	err       error
+	calls     int
+	gotNow    time.Time
+	gotParams query.ScreenParams
 }
 
 // Screen 实现 ScreenProvider。
-func (f *fakeScreenProvider) Screen(_ context.Context, now time.Time) (query.ScreenResult, error) {
+func (f *fakeScreenProvider) Screen(_ context.Context, now time.Time, params query.ScreenParams) (query.ScreenResult, error) {
 	f.calls++
 	f.gotNow = now
+	f.gotParams = params
 	return f.result, f.err
 }
 
-// serveScreen 打一次 /api/screen。
+// serveScreen 打一次不带查询参数的 /api/screen。
 func serveScreen(t *testing.T, srv *Server) *httptest.ResponseRecorder {
 	t.Helper()
+	return serveScreenQuery(t, srv, "")
+}
+
+// serveScreenQuery 打一次带查询串的 /api/screen。
+func serveScreenQuery(t *testing.T, srv *Server, rawQuery string) *httptest.ResponseRecorder {
+	t.Helper()
+	target := "/api/screen"
+	if rawQuery != "" {
+		target += "?" + rawQuery
+	}
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/screen", nil))
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
 	return rec
 }
 
@@ -160,6 +172,82 @@ func TestScreenOK(t *testing.T) {
 	}
 	if !fake.gotNow.Equal(now) {
 		t.Fatalf("时钟透传不符: %s", fake.gotNow)
+	}
+}
+
+// TestScreenPeakDaysDefault 覆盖 peak_days 缺省：不传时查询层收到近 7 日窗口。
+func TestScreenPeakDaysDefault(t *testing.T) {
+	fake := &fakeScreenProvider{result: screenResultFixture()}
+	srv := New(quietLogger(), nil, nil, nil, nil, WithScreen(fake))
+
+	if rec := serveScreen(t, srv); rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d，body=%s", rec.Code, rec.Body.String())
+	}
+	if fake.gotParams.PeakDays != 7 {
+		t.Fatalf("缺省 peak_days 应为 7，实际 %d", fake.gotParams.PeakDays)
+	}
+}
+
+// TestScreenPeakDaysExplicit 覆盖显式 7 与 30：原样下传查询层，不吞参数。
+func TestScreenPeakDaysExplicit(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{name: "显式 7", raw: "peak_days=7", want: 7},
+		{name: "显式 30", raw: "peak_days=30", want: 30},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeScreenProvider{result: screenResultFixture()}
+			srv := New(quietLogger(), nil, nil, nil, nil, WithScreen(fake))
+
+			rec := serveScreenQuery(t, srv, c.raw)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("期望 200，实际 %d，body=%s", rec.Code, rec.Body.String())
+			}
+			if fake.gotParams.PeakDays != c.want {
+				t.Fatalf("peak_days 应下传 %d，实际 %d", c.want, fake.gotParams.PeakDays)
+			}
+		})
+	}
+}
+
+// TestScreenPeakDaysInvalid 覆盖非法 peak_days：与 9.5 的参数错误口径一致，
+// HTTP 400 + 业务码 40001，且非法请求不进查询层。
+func TestScreenPeakDaysInvalid(t *testing.T) {
+	for _, raw := range []string{
+		"peak_days=abc",
+		"peak_days=14",
+		"peak_days=0",
+		"peak_days=31",
+		"peak_days=-7",
+		"peak_days=30.0",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			fake := &fakeScreenProvider{result: screenResultFixture()}
+			srv := New(quietLogger(), nil, nil, nil, nil, WithScreen(fake))
+
+			rec := serveScreenQuery(t, srv, raw)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("期望 400，实际 %d，body=%s", rec.Code, rec.Body.String())
+			}
+			var got struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("响应不是合法 JSON: %v", err)
+			}
+			if got.Code != 40001 || got.Message == "" {
+				t.Fatalf("期望业务码 40001 与非空描述，实际 %+v", got)
+			}
+			if fake.calls != 0 {
+				t.Fatalf("非法参数不应进入查询层，实际调用 %d 次", fake.calls)
+			}
+		})
 	}
 }
 
