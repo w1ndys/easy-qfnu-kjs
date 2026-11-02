@@ -381,7 +381,7 @@ type StatFacts struct {
 	Today StatPVUV // 今日口径
 	D7    StatPVUV // 近 7 日口径
 	D30   StatPVUV // 近 30 日口径
-	// 以下榜单已按命中降序、同分按名称升序取前 topN 行。
+	// 以下榜单已按命中降序、同分按标识升序取前 topN 行（楼按 building_id、教室按房名再房号、关键词按词面）。
 	// Buildings 只含白名单内的楼：白名单外的统计行不参与排行，也不占 Top N 名额。
 	Buildings []StatBuildingHit
 	Rooms     []StatRoomHit
