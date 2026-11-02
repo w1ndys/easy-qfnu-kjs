@@ -385,6 +385,7 @@ CREATE TABLE schema_migration (version text PRIMARY KEY, applied_at timestamptz 
 | 验证码识别错误 | 换图重试 ≤3 次，耗尽后 `ocr_failed` | failed |
 | 会话失效 | 重登录一次后继续当前任务，失败则任务 failed | 视任务必需性 |
 | 非 200 / 网络错误 / 读失败 | 单任务重试 ≤3 次，仍失败则任务 failed | 视任务必需性 |
+| 学期/周历内容非法（缺学期编号、kbjcmsid 或周次） | 结束本轮并保持学期日历不变，`calendar_invalid` | failed |
 | 表头/轴不一致 | `axis_changed`，整轮停止 | failed |
 | 数据行结构异常、重复房号 | `matrix_structure_invalid`，整轮停止 | failed |
 | 明细结构缺失（连标题表都没有） | `detail_structure_invalid`，该格任务 failed | partial |
