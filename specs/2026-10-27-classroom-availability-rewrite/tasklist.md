@@ -40,6 +40,7 @@
   - [x] 3.1 请求骨架与节奏控制
     - 统一 Cookie（仅内存）、`Content-Type`、User-Agent；相邻请求至少 500ms、单请求重试 ≤3 次（Requirement 11.5）
     - 非 200、网络错误、读取失败计入重试；正文含会话失效标记时抛会话错误而非数据错误
+    - 单次尝试 15 秒超时，超时计入重试；调用方 ctx 取消不重试
   - [ ] 3.2 登录流程
     - `GET /` → 验证码 → `POST logon&flag=sess` 取 `scode#sxh` → 生成 `encoded` → `POST logonLdap` → `GET jsMain.jsp` 校验成功标识（Requirement 2.1–2.4）
     - 验证码交 OCR，`code=200` 判成功，失败换图重试累计 ≤3 次

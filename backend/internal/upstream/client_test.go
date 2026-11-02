@@ -53,7 +53,7 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 }
 
 // TestNewDefaults 锁定 Requirement 11.5 的默认口径：
-// 相邻请求 500ms、首发之外最多 3 次重试、统一 User-Agent、内存 CookieJar。
+// 相邻请求 500ms、首发之外最多 3 次重试、单次尝试 15s 超时、统一 User-Agent、内存 CookieJar。
 func TestNewDefaults(t *testing.T) {
 	c := newTestClient(t, "http://upstream.test")
 
@@ -62,6 +62,9 @@ func TestNewDefaults(t *testing.T) {
 	}
 	if c.maxRetries != 3 {
 		t.Fatalf("默认重试次数期望 3，实际 %d", c.maxRetries)
+	}
+	if c.attemptTimeout != 15*time.Second {
+		t.Fatalf("默认单次尝试超时期望 15s，实际 %v", c.attemptTimeout)
 	}
 	if c.userAgent != DefaultUserAgent {
 		t.Fatalf("默认 User-Agent 期望 %q，实际 %q", DefaultUserAgent, c.userAgent)
@@ -492,6 +495,160 @@ func TestDoExhaustsRetriesOnReadFailure(t *testing.T) {
 	}
 	if calls.Load() != 4 {
 		t.Fatalf("默认 3 次重试应共 4 次尝试，实际 %d 次", calls.Load())
+	}
+}
+
+// TestDoRetriesOnAttemptTimeoutUntilSuccess 覆盖单次尝试超时计入重试：
+// 前两次尝试卡住直到单次超时，第三次成功；超时只归入重试，不会把整个调用判成失败。
+func TestDoRetriesOnAttemptTimeoutUntilSuccess(t *testing.T) {
+	const attemptTimeout = 20 * time.Millisecond
+
+	var calls atomic.Int64
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if calls.Add(1) <= 2 {
+			// 一直不响应，直到本次尝试的 15s（测试缩短为 20ms）超时被截断。
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}
+		return okResponse("矩阵页"), nil
+	})
+
+	c := newTestClient(t, "http://upstream.test",
+		WithHTTPClient(&http.Client{Transport: transport}),
+		WithMinInterval(0))
+	c.attemptTimeout = attemptTimeout
+
+	resp, err := c.get(t.Context(), "/jsxsd/kbxx/jsjy_query2", nil)
+	if err != nil {
+		t.Fatalf("超时两次后第三次应成功，实际 err=%v", err)
+	}
+	if string(resp.Body) != "矩阵页" {
+		t.Fatalf("响应正文期望 矩阵页，实际 %q", resp.Body)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("期望超时两次后成功，共 3 次尝试，实际 %d 次", calls.Load())
+	}
+}
+
+// TestDoExhaustsRetriesOnAttemptTimeout 覆盖单次尝试超时耗尽重试：
+// 4 次尝试全部超时后仍返回任务级 model.ErrUpstreamFailed，而不是 context 错误。
+func TestDoExhaustsRetriesOnAttemptTimeout(t *testing.T) {
+	const attemptTimeout = 10 * time.Millisecond
+
+	var calls atomic.Int64
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+
+	c := newTestClient(t, "http://upstream.test",
+		WithHTTPClient(&http.Client{Transport: transport}),
+		WithMinInterval(0))
+	c.attemptTimeout = attemptTimeout
+
+	_, err := c.get(t.Context(), "/jsxsd/kbxx/jsjy_query2", nil)
+	if !errors.Is(err, model.ErrUpstreamFailed) {
+		t.Fatalf("期望任务级 ErrUpstreamFailed，实际 err=%v", err)
+	}
+	// 超时这一具体原因也要能被包内区分，便于上层定位是卡住而不是被拒绝。
+	if !errors.Is(err, errAttemptTimeout) {
+		t.Fatalf("期望错误可追踪到单次尝试超时，实际 err=%v", err)
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("默认 3 次重试应共 4 次尝试，实际 %d 次", calls.Load())
+	}
+}
+
+// TestDoParentCancelIsNotRetried 覆盖调用方取消与单次尝试超时的区分：
+// 父 ctx 在请求进行中被取消时立即返回 context.Canceled、不重试，也不会误报任务级失败。
+func TestDoParentCancelIsNotRetried(t *testing.T) {
+	started := make(chan struct{}, 1)
+	var calls atomic.Int64
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		started <- struct{}{}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+
+	c := newTestClient(t, "http://upstream.test",
+		WithHTTPClient(&http.Client{Transport: transport}),
+		WithMinInterval(0))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.get(ctx, "/jsxsd/kbxx/jsjy_query2", nil)
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("请求未开始")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("期望 context.Canceled，实际 err=%v", err)
+		}
+		if errors.Is(err, model.ErrUpstreamFailed) {
+			t.Fatalf("调用方取消不应混成任务级失败，实际 err=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("父 ctx 取消后请求没有立即返回")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("调用方取消不应重试，实际 %d 次尝试", calls.Load())
+	}
+}
+
+// TestDoPacesRetriesAfterAttemptTimeout 守住「超时重试也走节奏」：
+// 第一次尝试超时后，第二次尝试仍要先等满最小间隔才发起。
+func TestDoPacesRetriesAfterAttemptTimeout(t *testing.T) {
+	const (
+		interval       = 30 * time.Millisecond
+		attemptTimeout = 10 * time.Millisecond
+	)
+
+	clock := newFakeClock()
+	var calls atomic.Int64
+	var at []time.Time
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		at = append(at, clock.Now())
+		if calls.Add(1) == 1 {
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}
+		return okResponse("ok"), nil
+	})
+
+	c := newTestClient(t, "http://upstream.test",
+		WithHTTPClient(&http.Client{Transport: transport}),
+		WithMinInterval(interval))
+	c.clock = clock.Now
+	c.sleep = clock.Sleep
+	c.attemptTimeout = attemptTimeout
+
+	if _, err := c.get(t.Context(), "/jsxsd/kbxx/jsjy_query2", nil); err != nil {
+		t.Fatalf("超时后重试应成功，实际 err=%v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("期望 2 次尝试，实际 %d 次", calls.Load())
+	}
+	if len(at) != 2 {
+		t.Fatalf("期望记录 2 次发起，实际 %d 次", len(at))
+	}
+	assertGapsAtLeast(t, at, interval)
+	if slept := clock.sleeps(); len(slept) != 1 {
+		t.Fatalf("超时后重试应等一个间隔，期望 1 次等待，实际 %d 次", len(slept))
+	} else if slept[0] <= 0 || slept[0] > interval {
+		t.Fatalf("等待 %v，应落在 (0, %v]", slept[0], interval)
 	}
 }
 

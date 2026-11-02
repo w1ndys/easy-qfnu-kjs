@@ -19,7 +19,9 @@ var ErrQueryFailed = errors.New("数据读取失败")
 // 上层据此重登录一次后重跑当前任务，而不是把登录页当数据页解析（Requirement 2.5）。
 var ErrUpstreamSessionExpired = errors.New("上游会话失效")
 
-// ErrUpstreamFailed 表示一次上游请求在重试耗尽后仍失败：非 200、网络错误或读取失败。
+// ErrUpstreamFailed 表示一次上游请求在重试耗尽后仍失败：非 200、网络错误、读取失败或单次尝试超时。
+// 该错误可能同时命中 context.DeadlineExceeded（单次超时被 url.Error 包装），
+// 上层分流时须先判本哨兵，再判 DeadlineExceeded，避免把上游超时误判成调用方取消。
 // 这是任务级错误，由 pipeline 按任务的必需/可选属性决定轮次走向。
 var ErrUpstreamFailed = errors.New("上游请求失败")
 

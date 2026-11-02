@@ -30,6 +30,10 @@ const (
 	// DefaultMaxRetries 是单次请求在首发之外允许的重试次数（Requirement 11.5）。
 	DefaultMaxRetries = 3
 
+	// DefaultAttemptTimeout 是单次尝试（含重试）的上游往返上限。
+	// 超时与网络错误同类，计入重试；调用方 ctx 取消不重试。
+	DefaultAttemptTimeout = 15 * time.Second
+
 	// formContentType 是所有请求统一携带的 Content-Type；上游只接受表单编码。
 	formContentType = "application/x-www-form-urlencoded"
 
@@ -41,8 +45,9 @@ const (
 
 // 内部错误原因：只在包内用于错误分类与测试断言，对外统一由 model 哨兵暴露。
 var (
-	errNon200   = errors.New("上游返回非 200")
-	errReadBody = errors.New("上游响应读取失败")
+	errNon200         = errors.New("上游返回非 200")
+	errReadBody       = errors.New("上游响应读取失败")
+	errAttemptTimeout = errors.New("单次上游尝试超时")
 )
 
 // Response 是一次成功请求的结果：正文已完整读入内存，状态码必为 200。
@@ -58,6 +63,9 @@ type Client struct {
 	userAgent   string        // 统一 User-Agent
 	minInterval time.Duration // 相邻请求最小间隔，0 表示不限速（仅测试使用）
 	maxRetries  int           // 首发之外的重试次数
+	// attemptTimeout 是单次尝试的上游往返上限，每次尝试单独派生超时 ctx。
+	// 不用 http.Client.Timeout：那个值会把整个 Client 的生命周期与一次调用绑死。
+	attemptTimeout time.Duration
 
 	// paceGate 是容量 1 的节奏闸门：持令牌者才可进入等待与记账，
 	// 排队者等令牌时可被 ctx 取消（不用 Mutex，避免锁不可取消）。
@@ -115,14 +123,15 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 	}
 
 	c := &Client{
-		baseURL:     parsed,
-		httpClient:  &http.Client{},
-		userAgent:   DefaultUserAgent,
-		minInterval: DefaultMinInterval,
-		maxRetries:  DefaultMaxRetries,
-		paceGate:    make(chan struct{}, 1),
-		clock:       time.Now,
-		sleep:       waitFor,
+		baseURL:        parsed,
+		httpClient:     &http.Client{},
+		userAgent:      DefaultUserAgent,
+		minInterval:    DefaultMinInterval,
+		maxRetries:     DefaultMaxRetries,
+		attemptTimeout: DefaultAttemptTimeout,
+		paceGate:       make(chan struct{}, 1),
+		clock:          time.Now,
+		sleep:          waitFor,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -174,9 +183,9 @@ func (c *Client) postForm(ctx context.Context, path string, form url.Values) (*R
 }
 
 // do 执行一次请求骨架：节奏 → 请求 → 分类 →（必要时）重试。
-// 非 200、网络错误、读取正文失败都计入重试；重试耗尽后返回任务级错误
-// model.ErrUpstreamFailed。会话失效与调用方取消不重试，分别返回
-// model.ErrUpstreamSessionExpired 与 context 错误。
+// 非 200、网络错误、读取正文失败与单次尝试超时都计入重试；重试耗尽后返回任务级错误
+// model.ErrUpstreamFailed。会话失效不重试，返回 model.ErrUpstreamSessionExpired；
+// 调用方 ctx 取消或到期也不重试，立即返回 context 错误。
 func (c *Client) do(ctx context.Context, r request) (*Response, error) {
 	target, err := c.buildURL(r)
 	if err != nil {
@@ -196,20 +205,33 @@ func (c *Client) do(ctx context.Context, r request) (*Response, error) {
 			return nil, err
 		}
 
-		req, err := c.newRequest(ctx, target, r.method, payload)
+		// 超时只约束这一次上游往返：父 ctx 仍是调用方的生命周期，
+		// 不设 http.Client.Timeout，免得把整个 Client 绑死在一次调用上。
+		attemptCtx, cancel := context.WithTimeout(ctx, c.attemptTimeout)
+		req, err := c.newRequest(attemptCtx, target, r.method, payload)
 		if err != nil {
+			cancel()
 			return nil, fmt.Errorf("构造上游请求失败: %w", err)
 		}
 		resp, err := c.attempt(r, req)
+		attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
+		cancel()
 		if err == nil {
 			return resp, nil
 		}
-		switch {
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			return nil, err
-		case errors.Is(err, model.ErrUpstreamSessionExpired):
+
+		// 父 ctx 先结束说明是调用方取消或调用方自己的截止时间到了：立即返回，不重试。
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if errors.Is(err, model.ErrUpstreamSessionExpired) {
 			// 会话失效要靠重新登录解决，拿同一会话重发只会再拿到登录页。
 			return nil, err
+		}
+		// 单次尝试超时与网络错误同类，计入重试，同时保留超时原因便于定位。
+		if attemptTimedOut {
+			lastErr = fmt.Errorf("%w: %w", errAttemptTimeout, err)
+			continue
 		}
 		lastErr = err
 	}
