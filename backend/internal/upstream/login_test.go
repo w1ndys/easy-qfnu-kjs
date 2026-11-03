@@ -41,6 +41,16 @@ const (
 	fixtureBuildingList = `[{"dm":"B001","dmmc":"1号教学楼"},{"dm":"B002","dmmc":"2号教学楼"}]`
 	// fixtureWeekMatrix 是周矩阵夹具：本包只发请求与取正文，结构交给 parser（tasklist 4.1）。
 	fixtureWeekMatrix = `<html><body><table id="dataList"><tr><td>矩阵页夹具</td></tr></table></body></html>`
+	// fixtureOccupancyDetail 是占用说明夹具：标题表在前、字段在后面的三列表，
+	// 本包只发请求与取正文，字段提取交给 parser（tasklist 4.2）。
+	fixtureOccupancyDetail = `<html><body><center id="alldiv"><table id="tab1">` +
+		`<tr><td class="toolstitle">教室占用情况</td></tr></table></center>` +
+		`<form action="/jsxsd/jspyfa/selectJx02" id="Form1" method="post"><table border="1"><tr><td><table border="0">` +
+		`<tr><td>教室状态：</td><td></td><td>正常上课</td></tr>` +
+		`<tr><td>课程：</td><td></td><td>某课程</td></tr>` +
+		`<tr><td>周次：</td><td></td><td>1-16</td></tr>` +
+		`<tr><td>时间标志：</td><td></td><td>单双周</td></tr>` +
+		`</table></td></tr></table></form></body></html>`
 )
 
 // loginRequest 记录一次上游或 OCR 请求的关键字段，供断言请求顺序、表单与 Cookie 会话。
@@ -91,6 +101,9 @@ type loginFixture struct {
 
 	weekMatrixBodies []string
 	weekMatrixN      int
+
+	occupancyDetailBodies []string
+	occupancyDetailN      int
 }
 
 // newLoginFixture 装配两个 httptest 服务并注册清理。
@@ -108,6 +121,8 @@ func newLoginFixture(t *testing.T) *loginFixture {
 		weekCalendarBodies: []string{fixtureWeekCalendar},
 		buildingListBodies: []string{fixtureBuildingList},
 		weekMatrixBodies:   []string{fixtureWeekMatrix},
+
+		occupancyDetailBodies: []string{fixtureOccupancyDetail},
 	}
 	for seed := range 4 {
 		f.captchaImages = append(f.captchaImages, captchaJPEG(t, seed))
@@ -212,6 +227,13 @@ func (f *loginFixture) handleUpstream(w http.ResponseWriter, r *http.Request) {
 		call := f.weekMatrixN
 		f.weekMatrixN++
 		body := f.weekMatrixBodies[min(call, len(f.weekMatrixBodies)-1)]
+		f.mu.Unlock()
+		_, _ = io.WriteString(w, body)
+	case occupancyDetailPath:
+		f.mu.Lock()
+		call := f.occupancyDetailN
+		f.occupancyDetailN++
+		body := f.occupancyDetailBodies[min(call, len(f.occupancyDetailBodies)-1)]
 		f.mu.Unlock()
 		_, _ = io.WriteString(w, body)
 	default:
