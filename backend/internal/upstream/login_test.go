@@ -347,6 +347,23 @@ func logonLDAPRequests(reqs []loginRequest) []loginRequest {
 	return out
 }
 
+// wantRequest 是一次期望的上游请求（方法 + 路径），供请求顺序断言复用。
+type wantRequest struct {
+	method string
+	path   string
+}
+
+// loginFlowOrder 是完整登录流程的上游请求顺序：
+// GET / → 验证码 → 取 scode#sxh → 提交 encoded → 校验 jsMain.jsp。
+// 登录成功、重登录与刷新分支的顺序断言都以这一份为准。
+var loginFlowOrder = []wantRequest{
+	{http.MethodGet, loginPagePath},
+	{http.MethodGet, captchaPath},
+	{http.MethodPost, logonPath},
+	{http.MethodPost, logonPath},
+	{http.MethodGet, jsMainPath},
+}
+
 // TestLoginFollowsDocumentedFlow 锁定 Requirement 2.1–2.4 的完整顺序与字段：
 // GET / → 验证码 → 取 scode#sxh → 提交 encoded → 校验 jsMain.jsp，
 // 并断言 OCR 表单、空账号密码字段与同一 Cookie 会话。
@@ -357,20 +374,10 @@ func TestLoginFollowsDocumentedFlow(t *testing.T) {
 	f.mustLogin(t, c)
 
 	reqs := f.upstreamSnapshot()
-	wantOrder := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, loginPagePath},
-		{http.MethodGet, captchaPath},
-		{http.MethodPost, logonPath},
-		{http.MethodPost, logonPath},
-		{http.MethodGet, jsMainPath},
+	if len(reqs) != len(loginFlowOrder) {
+		t.Fatalf("登录应发出 %d 次上游请求，实际 %d 次: %+v", len(loginFlowOrder), len(reqs), reqs)
 	}
-	if len(reqs) != len(wantOrder) {
-		t.Fatalf("登录应发出 %d 次上游请求，实际 %d 次: %+v", len(wantOrder), len(reqs), reqs)
-	}
-	for i, want := range wantOrder {
+	for i, want := range loginFlowOrder {
 		if reqs[i].method != want.method || reqs[i].path != want.path {
 			t.Fatalf("第 %d 次请求期望 %s %s，实际 %s %s", i+1, want.method, want.path, reqs[i].method, reqs[i].path)
 		}
@@ -952,5 +959,64 @@ func TestDoWithReloginSharesSingleLogin(t *testing.T) {
 	}
 	if _, _, jsMain := f.counts(); jsMain != 2 {
 		t.Fatalf("期望首次登录 + 一次重登录共 2 次校验，实际 %d 次", jsMain)
+	}
+}
+
+// TestDoWithReloginBarrierSharesSingleLogin 用 barrier 强制两个业务请求同时命中会话失效：
+// 两个请求都在拿到登录页之后才开始重登录，断言仍然只重登录一次（Requirement 2.6）。
+// 与上面的并发用例相比，barrier 保证了「一起失效」这个前提，不再依赖调度先后。
+func TestDoWithReloginBarrierSharesSingleLogin(t *testing.T) {
+	f := newLoginFixture(t)
+	c := newTestClient(t, f.srv.URL, WithMinInterval(0))
+	f.mustLogin(t, c)
+
+	const workers = 2
+	var arrived sync.WaitGroup
+	arrived.Add(workers)
+	f.mu.Lock()
+	f.businessHook = func(call int) string {
+		// 前两次业务请求都在这里等对方到齐再返回登录页：两者必定同时看到旧会话失效。
+		if call < workers {
+			arrived.Done()
+			arrived.Wait()
+			return fixtureSessionLost
+		}
+		// 重登录后的重试用新会话，直接成功。
+		return fixtureBusinessOK
+	}
+	f.mu.Unlock()
+
+	// 用同一个起点让两个请求尽量同时发出，barrier 负责把「同时失效」坐实。
+	start := make(chan struct{})
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := c.doWithRelogin(t.Context(), request{method: http.MethodGet, path: fixtureBusinessPath})
+			errs[i] = err
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("第 %d 个并发请求应成功，实际 err=%v", i+1, err)
+		}
+	}
+
+	reqs := f.upstreamSnapshot()
+	if got := len(logonLDAPRequests(reqs)); got != 2 {
+		t.Fatalf("同时失效只允许一次重登录，期望共 2 次提交，实际 %d 次", got)
+	}
+	if _, _, jsMain := f.counts(); jsMain != 2 {
+		t.Fatalf("期望首次登录 + 一次重登录共 2 次校验，实际 %d 次", jsMain)
+	}
+	// 两个请求各重试一次：首次都失效，重登录后都成功。
+	if got := len(requestsFor(reqs, http.MethodGet, fixtureBusinessPath)); got != workers*2 {
+		t.Fatalf("两个请求各重跑一次，期望 %d 次业务请求，实际 %d 次", workers*2, got)
 	}
 }

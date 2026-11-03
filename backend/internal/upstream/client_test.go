@@ -52,8 +52,8 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-// TestNewDefaults 锁定 Requirement 11.5 的默认口径：
-// 相邻请求 500ms、首发之外最多 3 次重试、单次尝试 15s 超时、统一 User-Agent、内存 CookieJar。
+// TestNewDefaults 锁定默认口径：11.5 的相邻请求 500ms、首发之外最多 3 次重试与
+// 单次尝试 15s 超时，upstream-api 请求头的统一 User-Agent，以及 2.6 的内存会话 CookieJar。
 func TestNewDefaults(t *testing.T) {
 	c := newTestClient(t, "http://upstream.test")
 
@@ -731,6 +731,95 @@ func TestDoStopsPacingOnContextCancel(t *testing.T) {
 	// 已取消的 context 必须立刻放弃等待，而不是先睡满一个间隔再失败。
 	if elapsed >= interval/2 {
 		t.Fatalf("取消后等待了 %v，应远小于间隔 %v", elapsed, interval)
+	}
+}
+
+// TestWaitForStopsOnContextCancel 覆盖默认等待实现的 ctx 分支（3.1 遗留）：
+// 已取消的 ctx 立即返回 context.Canceled；等待中取消则提前返回，不必等满时长。
+func TestWaitForStopsOnContextCancel(t *testing.T) {
+	const wait = 10 * time.Second
+
+	t.Run("已取消的 ctx", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		start := time.Now()
+		err := waitFor(ctx, wait)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("期望 context.Canceled，实际 err=%v", err)
+		}
+		if elapsed := time.Since(start); elapsed >= wait/2 {
+			t.Fatalf("已取消的 ctx 应立即返回，实际等了 %v", elapsed)
+		}
+	})
+
+	t.Run("等待中取消", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		start := time.Now()
+		done := make(chan error, 1)
+		go func() { done <- waitFor(ctx, wait) }()
+		// 留出进入定时器等待的时间再取消，命中的是 ctx.Done() 而不是入口检查。
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("期望 context.Canceled，实际 err=%v", err)
+			}
+			if elapsed := time.Since(start); elapsed >= wait/2 {
+				t.Fatalf("等待中取消应提前返回，实际等了 %v", elapsed)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("等待中取消后 waitFor 没有返回")
+		}
+	})
+}
+
+// TestWaitTurnPropagatesSleepError 覆盖 waitTurn 的 sleep 返回错误分支（3.1 遗留）：
+// 节奏等待失败时原样交回该错误、不吞成上游失败、也不再发出请求；
+// 同时确认失败路径会把节奏闸门令牌还回去，后续请求仍能继续。
+func TestWaitTurnPropagatesSleepError(t *testing.T) {
+	sleepErr := errors.New("模拟节奏等待被打断")
+	var calls atomic.Int64
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return okResponse("ok"), nil
+	})
+
+	// 间隔取大值：第二次请求一定需要等待，不受调度延迟影响。
+	c := newTestClient(t, "http://upstream.test",
+		WithHTTPClient(&http.Client{Transport: transport}),
+		WithMinInterval(time.Hour))
+
+	if _, err := c.get(t.Context(), "/first", nil); err != nil {
+		t.Fatalf("首个请求失败: %v", err)
+	}
+
+	c.sleep = func(context.Context, time.Duration) error { return sleepErr }
+	_, err := c.get(t.Context(), "/second", nil)
+	if !errors.Is(err, sleepErr) {
+		t.Fatalf("等待失败应原样返回该错误，实际 err=%v", err)
+	}
+	if errors.Is(err, model.ErrUpstreamFailed) {
+		t.Fatalf("节奏等待失败不能混成任务级失败，实际 err=%v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("等待失败时不应发出第二个请求，实际已发 %d 次", calls.Load())
+	}
+
+	// 闸门令牌必须在失败路径上归还，否则后续请求会永远排队。
+	// 给这一步加 deadline：令牌没归还时以超时暴露，而不是挂住整个测试进程。
+	c.sleep = func(context.Context, time.Duration) error { return nil }
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if _, err := c.get(ctx, "/third", nil); err != nil {
+		t.Fatalf("失败后应还能继续请求，实际 err=%v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("期望共 2 次请求（首个 + 恢复后的第三次），实际 %d 次", calls.Load())
 	}
 }
 

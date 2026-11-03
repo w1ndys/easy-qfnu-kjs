@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"net/http"
+	"net/url"
 	"testing"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
@@ -16,10 +17,14 @@ const (
 	detailTestRoomID   = "R0001"
 	// detailRefreshedKBJCMSID 是重登录后学期页给出的新节次模式 id，必须与首次不同。
 	detailRefreshedKBJCMSID = "20252"
+	// detailRefreshedTerm 是重登录后学期页上出现的另一个学期编号：
+	// 它必须与调用方 Term 不同，否则锁不住「xnxqh 仍来自调用方」。
+	detailRefreshedTerm = "2026-2027-2"
 )
 
-// fixtureRefreshedTermPage 是重登录后的学期页夹具：学期编号不变，kbjcmsid 换成新值。
-const fixtureRefreshedTermPage = `<html><body><div>2026-2027-1</div>` +
+// fixtureRefreshedTermPage 是重登录后的学期页夹具：学期编号故意换成 detailRefreshedTerm，
+// kbjcmsid 换成新值；重建请求的 xnxqh 必须仍取调用方 Term，不能跟着这一页走。
+const fixtureRefreshedTermPage = `<html><body><div>` + detailRefreshedTerm + `</div>` +
 	`<input type="hidden" id="kbjcmsid" name="kbjcmsid" value="` + detailRefreshedKBJCMSID + `"></body></html>`
 
 // detailParams 返回一份合法参数，用例只改自己关心的字段。
@@ -30,6 +35,46 @@ func detailParams() OccupancyDetailParams {
 		RoomID:   detailTestRoomID,
 		Weekday:  1,
 		BigSlot:  "0102",
+	}
+}
+
+// detailQueryWant 是明细请求 16 个查询参数的期望表（docs/upstream-api.md 第 8 节）：
+// 起止周次/节次/时间与 jszt 必须显式留空。kbjcmsid 由调用方给出，
+// 因为重登录后的重建请求会换成学期页下发的新值，其余 15 项首发与重建必须一致。
+// 这里照文档写死取值，不复用生产常量，避免常量写错时测试跟着一起错。
+func detailQueryWant(kbjcmsid string) map[string]string {
+	return map[string]string{
+		"xnxqh":     detailTestTerm,
+		"jsbh":      detailTestRoomID,
+		"kcsj":      "10102",
+		"xq":        "1",
+		"typewhere": "jszq",
+		"startZc":   "",
+		"endZc":     "",
+		"startJc":   "",
+		"endJc":     "",
+		"startXq":   "1",
+		"endXq":     "7",
+		"kssj":      "",
+		"jssj":      "",
+		"jszt":      "",
+		"type":      "add",
+		"kbjcmsid":  kbjcmsid,
+	}
+}
+
+// assertDetailQuery 逐项断言明细请求的全部查询参数，并要求字段个数与文档完全一致。
+// 首发与重登录后的重建请求共用这一份期望表：只抽查几个字段会漏掉重建时丢参数。
+func assertDetailQuery(t *testing.T, query url.Values, want map[string]string) {
+	t.Helper()
+	for name, wantValue := range want {
+		if got := query.Get(name); got != wantValue {
+			t.Fatalf("查询参数 %s 期望 %q，实际 %q", name, wantValue, got)
+		}
+	}
+	// 空参数也要显式带上，多带或少带都会改变上游的查询范围。
+	if got := len(query); got != len(want) {
+		t.Fatalf("查询参数期望 %d 个，实际 %d 个: %v", len(want), got, query)
 	}
 }
 
@@ -58,33 +103,7 @@ func TestFetchOccupancyDetailSendsQueryAndReturnsBody(t *testing.T) {
 		t.Fatalf("明细页必须复用登录会话，实际 Cookie=%q", got)
 	}
 
-	wantQuery := map[string]string{
-		"xnxqh":     detailTestTerm,
-		"jsbh":      detailTestRoomID,
-		"kcsj":      "10102",
-		"xq":        "1",
-		"typewhere": "jszq",
-		"startZc":   "",
-		"endZc":     "",
-		"startJc":   "",
-		"endJc":     "",
-		"startXq":   "1",
-		"endXq":     "7",
-		"kssj":      "",
-		"jssj":      "",
-		"jszt":      "",
-		"type":      "add",
-		"kbjcmsid":  detailTestKBJCMSID,
-	}
-	for name, want := range wantQuery {
-		if got := req.query.Get(name); got != want {
-			t.Fatalf("查询参数 %s 期望 %q，实际 %q", name, want, got)
-		}
-	}
-	// 字段数必须与文档一致：空参数也要显式带上，多带或少带都会改变上游的查询范围。
-	if got := len(req.query); got != len(wantQuery) {
-		t.Fatalf("查询参数期望 %d 个，实际 %d 个: %v", len(wantQuery), got, req.query)
-	}
+	assertDetailQuery(t, req.query, detailQueryWant(detailTestKBJCMSID))
 }
 
 // TestOccupancyDetailQueryBuildsKcsjFromWeekdayAndBigSlot 覆盖 Requirement 6.1 的参数组装：
@@ -171,8 +190,8 @@ func TestFetchOccupancyDetailRejectsInvalidParams(t *testing.T) {
 
 // TestFetchOccupancyDetailRefreshesTermAfterRelogin 锁定拍板口径：
 // 明细页会话失效 → 重登录一次 → 重取学期页拿新 kbjcmsid → 用新值重建请求重跑。
-// 断言第二次明细请求的 kbjcmsid 是新值且与第一次不同，重登录与学期页刷新各只一次，
-// 且其余查询参数在重建时没有丢。
+// 学期页夹具的学期编号故意与调用方不同，所以还能锁住 xnxqh 仍来自调用方 Term；
+// 首发与重建的 16 个查询参数逐项断言，重登录与学期页刷新各只一次。
 func TestFetchOccupancyDetailRefreshesTermAfterRelogin(t *testing.T) {
 	f := newLoginFixture(t)
 	f.occupancyDetailBodies = []string{fixtureSessionLost, fixtureOccupancyDetail}
@@ -202,32 +221,23 @@ func TestFetchOccupancyDetailRefreshesTermAfterRelogin(t *testing.T) {
 		t.Fatalf("期望明细请求重跑一次共 2 次，实际 %d 次", len(detailReqs))
 	}
 
-	firstKBJCMSID := detailReqs[0].query.Get("kbjcmsid")
-	if firstKBJCMSID != detailTestKBJCMSID {
-		t.Fatalf("第一次明细请求应带调用方传入的 %q，实际 %q", detailTestKBJCMSID, firstKBJCMSID)
+	// 首发用调用方传入的 kbjcmsid，16 个查询参数逐项对齐文档。
+	assertDetailQuery(t, detailReqs[0].query, detailQueryWant(detailTestKBJCMSID))
+	// 重建只换 kbjcmsid，其余 15 个参数必须原样保留。
+	assertDetailQuery(t, detailReqs[1].query, detailQueryWant(detailRefreshedKBJCMSID))
+	if first, second := detailReqs[0].query.Get("kbjcmsid"), detailReqs[1].query.Get("kbjcmsid"); first == second {
+		t.Fatalf("两次明细请求的 kbjcmsid 必须不同，实际都是 %q", first)
 	}
-	secondKBJCMSID := detailReqs[1].query.Get("kbjcmsid")
-	if secondKBJCMSID != detailRefreshedKBJCMSID {
-		t.Fatalf("重跑必须用学期页的新 kbjcmsid %q，实际 %q", detailRefreshedKBJCMSID, secondKBJCMSID)
+
+	// 学期页夹具必须给另一个学期编号，否则这条断言锁不住「xnxqh 不跟着刷新页走」。
+	if detailRefreshedTerm == detailTestTerm {
+		t.Fatal("刷新后的学期页夹具必须用不同学期编号，否则锁不住 xnxqh 的来源")
 	}
-	if firstKBJCMSID == secondKBJCMSID {
-		t.Fatalf("两次明细请求的 kbjcmsid 必须不同，实际都是 %q", firstKBJCMSID)
+	if got := detailReqs[1].query.Get("kbjcmsid"); got != detailRefreshedKBJCMSID {
+		t.Fatalf("重跑必须用学期页的新 kbjcmsid %q，实际 %q", detailRefreshedKBJCMSID, got)
 	}
-	// 重建只换 kbjcmsid：学期编号、房号、星期与大节仍然来自调用方参数。
-	second := detailReqs[1].query
-	for name, want := range map[string]string{
-		"xnxqh": detailTestTerm,
-		"jsbh":  detailTestRoomID,
-		"kcsj":  "10102",
-		"xq":    "1",
-		"type":  "add",
-	} {
-		if got := second.Get(name); got != want {
-			t.Fatalf("重建后查询参数 %s 期望 %q，实际 %q", name, want, got)
-		}
-	}
-	if got := len(second); got != len(detailReqs[0].query) {
-		t.Fatalf("重建后查询参数个数应与首次一致，实际 %d 个", got)
+	if got, want := detailReqs[1].query.Get("xnxqh"), detailParams().Term; got != want {
+		t.Fatalf("重建后的 xnxqh 期望调用方 Term %q，实际 %q", want, got)
 	}
 }
 
@@ -284,5 +294,104 @@ func TestFetchOccupancyDetailReloginOnceOnSessionExpiry(t *testing.T) {
 	}
 	if got := len(requestsFor(reqs, http.MethodGet, occupancyDetailPath)); got != 2 {
 		t.Fatalf("期望明细请求重跑一次，实际 %d 次", got)
+	}
+}
+
+// TestFetchOccupancyDetailRefreshFailsWhenTermPageExpired 锁定刷新分支的第一条错误路径：
+// 重登录后学期页仍是登录页时，把会话错误交回上层，不再重跑明细、也不再重登录第二次。
+func TestFetchOccupancyDetailRefreshFailsWhenTermPageExpired(t *testing.T) {
+	f := newLoginFixture(t)
+	f.occupancyDetailBodies = []string{fixtureSessionLost}
+	f.businessBodies = []string{fixtureSessionLost}
+	c := newTestClient(t, f.srv.URL, WithMinInterval(0))
+	f.mustLogin(t, c)
+
+	_, err := c.FetchOccupancyDetail(t.Context(), detailParams())
+	if !errors.Is(err, model.ErrUpstreamSessionExpired) {
+		t.Fatalf("学期页仍失效时应返回会话错误，实际 err=%v", err)
+	}
+	if errors.Is(err, model.ErrUpstreamCalendarInvalid) {
+		t.Fatalf("登录页不是学期内容非法，实际 err=%v", err)
+	}
+
+	reqs := f.upstreamSnapshot()
+	if got := len(logonLDAPRequests(reqs)); got != 2 {
+		t.Fatalf("只允许重登录一次，期望共 2 次提交，实际 %d 次", got)
+	}
+	if got := len(requestsFor(reqs, http.MethodGet, termPagePath)); got != 1 {
+		t.Fatalf("学期页只应重取一次，实际 %d 次", got)
+	}
+	if got := len(requestsFor(reqs, http.MethodGet, occupancyDetailPath)); got != 1 {
+		t.Fatalf("学期页失效时不应重跑明细，期望 1 次，实际 %d 次", got)
+	}
+}
+
+// TestFetchOccupancyDetailRefreshRejectsMissingKBJCMSID 锁定刷新分支的第二条错误路径：
+// 重登录后学期页缺 kbjcmsid 时返回学期内容非法，不二次登录、也不重跑明细。
+func TestFetchOccupancyDetailRefreshRejectsMissingKBJCMSID(t *testing.T) {
+	// 有学期编号、但没有 id/name 为 kbjcmsid 的隐藏输入。
+	const termPageWithoutKBJCMSID = `<html><body><div>` + detailRefreshedTerm + `</div></body></html>`
+
+	f := newLoginFixture(t)
+	f.occupancyDetailBodies = []string{fixtureSessionLost}
+	f.businessBodies = []string{termPageWithoutKBJCMSID}
+	c := newTestClient(t, f.srv.URL, WithMinInterval(0))
+	f.mustLogin(t, c)
+
+	_, err := c.FetchOccupancyDetail(t.Context(), detailParams())
+	if !errors.Is(err, model.ErrUpstreamCalendarInvalid) {
+		t.Fatalf("学期页缺 kbjcmsid 应返回学期内容非法，实际 err=%v", err)
+	}
+	if !errors.Is(err, errKBJCMSIDNotFound) {
+		t.Fatalf("错误应能追踪到缺 kbjcmsid，实际 err=%v", err)
+	}
+	if errors.Is(err, model.ErrUpstreamSessionExpired) {
+		t.Fatalf("内容缺失不是会话失效，实际 err=%v", err)
+	}
+
+	reqs := f.upstreamSnapshot()
+	// 首次登录 + 一次重登录；内容非法不能再触发第二次重登录。
+	if got := len(logonLDAPRequests(reqs)); got != 2 {
+		t.Fatalf("不应二次登录，期望共 2 次提交，实际 %d 次", got)
+	}
+	if got := len(requestsFor(reqs, http.MethodGet, termPagePath)); got != 1 {
+		t.Fatalf("学期页只应重取一次，实际 %d 次", got)
+	}
+	if got := len(requestsFor(reqs, http.MethodGet, occupancyDetailPath)); got != 1 {
+		t.Fatalf("学期参数重建失败时不应重跑明细，期望 1 次，实际 %d 次", got)
+	}
+}
+
+// TestFetchOccupancyDetailRefreshRequestOrder 锁定刷新分支的请求序列：
+// 明细首发 → 会话失效 → 完整重登录 → 学期页刷新 → 明细重跑。
+// 期望序列按夹具记录的上游请求逐条比对，顺序错位（例如先刷新学期页再登录）会在这里炸。
+func TestFetchOccupancyDetailRefreshRequestOrder(t *testing.T) {
+	f := newLoginFixture(t)
+	f.occupancyDetailBodies = []string{fixtureSessionLost, fixtureOccupancyDetail}
+	f.businessBodies = []string{fixtureRefreshedTermPage}
+	c := newTestClient(t, f.srv.URL, WithMinInterval(0))
+	f.mustLogin(t, c)
+
+	if _, err := c.FetchOccupancyDetail(t.Context(), detailParams()); err != nil {
+		t.Fatalf("刷新后明细页应成功，实际 err=%v", err)
+	}
+
+	want := append([]wantRequest{}, loginFlowOrder...)
+	want = append(want, wantRequest{http.MethodGet, occupancyDetailPath})
+	want = append(want, loginFlowOrder...)
+	want = append(want,
+		wantRequest{http.MethodGet, termPagePath},
+		wantRequest{http.MethodGet, occupancyDetailPath},
+	)
+
+	reqs := f.upstreamSnapshot()
+	if len(reqs) != len(want) {
+		t.Fatalf("刷新分支应发出 %d 次上游请求，实际 %d 次: %+v", len(want), len(reqs), reqs)
+	}
+	for i, wantReq := range want {
+		if reqs[i].method != wantReq.method || reqs[i].path != wantReq.path {
+			t.Fatalf("第 %d 次请求期望 %s %s，实际 %s %s",
+				i+1, wantReq.method, wantReq.path, reqs[i].method, reqs[i].path)
+		}
 	}
 }
