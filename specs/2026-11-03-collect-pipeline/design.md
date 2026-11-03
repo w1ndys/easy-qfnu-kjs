@@ -20,7 +20,7 @@ flowchart LR
   PUB -->|版本切换| DB
 ```
 
-依赖方向：`parser`、`clean` 只 import `model`；`pipeline` import `upstream/parser/clean/store/model`；`publish` import `store/model`。`pipeline` 不 import `api`/`query`，`query` 不反向依赖采集链路。
+依赖方向：`parser` 可 import `model` 与 `goquery`（只做结构解析，不发请求）；`clean` 只 import `model`；`pipeline` import `upstream/parser/clean/store/model`；`publish` import `store/model`。`pipeline` 不 import `api`/`query`，`query` 不反向依赖采集链路。
 
 ## Components and Interfaces
 

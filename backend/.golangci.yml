@@ -30,13 +30,16 @@ linters:
           allow:
             - $gostd
 
-        # 纯解析：只依赖实体，不碰网络与数据库。
+        # 纯解析：只依赖实体与 HTML 解析库，不碰网络与数据库。
+        # goquery 是 docs/pitfalls.md 第 10 节指定的唯一结构解析手段（v1.13.0）；
+        # depguard 只检查直接 import，其依赖 cascadia 与 golang.org/x/net 不必列出。
         parser:
           files:
             - "**/internal/parser/**"
           allow:
             - $gostd
             - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/PuerkitoBio/goquery
 
         # 纯变换：同上，保持可测无副作用。
         clean:
