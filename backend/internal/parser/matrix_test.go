@@ -132,17 +132,17 @@ func TestRowsParsesMatrixRows(t *testing.T) {
 
 	// 位置 → 星期/大节由表头顺序唯一决定：前 5 格是周一，第 6 格进周二。
 	wantCells := map[int]model.MatrixCell{
-		0:  {Weekday: 1, Block: "0102", Raw: "◆"},
-		1:  {Weekday: 1, Block: "030405", Raw: "Ｊ"},
-		5:  {Weekday: 2, Block: "0102", Raw: "空闲"},
-		34: {Weekday: 7, Block: "101112", Raw: "◆Ｊ"},
+		0:  {Weekday: 1, Block: "0102", StateRaw: "◆"},
+		1:  {Weekday: 1, Block: "030405", StateRaw: "Ｊ"},
+		5:  {Weekday: 2, Block: "0102", StateRaw: "空闲"},
+		34: {Weekday: 7, Block: "101112", StateRaw: "◆Ｊ"},
 	}
 	for index, want := range wantCells {
 		if got := rooms[0].Cells[index]; got != want {
 			t.Fatalf("第 1 行第 %d 格期望 %+v，实际 %+v", index+1, want, got)
 		}
 	}
-	if want := (model.MatrixCell{Weekday: 2, Block: "030405", Raw: "Ｘ"}); rooms[1].Cells[6] != want {
+	if want := (model.MatrixCell{Weekday: 2, Block: "030405", StateRaw: "Ｘ"}); rooms[1].Cells[6] != want {
 		t.Fatalf("第 2 行第 7 格期望 %+v，实际 %+v", want, rooms[1].Cells[6])
 	}
 	if want := (model.MatrixCell{Weekday: 1, Block: "0607"}); rooms[2].Cells[2] != want {

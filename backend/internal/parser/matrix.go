@@ -105,9 +105,9 @@ func Rows(body []byte, axis []model.AxisNode) ([]model.MatrixRoom, error) {
 		}
 		for i := 0; i < wantCells-1; i++ {
 			room.Cells = append(room.Cells, model.MatrixCell{
-				Weekday: i/len(blocks) + 1,
-				Block:   blocks[i%len(blocks)],
-				Raw:     strings.TrimSpace(cells.Eq(i + 1).Text()),
+				Weekday:  i/len(blocks) + 1,
+				Block:    blocks[i%len(blocks)],
+				StateRaw: strings.TrimSpace(cells.Eq(i + 1).Text()),
 			})
 		}
 		rooms = append(rooms, room)

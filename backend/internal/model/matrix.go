@@ -9,10 +9,13 @@ type AxisNode struct {
 }
 
 // MatrixCell 是周矩阵里的一格：某天某大节的状态原文，语义键由 clean 投影。
+// StateRaw 与 OccupancyEntry.StateRaw 同名同义：都是 clean 投影前的原文，
+// clean 按字典把它映射成 observation.state_key（与 occupancy_detail.state_key 同一套字典），
+// 两处字段名保持一致，避免后续只改一边。
 type MatrixCell struct {
-	Weekday int    // 星期，1=周一 … 7=周日
-	Block   string // 大节编码，如 0102
-	Raw     string // 状态原文，未清洗；空白格为空串
+	Weekday  int    // 星期，1=周一 … 7=周日
+	Block    string // 大节编码，如 0102
+	StateRaw string // 状态原文，未清洗；空白格为空串
 }
 
 // MatrixRoom 是周矩阵里的一行：一间教室及其逐格原文。
