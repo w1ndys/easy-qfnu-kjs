@@ -14,7 +14,13 @@ const (
 	detailTestTerm     = "2026-2027-1"
 	detailTestKBJCMSID = "20251"
 	detailTestRoomID   = "R0001"
+	// detailRefreshedKBJCMSID 是重登录后学期页给出的新节次模式 id，必须与首次不同。
+	detailRefreshedKBJCMSID = "20252"
 )
+
+// fixtureRefreshedTermPage 是重登录后的学期页夹具：学期编号不变，kbjcmsid 换成新值。
+const fixtureRefreshedTermPage = `<html><body><div>2026-2027-1</div>` +
+	`<input type="hidden" id="kbjcmsid" name="kbjcmsid" value="` + detailRefreshedKBJCMSID + `"></body></html>`
 
 // detailParams 返回一份合法参数，用例只改自己关心的字段。
 func detailParams() OccupancyDetailParams {
@@ -163,11 +169,101 @@ func TestFetchOccupancyDetailRejectsInvalidParams(t *testing.T) {
 	}
 }
 
+// TestFetchOccupancyDetailRefreshesTermAfterRelogin 锁定拍板口径：
+// 明细页会话失效 → 重登录一次 → 重取学期页拿新 kbjcmsid → 用新值重建请求重跑。
+// 断言第二次明细请求的 kbjcmsid 是新值且与第一次不同，重登录与学期页刷新各只一次，
+// 且其余查询参数在重建时没有丢。
+func TestFetchOccupancyDetailRefreshesTermAfterRelogin(t *testing.T) {
+	f := newLoginFixture(t)
+	f.occupancyDetailBodies = []string{fixtureSessionLost, fixtureOccupancyDetail}
+	f.businessBodies = []string{fixtureRefreshedTermPage}
+	c := newTestClient(t, f.srv.URL, WithMinInterval(0))
+	f.mustLogin(t, c)
+
+	body, err := c.FetchOccupancyDetail(t.Context(), detailParams())
+	if err != nil {
+		t.Fatalf("重登录并刷新学期参数后明细页应成功，实际 err=%v", err)
+	}
+	if !bytes.Equal(body, []byte(fixtureOccupancyDetail)) {
+		t.Fatalf("应返回第二次的明细正文，实际 %q", body)
+	}
+
+	reqs := f.upstreamSnapshot()
+	// 首次登录 1 次 + 重登录 1 次，只允许重登录一次。
+	if got := len(logonLDAPRequests(reqs)); got != 2 {
+		t.Fatalf("期望首次登录 + 一次重登录，实际提交 %d 次", got)
+	}
+	// 学期页只在重登录后取一次：取多了说明刷新逻辑跑偏。
+	if got := len(requestsFor(reqs, http.MethodGet, termPagePath)); got != 1 {
+		t.Fatalf("期望只重取一次学期页，实际 %d 次", got)
+	}
+	detailReqs := requestsFor(reqs, http.MethodGet, occupancyDetailPath)
+	if len(detailReqs) != 2 {
+		t.Fatalf("期望明细请求重跑一次共 2 次，实际 %d 次", len(detailReqs))
+	}
+
+	firstKBJCMSID := detailReqs[0].query.Get("kbjcmsid")
+	if firstKBJCMSID != detailTestKBJCMSID {
+		t.Fatalf("第一次明细请求应带调用方传入的 %q，实际 %q", detailTestKBJCMSID, firstKBJCMSID)
+	}
+	secondKBJCMSID := detailReqs[1].query.Get("kbjcmsid")
+	if secondKBJCMSID != detailRefreshedKBJCMSID {
+		t.Fatalf("重跑必须用学期页的新 kbjcmsid %q，实际 %q", detailRefreshedKBJCMSID, secondKBJCMSID)
+	}
+	if firstKBJCMSID == secondKBJCMSID {
+		t.Fatalf("两次明细请求的 kbjcmsid 必须不同，实际都是 %q", firstKBJCMSID)
+	}
+	// 重建只换 kbjcmsid：学期编号、房号、星期与大节仍然来自调用方参数。
+	second := detailReqs[1].query
+	for name, want := range map[string]string{
+		"xnxqh": detailTestTerm,
+		"jsbh":  detailTestRoomID,
+		"kcsj":  "10102",
+		"xq":    "1",
+		"type":  "add",
+	} {
+		if got := second.Get(name); got != want {
+			t.Fatalf("重建后查询参数 %s 期望 %q，实际 %q", name, want, got)
+		}
+	}
+	if got := len(second); got != len(detailReqs[0].query) {
+		t.Fatalf("重建后查询参数个数应与首次一致，实际 %d 个", got)
+	}
+}
+
+// TestFetchOccupancyDetailGivesUpAfterSecondExpiry 锁定「只重试一次」：
+// 重登录并用新 kbjcmsid 重跑后仍返回登录页时，把会话错误交回上层，
+// 不再重登录第二次，也不再多取一次学期页。
+func TestFetchOccupancyDetailGivesUpAfterSecondExpiry(t *testing.T) {
+	f := newLoginFixture(t)
+	f.occupancyDetailBodies = []string{fixtureSessionLost}
+	f.businessBodies = []string{fixtureRefreshedTermPage}
+	c := newTestClient(t, f.srv.URL, WithMinInterval(0))
+	f.mustLogin(t, c)
+
+	_, err := c.FetchOccupancyDetail(t.Context(), detailParams())
+	if !errors.Is(err, model.ErrUpstreamSessionExpired) {
+		t.Fatalf("重跑仍失效时应返回会话错误，实际 err=%v", err)
+	}
+
+	reqs := f.upstreamSnapshot()
+	if got := len(logonLDAPRequests(reqs)); got != 2 {
+		t.Fatalf("只允许重登录一次，期望共 2 次提交，实际 %d 次", got)
+	}
+	if got := len(requestsFor(reqs, http.MethodGet, termPagePath)); got != 1 {
+		t.Fatalf("期望只重取一次学期页，实际 %d 次", got)
+	}
+	if got := len(requestsFor(reqs, http.MethodGet, occupancyDetailPath)); got != 2 {
+		t.Fatalf("期望明细请求只重跑一次共 2 次，实际 %d 次", got)
+	}
+}
+
 // TestFetchOccupancyDetailReloginOnceOnSessionExpiry 覆盖 Requirement 2.5、6.1：
-// 明细页会话失效时经 doWithRelogin 重登录一次后重跑当前下钻。
+// 明细页会话失效时经 doWithReloginRefresh 重登录一次后重取学期参数并重跑当前下钻。
 func TestFetchOccupancyDetailReloginOnceOnSessionExpiry(t *testing.T) {
 	f := newLoginFixture(t)
 	f.occupancyDetailBodies = []string{fixtureSessionLost, fixtureOccupancyDetail}
+	f.businessBodies = []string{fixtureTermPage}
 	c := newTestClient(t, f.srv.URL, WithMinInterval(0))
 	f.mustLogin(t, c)
 
@@ -182,6 +278,9 @@ func TestFetchOccupancyDetailReloginOnceOnSessionExpiry(t *testing.T) {
 	reqs := f.upstreamSnapshot()
 	if got := len(logonLDAPRequests(reqs)); got != 2 {
 		t.Fatalf("期望首次登录 + 一次重登录，实际提交 %d 次", got)
+	}
+	if got := len(requestsFor(reqs, http.MethodGet, termPagePath)); got != 1 {
+		t.Fatalf("重登录后应重取一次学期页，实际 %d 次", got)
 	}
 	if got := len(requestsFor(reqs, http.MethodGet, occupancyDetailPath)); got != 2 {
 		t.Fatalf("期望明细请求重跑一次，实际 %d 次", got)

@@ -50,7 +50,9 @@ type OccupancyDetailParams struct {
 // 原样返回正文交给 parser（tasklist 4.2）提取四项字段。
 //
 // 一次调用只下一次钻，所以「同一格至多一条任务」由调用方按格各调一次保证；
-// 请求走 doWithRelogin，与其他业务请求共用内存会话、节奏与重试。
+// 请求走 doWithReloginRefresh，与其他业务请求共用内存会话、节奏与重试，
+// 并在重登录后重取学期参数、用新的 kbjcmsid 重建请求重跑一次（见
+// refreshOccupancyDetailRequest）。
 // 参数缺失或非法在发请求前失败：空学期编号、空 kbjcmsid、空房号、星期越界与
 // 大节代码不在五块之内都不打上游，避免用错参数换来一个看似正常的错误页。
 func (c *Client) FetchOccupancyDetail(ctx context.Context, params OccupancyDetailParams) ([]byte, error) {
@@ -72,16 +74,44 @@ func (c *Client) FetchOccupancyDetail(ctx context.Context, params OccupancyDetai
 		return nil, fmt.Errorf("%w: 实际 %q", errBadBigSlot, params.BigSlot)
 	}
 
-	resp, err := c.doWithRelogin(ctx, request{
-		method: http.MethodGet,
-		path:   occupancyDetailPath,
-		query:  occupancyDetailQuery(params),
-	})
+	resp, err := c.doWithReloginRefresh(ctx, detailRequest(params),
+		func(ctx context.Context) (request, error) {
+			return c.refreshOccupancyDetailRequest(ctx, params)
+		})
 	if err != nil {
 		return nil, fmt.Errorf("读取房号 %s 星期 %d 大节 %s 的占用说明: %w",
 			params.RoomID, params.Weekday, params.BigSlot, err)
 	}
 	return resp.Body, nil
+}
+
+// detailRequest 把参数组装成一次明细请求；首次发送与重登录后重建共用同一份组装。
+func detailRequest(params OccupancyDetailParams) request {
+	return request{
+		method: http.MethodGet,
+		path:   occupancyDetailPath,
+		query:  occupancyDetailQuery(params),
+	}
+}
+
+// refreshOccupancyDetailRequest 在重登录后重取学期页的 kbjcmsid，并据此重建明细请求。
+//
+// kbjcmsid 是学期页下发的节次模式 id，重登录后可能换成新值；沿用调用方传入的旧值
+// 只会换回旧节次模式下的页面或空说明，所以必须重新取一次而不是原样重跑。
+// 这里直接用 c.do 读学期页、复用 parseTermPage 提取，而不是再调 FetchTerm：
+// 后者自带的 doWithRelogin 会在学期页仍失效时再登录一次，破坏「只重登录一次」。
+// 学期编号（xnxqh）沿用调用方参数：那是要采集的目标学期，不从当前学期页反推。
+func (c *Client) refreshOccupancyDetailRequest(ctx context.Context, params OccupancyDetailParams) (request, error) {
+	resp, err := c.do(ctx, request{method: http.MethodGet, path: termPagePath})
+	if err != nil {
+		return request{}, fmt.Errorf("重登录后重取学期页: %w", err)
+	}
+	_, kbjcmsid, err := parseTermPage(resp.Body)
+	if err != nil {
+		return request{}, fmt.Errorf("重登录后重取学期参数: %w", err)
+	}
+	params.KBJCMSID = kbjcmsid
+	return detailRequest(params), nil
 }
 
 // occupancyDetailQuery 按 docs/upstream-api.md 第 8 节拼查询串：

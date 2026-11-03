@@ -297,12 +297,28 @@ func generateEncoded(username, password, scode, sxh string) (string, error) {
 	return encoded.String(), nil
 }
 
-// doWithRelogin 执行一次业务请求，遇到会话失效时重登录一次后重试（Requirement 2.5）。
+// doWithRelogin 执行一次业务请求，遇到会话失效时重登录一次后原样重试（Requirement 2.5）。
 //
 // 只重登录一次：重试后仍失效就把会话错误交回上层，由任务标记失败，避免登录循环。
 // 并发调用共享同一次重登录：登录序号已被别的调用推进时直接重试，
 // 避免两次登录互相踢掉同一个会话（Requirement 2.6）。
+// 原样重试只适用于参数与会话无关的请求（学期、周历、楼列表、矩阵）；
+// 参数里含登录后才确定的值的请求要用 doWithReloginRefresh。
 func (c *Client) doWithRelogin(ctx context.Context, r request) (*Response, error) {
+	return c.doWithReloginRefresh(ctx, r, nil)
+}
+
+// doWithReloginRefresh 与 doWithRelogin 相同，区别是重登录成功后、重跑请求之前
+// 先用 rebuild 重建一次请求；rebuild 为 nil 时行为与 doWithRelogin 完全一致。
+//
+// 需要重建的是参数里含「登录后才确定」的会话/学期状态的请求：重登录后那个值
+// 可能已经变了，继续用调用方传入的旧值重跑只会换回一个无效页面。
+// rebuild 只调用一次；它返回错误时把错误交回调用方，不再发第二次业务请求。
+func (c *Client) doWithReloginRefresh(
+	ctx context.Context,
+	r request,
+	rebuild func(context.Context) (request, error),
+) (*Response, error) {
 	if r.loginFlow {
 		return c.do(ctx, r)
 	}
@@ -314,6 +330,13 @@ func (c *Client) doWithRelogin(ctx context.Context, r request) (*Response, error
 	}
 	if reloginErr := c.reloginAfter(ctx, seq); reloginErr != nil {
 		return nil, reloginErr
+	}
+	if rebuild != nil {
+		fresh, rebuildErr := rebuild(ctx)
+		if rebuildErr != nil {
+			return nil, rebuildErr
+		}
+		r = fresh
 	}
 	return c.do(ctx, r)
 }
