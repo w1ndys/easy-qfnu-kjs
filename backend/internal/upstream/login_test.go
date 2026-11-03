@@ -37,6 +37,10 @@ const (
 		`<input type="hidden" id="kbjcmsid" name="kbjcmsid" value="20251"></body></html>`
 	// fixtureWeekCalendar 是周历页夹具：紧凑写法的「第 X 周 / Y 周」。
 	fixtureWeekCalendar = `<html><body><div>第5周 /16周</div></body></html>`
+	// fixtureBuildingList 是教学楼下拉夹具：dm 是楼编号，dmmc 是展示名。
+	fixtureBuildingList = `[{"dm":"B001","dmmc":"1号教学楼"},{"dm":"B002","dmmc":"2号教学楼"}]`
+	// fixtureWeekMatrix 是周矩阵夹具：本包只发请求与取正文，结构交给 parser（tasklist 4.1）。
+	fixtureWeekMatrix = `<html><body><table id="dataList"><tr><td>矩阵页夹具</td></tr></table></body></html>`
 )
 
 // loginRequest 记录一次上游或 OCR 请求的关键字段，供断言请求顺序、表单与 Cookie 会话。
@@ -81,6 +85,12 @@ type loginFixture struct {
 
 	weekCalendarBodies []string
 	weekCalendarN      int
+
+	buildingListBodies []string
+	buildingListN      int
+
+	weekMatrixBodies []string
+	weekMatrixN      int
 }
 
 // newLoginFixture 装配两个 httptest 服务并注册清理。
@@ -96,6 +106,8 @@ func newLoginFixture(t *testing.T) *loginFixture {
 		jsMainBody:         "<html><title>教学一体化服务平台</title></html>",
 		businessBodies:     []string{fixtureBusinessOK},
 		weekCalendarBodies: []string{fixtureWeekCalendar},
+		buildingListBodies: []string{fixtureBuildingList},
+		weekMatrixBodies:   []string{fixtureWeekMatrix},
 	}
 	for seed := range 4 {
 		f.captchaImages = append(f.captchaImages, captchaJPEG(t, seed))
@@ -186,6 +198,20 @@ func (f *loginFixture) handleUpstream(w http.ResponseWriter, r *http.Request) {
 		call := f.weekCalendarN
 		f.weekCalendarN++
 		body := f.weekCalendarBodies[min(call, len(f.weekCalendarBodies)-1)]
+		f.mu.Unlock()
+		_, _ = io.WriteString(w, body)
+	case buildingListPath:
+		f.mu.Lock()
+		call := f.buildingListN
+		f.buildingListN++
+		body := f.buildingListBodies[min(call, len(f.buildingListBodies)-1)]
+		f.mu.Unlock()
+		_, _ = io.WriteString(w, body)
+	case weekMatrixPath:
+		f.mu.Lock()
+		call := f.weekMatrixN
+		f.weekMatrixN++
+		body := f.weekMatrixBodies[min(call, len(f.weekMatrixBodies)-1)]
 		f.mu.Unlock()
 		_, _ = io.WriteString(w, body)
 	default:
