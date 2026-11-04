@@ -43,3 +43,13 @@ var ErrUpstreamCalendarInvalid = errors.New("学期或周历内容非法")
 // ErrStatsFailed 表示一次访问统计的写入或清理失败。
 // 统计是旁路数据：失败只记日志，不改变查询响应与 HTTP 状态码（CP18）。
 var ErrStatsFailed = errors.New("访问统计失败")
+
+// ErrRunStoreFailed 表示采集轮次在数据库里的创建或状态更新失败。
+// 这是基础设施失败，与「本轮采集业务失败」分开：上层据此结束本轮，而不是写成
+// matrix_structure_invalid 之类的业务错误码。
+var ErrRunStoreFailed = errors.New("采集轮次读写失败")
+
+// ErrRunConflict 表示创建轮次撞上 collect_run_single_running 唯一索引、随后却查不到
+// 进行中轮次。唯一索引保证同一时刻至多一轮，查不到说明那一轮在冲突与查询之间刚好结束。
+// 按约定这里不重试，由调用方在下一轮重新尝试。
+var ErrRunConflict = errors.New("采集轮次冲突")

@@ -20,6 +20,7 @@ import (
 	"github.com/w1ndys/easy-qfnu-kjs/internal/api"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/config"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/pipeline"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/query"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/stats"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
@@ -61,6 +62,19 @@ func run() int {
 	if err := store.Migrate(ctx, pool); err != nil {
 		log.Error("结构变更失败", "err", err)
 		return 1
+	}
+
+	// 启动时先收敛进程崩溃留下的过期轮次（Requirement 8.3）：它们占着
+	// collect_run_single_running 唯一索引，不收拾掉，之后每轮都只能复用这条死轮次。
+	// 失败只记日志、不阻止启动：收敛是维护动作，查询服务仍应能对外提供已有数据。
+	// 连接池由 store.NewCollectRunRepo 适配成 pipeline.RunStore，pipeline 不碰 pgx。
+	// 限时 5 秒：行锁或网络卡住时不能让启动无限等，超时同样按 Warn 继续。
+	convergeCtx, cancelConverge := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelConverge()
+	if staleRunIDs, err := pipeline.ConvergeStaleRuns(convergeCtx, store.NewCollectRunRepo(pool), nil); err != nil {
+		log.Warn("收敛过期轮次失败，继续启动", "err", err)
+	} else if len(staleRunIDs) > 0 {
+		log.Info("已收敛过期轮次", "run_ids", staleRunIDs)
 	}
 
 	// 启动日志只打非敏感项：连接串拆成主机与库名，密码与查询参数不出现。
