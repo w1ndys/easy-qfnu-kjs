@@ -19,6 +19,14 @@ const (
 	SyncTaskFailed  = "failed"  // 已失败：同一轮内不重试，保持 failed
 )
 
+// sync_task.kind 的两种取值，必须与 0001_baseline.sql 的 CHECK 约束一致。
+// 两种任务分段落库：周矩阵不依赖 room，先落；占用说明的 room_id 有外键，
+// 必须等本轮归属写进 room 之后再落（见 EnsureWeekMatrixTasks / EnsureCellDetailTasks）。
+const (
+	SyncTaskKindWeekMatrix = "week_matrix"
+	SyncTaskKindCellDetail = "cell_detail"
+)
+
 // SyncTask 是执行循环关心的 sync_task 列：身份、请求参数与状态。
 // week 与 room_id/weekday/block 是互斥的两组：周矩阵只有 week，
 // 占用说明只有 room_id、weekday、block；读取时把 NULL 折成零值。
@@ -73,31 +81,31 @@ type syncTaskQuerier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-// insertSyncTasksSQL 一次性写入本轮规划的全部任务。
+// insertSyncTasksByKindSQL 写入本轮某一类规划任务（$9 是 kind）。
 //
 // 三个细节：
-//   - WHERE NOT EXISTS 让「本轮已有任务」时整批不写：续跑以库里的任务与状态为准，
-//     不把新规划混进已经跑了一半的轮次；
+//   - WHERE NOT EXISTS 让「本轮该类任务已有」时整批不写：续跑以库里的任务与状态为准，
+//     不把新规划混进已经跑了一半的轮次；按 kind 判而不是按整个 run 判，
+//     周矩阵与占用说明才能分两段各自只插一次；
 //   - ON CONFLICT DO NOTHING 兜住同一轮重复写入，唯一索引认的是
 //     sync_task_week / sync_task_cell 两条部分索引；
-//   - room_id 有外键指向 room(room_id)：调用方必须先 upsert 本轮解析出的教室归属，
-//     再执行本函数。这个顺序由任务 8 的归属落库保证；缺房号时让外键失败上抛，
-//     不在这里替调用方补 room，也不静默丢任务。
+//   - 占用说明的 room_id 有外键指向 room(room_id)：调用方必须先把本轮归属写进 room，
+//     再执行 CellDetail 段。缺房号时外键失败上抛，不静默丢任务。
 //
 // week、room_id、weekday、block 用 NULLIF 把规划里的零值折成 NULL，
 // 以满足表上「周矩阵与占用说明字段互斥」的 CHECK 约束。
 // 整批不写时执行成功但影响 0 行，这是续跑的正常路径，不能按错误处理。
-const insertSyncTasksSQL = `
+const insertSyncTasksByKindSQL = `
 INSERT INTO sync_task (run_id, kind, required, building_id, week, room_id, weekday, block)
 SELECT $1, t.kind, t.required, t.building_id,
        NULLIF(t.week, 0), NULLIF(t.room_id, ''), NULLIF(t.weekday, 0), NULLIF(t.block, '')
   FROM unnest($2::text[], $3::boolean[], $4::text[], $5::smallint[], $6::text[], $7::smallint[], $8::text[])
        AS t(kind, required, building_id, week, room_id, weekday, block)
- WHERE NOT EXISTS (SELECT 1 FROM sync_task WHERE run_id = $1)
+ WHERE NOT EXISTS (SELECT 1 FROM sync_task WHERE run_id = $1 AND kind = $9)
 ON CONFLICT DO NOTHING`
 
 // recountSyncTasksSQL 按 sync_task 的现状重算轮次计数。
-// 目前由 EnsureSyncTasks 在落任务后调用一次；它可重复执行，收尾阶段若要纠正计数，
+// 目前由两段 Ensure 在落任务后各调用一次；它可重复执行，收尾阶段若要纠正计数，
 // 调用导出的 RecountSyncTasks 即可（执行循环不会自动重算）。
 // 轮次不存在时影响 0 行，RecountSyncTasks 据此报 ErrRunStoreFailed。
 const recountSyncTasksSQL = `
@@ -109,12 +117,15 @@ UPDATE collect_run
        updated_at = $2
  WHERE run_id = $1`
 
-// selectSyncTasksSQL 按 task_id 升序取本轮任务。task_id 由规划写入顺序决定，
-// 所以「从第一个 pending 继续」有稳定顺序，不依赖任何额外的排序列。
-const selectSyncTasksSQL = `
+// selectSyncTasksByKindSQL 按 task_id 升序取本轮某一类任务。task_id 由规划写入顺序
+// 决定，所以「从第一个 pending 继续」有稳定顺序，不依赖任何额外的排序列。
+// 按 kind 过滤是为了让两段 Ensure 各自只返回自己的任务：续跑时周矩阵段不能
+// 把已存在的占用说明任务混进周矩阵执行循环。
+const selectSyncTasksByKindSQL = `
 SELECT task_id, kind, required, building_id, week, room_id, weekday, block, status
   FROM sync_task
  WHERE run_id = $1
+   AND kind = $2
  ORDER BY task_id`
 
 // completeSyncTaskSQL 把一条 pending 任务置为 done，并只在真的发生状态迁移时
@@ -193,32 +204,57 @@ DO UPDATE
        page_sha256 = NULL,
        error_message = EXCLUDED.error_message`
 
-// EnsureSyncTasks 写入本轮规划任务并返回库里的权威任务清单（按 task_id 升序）。
+// EnsureWeekMatrixTasks 写入本轮规划的周矩阵任务并返回库里该段的权威清单
+// （按 task_id 升序）。周矩阵的 sync_task 行没有 room_id，新库没有 room 也能落库，
+// 所以它必须先于占用说明段执行，给归属落库创造前置条件。
 //
-// 只在轮到本 run_id 还没有任何任务时插入；已有任务时直接读回，保留 done/failed，
+// 只在该轮还没有周矩阵任务时插入；已有任务时直接读回，保留 done/failed，
 // 这是断点续跑「从第一个 pending 继续、跳过 done、不重试 failed」的数据基础。
-// 插入后按实际行数重算 required_total/optional_total/required_done/optional_done，
-// 让轮次计数与任务表一致；轮次不存在时重算影响 0 行并返回 ErrRunStoreFailed。
+// 插入后重算轮次计数；轮次不存在时重算影响 0 行并返回 ErrRunStoreFailed。
+func EnsureWeekMatrixTasks(ctx context.Context, q syncTaskQuerier, runID int64, tasks []SyncTaskInput, now time.Time) ([]SyncTask, error) {
+	return ensureSyncTasksOfKind(ctx, q, runID, SyncTaskKindWeekMatrix, tasks, now)
+}
+
+// EnsureCellDetailTasks 写入本轮规划的占用说明任务并返回库里该段的权威清单。
 //
-// sync_task.room_id 依赖 room 已存在：调用方必须先 upsert 本轮解析出的教室归属，
-// 再执行本函数；这个顺序由任务 8 的归属落库保证。缺房号时外键失败会包装成
-// ErrRunStoreFailed 上抛，不会静默丢任务。
-func EnsureSyncTasks(ctx context.Context, q syncTaskQuerier, runID int64, tasks []SyncTaskInput, now time.Time) ([]SyncTask, error) {
+// sync_task.room_id 有外键指向 room(room_id)：调用方必须先用周矩阵响应完成
+// 本轮归属落库，再执行本函数。周矩阵段与占用说明段拆开写，正是为了让「新库里
+// room 还不存在」不再把两段任务一起打挂：周矩阵先落、先跑、先写 room，
+// 占用说明再落。缺房号时外键失败仍会包装成 ErrRunStoreFailed 上抛，不静默丢任务。
+func EnsureCellDetailTasks(ctx context.Context, q syncTaskQuerier, runID int64, tasks []SyncTaskInput, now time.Time) ([]SyncTask, error) {
+	return ensureSyncTasksOfKind(ctx, q, runID, SyncTaskKindCellDetail, tasks, now)
+}
+
+// ensureSyncTasksOfKind 是两段 Ensure 的共同实现：只处理 kind 这一种任务，
+// 写库、重算计数、按 kind 读回。
+func ensureSyncTasksOfKind(
+	ctx context.Context,
+	q syncTaskQuerier,
+	runID int64,
+	kind string,
+	tasks []SyncTaskInput,
+	now time.Time,
+) ([]SyncTask, error) {
+	for _, task := range tasks {
+		if task.Kind != kind {
+			return nil, fmt.Errorf("%w: 任务种类 %q 不能写进 %s 段", model.ErrRunStoreFailed, task.Kind, kind)
+		}
+	}
 	if len(tasks) > 0 {
-		if err := insertSyncTasks(ctx, q, runID, tasks); err != nil {
+		if err := insertSyncTasks(ctx, q, runID, kind, tasks); err != nil {
 			return nil, err
 		}
 	}
 	if err := RecountSyncTasks(ctx, q, runID, now); err != nil {
 		return nil, err
 	}
-	return loadSyncTasks(ctx, q, runID)
+	return loadSyncTasksByKind(ctx, q, runID, kind)
 }
 
 // RecountSyncTasks 按 sync_task 的现状重算轮次的 required_total/optional_total/
 // required_done/optional_done，并刷新 updated_at。
 //
-// 它只改计数、不碰任务状态，可重复执行；EnsureSyncTasks 落任务后调用一次。
+// 它只改计数、不碰任务状态，可重复执行；两段 Ensure 落任务后各调用一次。
 // 收尾阶段若需要纠正计数，调用方应显式调用本函数，不要假定执行循环会自动重算。
 // 轮次不存在时 UPDATE 影响 0 行：这是调用方传错 run_id 的信号，按
 // ErrRunStoreFailed 上抛，不静默当成「重算成功」。
@@ -233,8 +269,8 @@ func RecountSyncTasks(ctx context.Context, q syncTaskQuerier, runID int64, now t
 	return nil
 }
 
-// insertSyncTasks 把规划任务写进 sync_task；已有任务时整批不写。
-func insertSyncTasks(ctx context.Context, q syncTaskQuerier, runID int64, tasks []SyncTaskInput) error {
+// insertSyncTasks 把某一类规划任务写进 sync_task；该轮已有同类任务时整批不写。
+func insertSyncTasks(ctx context.Context, q syncTaskQuerier, runID int64, kind string, tasks []SyncTaskInput) error {
 	kinds := make([]string, len(tasks))
 	required := make([]bool, len(tasks))
 	buildingIDs := make([]string, len(tasks))
@@ -252,16 +288,16 @@ func insertSyncTasks(ctx context.Context, q syncTaskQuerier, runID int64, tasks 
 		blocks[index] = task.Block
 	}
 
-	if _, err := q.Exec(ctx, insertSyncTasksSQL,
-		runID, kinds, required, buildingIDs, weeks, roomIDs, weekdays, blocks); err != nil {
+	if _, err := q.Exec(ctx, insertSyncTasksByKindSQL,
+		runID, kinds, required, buildingIDs, weeks, roomIDs, weekdays, blocks, kind); err != nil {
 		return fmt.Errorf("%w: 写入同步任务失败: %w", model.ErrRunStoreFailed, err)
 	}
 	return nil
 }
 
-// loadSyncTasks 读回本轮任务；NULL 的周次与占用说明字段折成零值。
-func loadSyncTasks(ctx context.Context, q syncTaskQuerier, runID int64) ([]SyncTask, error) {
-	rows, err := q.Query(ctx, selectSyncTasksSQL, runID)
+// loadSyncTasksByKind 读回本轮某一类任务；NULL 的周次与占用说明字段折成零值。
+func loadSyncTasksByKind(ctx context.Context, q syncTaskQuerier, runID int64, kind string) ([]SyncTask, error) {
+	rows, err := q.Query(ctx, selectSyncTasksByKindSQL, runID, kind)
 	if err != nil {
 		return nil, fmt.Errorf("%w: 读取同步任务失败: %w", model.ErrRunStoreFailed, err)
 	}
@@ -369,9 +405,14 @@ func NewSyncTaskRepo(q syncTaskQuerier) SyncTaskRepo {
 	return SyncTaskRepo{q: q}
 }
 
-// EnsureSyncTasks 见同名函数。
-func (r SyncTaskRepo) EnsureSyncTasks(ctx context.Context, runID int64, tasks []SyncTaskInput, now time.Time) ([]SyncTask, error) {
-	return EnsureSyncTasks(ctx, r.q, runID, tasks, now)
+// EnsureWeekMatrixTasks 见同名函数。
+func (r SyncTaskRepo) EnsureWeekMatrixTasks(ctx context.Context, runID int64, tasks []SyncTaskInput, now time.Time) ([]SyncTask, error) {
+	return EnsureWeekMatrixTasks(ctx, r.q, runID, tasks, now)
+}
+
+// EnsureCellDetailTasks 见同名函数。
+func (r SyncTaskRepo) EnsureCellDetailTasks(ctx context.Context, runID int64, tasks []SyncTaskInput, now time.Time) ([]SyncTask, error) {
+	return EnsureCellDetailTasks(ctx, r.q, runID, tasks, now)
 }
 
 // RecountSyncTasks 见同名函数。

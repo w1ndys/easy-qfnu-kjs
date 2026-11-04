@@ -170,70 +170,139 @@ func (s *syncTaskRowsStub) Conn() *pgx.Conn { return nil }
 // TypeMap 实现 pgx.Rows。
 func (s *syncTaskRowsStub) TypeMap() *pgtype.Map { return nil }
 
-// TestEnsureSyncTasksInsertsAndReloads 覆盖落库映射与读取折零：
-// 规划任务写成并行数组，读回时 NULL 的周次/占用说明字段折成零值。
-func TestEnsureSyncTasksInsertsAndReloads(t *testing.T) {
+// TestEnsureWeekMatrixTasksInsertsAndReloads 覆盖周矩阵段落库映射与读取折零：
+// 规划任务写成并行数组并以 kind 参数限定本段，读回时 NULL 的占用说明字段折成零值。
+func TestEnsureWeekMatrixTasksInsertsAndReloads(t *testing.T) {
 	now := time.Date(2026, 11, 4, 9, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
 	rows := &syncTaskRowsStub{tasks: []SyncTask{
-		{TaskID: 1, Kind: "week_matrix", Required: true, BuildingID: "Q10", Week: 20, Status: SyncTaskDone},
-		{TaskID: 2, Kind: "cell_detail", BuildingID: "Q10", RoomID: "r101", Weekday: 3, Block: "0304", Status: SyncTaskPending},
+		{TaskID: 1, Kind: SyncTaskKindWeekMatrix, Required: true, BuildingID: "Q10", Week: 20, Status: SyncTaskDone},
+		{TaskID: 2, Kind: SyncTaskKindWeekMatrix, Required: true, BuildingID: "Q10", Week: 21, Status: SyncTaskPending},
 	}}
 	querier := &syncTaskQuerierStub{queryRows: rows}
 	inputs := []SyncTaskInput{
-		{Kind: "week_matrix", Required: true, BuildingID: "Q10", Week: 20},
-		{Kind: "cell_detail", BuildingID: "Q10", RoomID: "r101", Weekday: 3, Block: "0304"},
+		{Kind: SyncTaskKindWeekMatrix, Required: true, BuildingID: "Q10", Week: 20},
+		{Kind: SyncTaskKindWeekMatrix, Required: true, BuildingID: "Q10", Week: 21},
 	}
 
-	tasks, err := EnsureSyncTasks(context.Background(), querier, 7, inputs, now)
+	tasks, err := EnsureWeekMatrixTasks(context.Background(), querier, 7, inputs, now)
 	if err != nil {
 		t.Fatalf("落任务不应报错，实际 %v", err)
 	}
-	if len(tasks) != 2 || tasks[0].Status != SyncTaskDone || tasks[1].RoomID != "r101" {
+	if len(tasks) != 2 || tasks[0].Status != SyncTaskDone || tasks[1].Week != 21 {
 		t.Fatalf("读回任务不符: %+v", tasks)
 	}
 	if tasks[0].RoomID != "" || tasks[0].Weekday != 0 || tasks[0].Block != "" {
 		t.Fatalf("周矩阵任务的占用说明字段应折成零值: %+v", tasks[0])
 	}
-	if tasks[1].Week != 0 {
-		t.Fatalf("占用说明任务的周次应折成零值: %+v", tasks[1])
-	}
 	if querier.execCalls != 2 {
 		t.Fatalf("应依次执行插入与重算计数两条 SQL，实际 %d 条", querier.execCalls)
 	}
-	if querier.execSQLs[0] != insertSyncTasksSQL || querier.execSQLs[1] != recountSyncTasksSQL {
+	if querier.execSQLs[0] != insertSyncTasksByKindSQL || querier.execSQLs[1] != recountSyncTasksSQL {
 		t.Fatalf("SQL 顺序不符: %v", querier.execSQLs)
 	}
 	args := querier.execArgs[0]
-	if len(args) != 8 {
-		t.Fatalf("插入参数应有 8 个，实际 %d 个", len(args))
+	if len(args) != 9 {
+		t.Fatalf("插入参数应有 9 个，实际 %d 个", len(args))
 	}
 	if args[0].(int64) != 7 {
 		t.Fatalf("run_id 期望 7，实际 %v", args[0])
 	}
-	if got := args[1].([]string); len(got) != 2 || got[0] != "week_matrix" || got[1] != "cell_detail" {
+	if got := args[1].([]string); len(got) != 2 || got[0] != SyncTaskKindWeekMatrix || got[1] != SyncTaskKindWeekMatrix {
 		t.Fatalf("kind 数组不符: %v", got)
 	}
-	if got := args[2].([]bool); len(got) != 2 || !got[0] || got[1] {
+	if got := args[2].([]bool); len(got) != 2 || !got[0] || !got[1] {
 		t.Fatalf("required 数组不符: %v", got)
 	}
-	if got := args[4].([]int16); len(got) != 2 || got[0] != 20 || got[1] != 0 {
+	if got := args[4].([]int16); len(got) != 2 || got[0] != 20 || got[1] != 21 {
 		t.Fatalf("week 数组不符: %v", got)
 	}
-	if got := args[5].([]string); len(got) != 2 || got[0] != "" || got[1] != "r101" {
+	if got := args[5].([]string); len(got) != 2 || got[0] != "" || got[1] != "" {
 		t.Fatalf("room_id 数组不符: %v", got)
 	}
-	if got := args[6].([]int16); len(got) != 2 || got[0] != 0 || got[1] != 3 {
-		t.Fatalf("weekday 数组不符: %v", got)
+	if args[8] != SyncTaskKindWeekMatrix {
+		t.Fatalf("段种类参数期望 %q，实际 %v", SyncTaskKindWeekMatrix, args[8])
 	}
 	recountArgs := querier.execArgs[1]
 	if len(recountArgs) != 2 || recountArgs[0].(int64) != 7 || !recountArgs[1].(time.Time).Equal(now) {
 		t.Fatalf("重算计数参数不符: %v", recountArgs)
 	}
-	if querier.queryCalls != 1 || querier.queryArgs[0].(int64) != 7 {
+	if querier.queryCalls != 1 || querier.queryArgs[0].(int64) != 7 || querier.queryArgs[1] != SyncTaskKindWeekMatrix {
 		t.Fatalf("读任务参数不符: calls=%d args=%v", querier.queryCalls, querier.queryArgs)
 	}
 	if !rows.closed {
 		t.Fatal("任务行应被关闭")
+	}
+}
+
+// TestEnsureCellDetailTasksInsertsAndReloads 覆盖占用说明段落库与读取折零：
+// room_id 等字段原样传库，读回时 NULL 的周次折成零值，kind 参数限定本段。
+func TestEnsureCellDetailTasksInsertsAndReloads(t *testing.T) {
+	now := time.Date(2026, 11, 4, 9, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	rows := &syncTaskRowsStub{tasks: []SyncTask{
+		{TaskID: 1, Kind: SyncTaskKindCellDetail, BuildingID: "Q10", RoomID: "r101", Weekday: 3, Block: "0304", Status: SyncTaskPending},
+	}}
+	querier := &syncTaskQuerierStub{queryRows: rows}
+	inputs := []SyncTaskInput{
+		{Kind: SyncTaskKindCellDetail, BuildingID: "Q10", RoomID: "r101", Weekday: 3, Block: "0304"},
+	}
+
+	tasks, err := EnsureCellDetailTasks(context.Background(), querier, 7, inputs, now)
+	if err != nil {
+		t.Fatalf("落任务不应报错，实际 %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].RoomID != "r101" || tasks[0].Weekday != 3 {
+		t.Fatalf("读回任务不符: %+v", tasks)
+	}
+	if tasks[0].Week != 0 {
+		t.Fatalf("占用说明任务的周次应折成零值: %+v", tasks[0])
+	}
+	if querier.execCalls != 2 || querier.execSQLs[0] != insertSyncTasksByKindSQL {
+		t.Fatalf("SQL 顺序不符: %v", querier.execSQLs)
+	}
+	args := querier.execArgs[0]
+	if len(args) != 9 || args[8] != SyncTaskKindCellDetail {
+		t.Fatalf("段种类参数不符: %v", args)
+	}
+	if got := args[5].([]string); len(got) != 1 || got[0] != "r101" {
+		t.Fatalf("room_id 数组不符: %v", got)
+	}
+	if got := args[6].([]int16); len(got) != 1 || got[0] != 3 {
+		t.Fatalf("weekday 数组不符: %v", got)
+	}
+	if querier.queryCalls != 1 || querier.queryArgs[1] != SyncTaskKindCellDetail {
+		t.Fatalf("读任务参数不符: calls=%d args=%v", querier.queryCalls, querier.queryArgs)
+	}
+}
+
+// TestEnsureSplitSyncTasksRejectsMixedKind 覆盖两段 Ensure 的段边界：
+// 把占用说明任务交给周矩阵段（或反过来）直接报错，不执行任何 SQL。
+func TestEnsureSplitSyncTasksRejectsMixedKind(t *testing.T) {
+	cases := []struct {
+		name  string
+		kind  string
+		input SyncTaskInput
+	}{
+		{name: "周矩阵段拒绝占用说明", kind: SyncTaskKindWeekMatrix,
+			input: SyncTaskInput{Kind: SyncTaskKindCellDetail, BuildingID: "Q10", RoomID: "r101", Weekday: 1, Block: "0102"}},
+		{name: "占用说明段拒绝周矩阵", kind: SyncTaskKindCellDetail,
+			input: SyncTaskInput{Kind: SyncTaskKindWeekMatrix, Required: true, BuildingID: "Q10", Week: 20}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			querier := &syncTaskQuerierStub{}
+			var err error
+			if c.kind == SyncTaskKindWeekMatrix {
+				_, err = EnsureWeekMatrixTasks(context.Background(), querier, 7, []SyncTaskInput{c.input}, time.Now())
+			} else {
+				_, err = EnsureCellDetailTasks(context.Background(), querier, 7, []SyncTaskInput{c.input}, time.Now())
+			}
+			if !errors.Is(err, model.ErrRunStoreFailed) {
+				t.Fatalf("同段混入别的种类应报 ErrRunStoreFailed，实际 %v", err)
+			}
+			if querier.execCalls != 0 || querier.queryCalls != 0 {
+				t.Fatalf("段边界校验失败时不应触库: exec=%d query=%d", querier.execCalls, querier.queryCalls)
+			}
+		})
 	}
 }
 
@@ -410,30 +479,40 @@ func TestRecountSyncTasksRejectsMissingRun(t *testing.T) {
 	}
 }
 
-// TestEnsureSyncTasksRejectsMissingRunOnRecount 覆盖空任务清单加轮次不存在：
-// 没有插入语句可发，唯一的重算语句影响 0 行，必须报错；也不该去读任务。
-func TestEnsureSyncTasksRejectsMissingRunOnRecount(t *testing.T) {
-	querier := &syncTaskQuerierStub{execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0")}}
-
-	_, err := EnsureSyncTasks(context.Background(), querier, 404, nil,
-		time.Date(2026, 11, 4, 9, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60)))
-	if !errors.Is(err, model.ErrRunStoreFailed) {
-		t.Fatalf("轮次不存在时应返回 ErrRunStoreFailed，实际 %v", err)
+// TestEnsureSplitSyncTasksRejectsMissingRunOnRecount 覆盖空任务清单加轮次不存在：
+// 两段 Ensure 都没有插入语句可发，唯一的重算语句影响 0 行，必须报错；也不该去读任务。
+func TestEnsureSplitSyncTasksRejectsMissingRunOnRecount(t *testing.T) {
+	now := time.Date(2026, 11, 4, 9, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	cases := []struct {
+		name   string
+		ensure func(context.Context, syncTaskQuerier, int64, []SyncTaskInput, time.Time) ([]SyncTask, error)
+	}{
+		{name: "周矩阵段", ensure: EnsureWeekMatrixTasks},
+		{name: "占用说明段", ensure: EnsureCellDetailTasks},
 	}
-	if querier.execCalls != 1 || querier.execSQLs[0] != recountSyncTasksSQL {
-		t.Fatalf("空任务清单只应执行重算计数 SQL，实际 %v", querier.execSQLs)
-	}
-	if querier.queryCalls != 0 {
-		t.Fatalf("重算失败后不应继续读任务，实际查询 %d 次", querier.queryCalls)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			querier := &syncTaskQuerierStub{execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0")}}
+			_, err := c.ensure(context.Background(), querier, 404, nil, now)
+			if !errors.Is(err, model.ErrRunStoreFailed) {
+				t.Fatalf("轮次不存在时应返回 ErrRunStoreFailed，实际 %v", err)
+			}
+			if querier.execCalls != 1 || querier.execSQLs[0] != recountSyncTasksSQL {
+				t.Fatalf("空任务清单只应执行重算计数 SQL，实际 %v", querier.execSQLs)
+			}
+			if querier.queryCalls != 0 {
+				t.Fatalf("重算失败后不应继续读任务，实际查询 %d 次", querier.queryCalls)
+			}
+		})
 	}
 }
 
-// TestEnsureSyncTasksWrapsStoreFailure 覆盖基础设施错误统一映射成 ErrRunStoreFailed。
-func TestEnsureSyncTasksWrapsStoreFailure(t *testing.T) {
+// TestEnsureWeekMatrixTasksWrapsStoreFailure 覆盖基础设施错误统一映射成 ErrRunStoreFailed。
+func TestEnsureWeekMatrixTasksWrapsStoreFailure(t *testing.T) {
 	querier := &syncTaskQuerierStub{execErr: errors.New("连接断开")}
 
-	_, err := EnsureSyncTasks(context.Background(), querier, 7,
-		[]SyncTaskInput{{Kind: "week_matrix", Required: true, BuildingID: "Q10", Week: 20}},
+	_, err := EnsureWeekMatrixTasks(context.Background(), querier, 7,
+		[]SyncTaskInput{{Kind: SyncTaskKindWeekMatrix, Required: true, BuildingID: "Q10", Week: 20}},
 		time.Date(2026, 11, 4, 9, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60)))
 	if !errors.Is(err, model.ErrRunStoreFailed) {
 		t.Fatalf("应包装成 ErrRunStoreFailed，实际 %v", err)

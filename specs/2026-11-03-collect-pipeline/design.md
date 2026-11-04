@@ -31,14 +31,16 @@ flowchart LR
 - `clean.RoomName(raw string) string`：全半角归一、反复删容量片段、压缩空白，保留原始名。
 - `clean.ExpandNodes(block string) []string`：5 大节映射 12 小节，同一大节内状态一致。
 - `pipeline.Plan(window Window, buildingIDs []string, unavailable []Cell) PlanResult`：纯规划、不读时钟；窗口 `C..min(Y,C+3)`、每楼每周一条矩阵任务、占用说明任务；空窗 `skipped`、空白名单 `blocked`。
-- `pipeline.Run(ctx, runID, tasks)`：单轮互斥、断点续跑、归属落库、失败分层。
+- `pipeline.Run(ctx, runID, whitelist []string, planned []Task, deps RunDeps) (RunProgress, error)`：断点续跑、归属落库、两段执行（周矩阵 → 归属 → 明细）；单轮互斥由 StartRun 的唯一索引负责，整轮失败分层见任务 9。
+  - 契约：计划里的楼序列必须与白名单逐位一致，不一致在落库前拒绝，一条任务都不写（命中这种情况的是 `checkPlannedWhitelist`）。
+  - 契约：`collect_run_room` 的 `conflict` 与 `conflict_building_id` 同进同出——有冲突必须有被丢弃的楼，没冲突必须留空；DB CHECK 兜最后一道，Go 侧 `normalizeRunRooms` 先挡一道。
 - `publish.Build(runID) Candidate`：组装观测、说明、归属快照、派生状态。
 - `publish.Validate(candidate) error`：候选集非空、必需任务完成、未知/复合计数。
 - `publish.Commit(candidate) error`：单事务写 release → 观测 → 说明 → 归属快照 → 降原 current → 抬新 current → 删更早版本。
 
 ## Data Models
 
-复用 `migrations/0001_baseline.sql`：`collect_run`、`collect_run_week`、`sync_task`、`release`、`release_room_building`、`observation`、`occupancy_detail`、`room`、`term`、`term_week`、`dict_state`、`dict_symbol`、`axis_node`。本 spec 不新增表；若确实缺列，先报告再定，不擅自改 migration。
+复用 `migrations/0001_baseline.sql`：`collect_run`、`collect_run_week`、`sync_task`、`release`、`release_room_building`、`observation`、`occupancy_detail`、`room`、`term`、`term_week`、`dict_state`、`dict_symbol`、`axis_node`。另新增 `migrations/0002_collect_run_room.sql` 的 `collect_run_room`（每轮房号→楼归属快照，供续跑重建累计器、任务 10 发布读取；用户已批准新增表）。除此之外不新增表；若确实缺列，先报告再定，不擅自改 migration。
 
 ## Correctness Properties
 

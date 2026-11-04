@@ -91,9 +91,43 @@ SELECT required_total, required_done, optional_total, optional_done
 	return requiredTotal, requiredDone, optionalTotal, optionalDone
 }
 
-// TestEnsureSyncTasksAgainstRealDB 覆盖任务落库与续跑基准：
+// ensurePlannedTasksForTest 按两段落库并拼回完整清单，模拟 pipeline 的落库顺序：
+// 先周矩阵段（不依赖 room），再占用说明段（room_id 有外键）。返回顺序是
+// 周矩阵任务在前、占用说明任务在后，与 task_id 顺序一致。
+func ensurePlannedTasksForTest(
+	ctx context.Context,
+	repo SyncTaskRepo,
+	runID int64,
+	planned []SyncTaskInput,
+	now time.Time,
+) ([]SyncTask, error) {
+	weekInputs, cellInputs := splitSyncTaskInputsForTest(planned)
+	weeks, err := repo.EnsureWeekMatrixTasks(ctx, runID, weekInputs, now)
+	if err != nil {
+		return nil, err
+	}
+	cells, err := repo.EnsureCellDetailTasks(ctx, runID, cellInputs, now)
+	if err != nil {
+		return nil, err
+	}
+	return append(weeks, cells...), nil
+}
+
+// splitSyncTaskInputsForTest 按 kind 把规划拆成两段，保持段内顺序。
+func splitSyncTaskInputsForTest(tasks []SyncTaskInput) (week, cell []SyncTaskInput) {
+	for _, task := range tasks {
+		if task.Kind == SyncTaskKindWeekMatrix {
+			week = append(week, task)
+		} else {
+			cell = append(cell, task)
+		}
+	}
+	return week, cell
+}
+
+// TestEnsureSplitSyncTasksAgainstRealDB 覆盖两段任务落库与续跑基准：
 // 首次写入规划任务并回写总数；再次调用沿用库里的任务与状态，不把新规划混进来。
-func TestEnsureSyncTasksAgainstRealDB(t *testing.T) {
+func TestEnsureSplitSyncTasksAgainstRealDB(t *testing.T) {
 	ctx, pool := openCollectRunTestDB(t)
 	repo := NewSyncTaskRepo(pool)
 	runID := seedSyncTaskRun(ctx, t, pool)
@@ -104,7 +138,7 @@ func TestEnsureSyncTasksAgainstRealDB(t *testing.T) {
 		{Kind: "week_matrix", Required: true, BuildingID: "Q10", Week: 21},
 		{Kind: "cell_detail", BuildingID: "Q10", RoomID: "r101", Weekday: 1, Block: "0102"},
 	}
-	tasks, err := repo.EnsureSyncTasks(ctx, runID, planned, now)
+	tasks, err := ensurePlannedTasksForTest(ctx, repo, runID, planned, now)
 	if err != nil {
 		t.Fatalf("落任务失败: %v", err)
 	}
@@ -139,7 +173,7 @@ func TestEnsureSyncTasksAgainstRealDB(t *testing.T) {
 	}
 
 	// 续跑时传入另一份规划：库里已有任务，整批不写，返回的仍是原来的 3 条。
-	resumed, err := repo.EnsureSyncTasks(ctx, runID, []SyncTaskInput{
+	resumed, err := ensurePlannedTasksForTest(ctx, repo, runID, []SyncTaskInput{
 		{Kind: "week_matrix", Required: true, BuildingID: "Q99", Week: 22},
 	}, now.Add(time.Minute))
 	if err != nil {
@@ -169,7 +203,7 @@ func TestCompleteSyncTaskWritesWeekResultAgainstRealDB(t *testing.T) {
 	runID := seedSyncTaskRun(ctx, t, pool)
 	now := time.Date(2026, 11, 4, 9, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
 
-	tasks, err := repo.EnsureSyncTasks(ctx, runID, []SyncTaskInput{
+	tasks, err := ensurePlannedTasksForTest(ctx, repo, runID, []SyncTaskInput{
 		{Kind: "week_matrix", Required: true, BuildingID: "Q10", Week: 20},
 		{Kind: "cell_detail", BuildingID: "Q10", RoomID: "r101", Weekday: 1, Block: "0102"},
 	}, now)
@@ -208,7 +242,7 @@ SELECT term, ok, fetched_at, page_sha256
 	}
 
 	// 续跑读回时已完成任务保持 done，计数也不被重算回零。
-	resumed, err := repo.EnsureSyncTasks(ctx, runID, []SyncTaskInput{
+	resumed, err := ensurePlannedTasksForTest(ctx, repo, runID, []SyncTaskInput{
 		{Kind: "week_matrix", Required: true, BuildingID: "Q10", Week: 20},
 	}, now.Add(time.Minute))
 	if err != nil {
@@ -270,7 +304,7 @@ func TestFailSyncTaskKeepsFailedAcrossResumeAgainstRealDB(t *testing.T) {
 		{Kind: "week_matrix", Required: true, BuildingID: "Q10", Week: 20},
 		{Kind: "cell_detail", BuildingID: "Q10", RoomID: "r101", Weekday: 1, Block: "0102"},
 	}
-	tasks, err := repo.EnsureSyncTasks(ctx, runID, planned, now)
+	tasks, err := ensurePlannedTasksForTest(ctx, repo, runID, planned, now)
 	if err != nil {
 		t.Fatalf("落任务失败: %v", err)
 	}
@@ -291,7 +325,7 @@ func TestFailSyncTaskKeepsFailedAcrossResumeAgainstRealDB(t *testing.T) {
 	}
 
 	// 续跑：读回的任务仍是 failed，再置失败也不会增加尝试次数。
-	resumed, err := repo.EnsureSyncTasks(ctx, runID, planned, now.Add(time.Minute))
+	resumed, err := ensurePlannedTasksForTest(ctx, repo, runID, planned, now.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("续跑读任务失败: %v", err)
 	}
@@ -392,7 +426,7 @@ func TestSyncTaskWritesRejectMissingRunOrTaskAgainstRealDB(t *testing.T) {
 	repo := NewSyncTaskRepo(pool)
 	runID := seedSyncTaskRun(ctx, t, pool)
 	now := time.Date(2026, 11, 4, 9, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
-	tasks, err := repo.EnsureSyncTasks(ctx, runID, []SyncTaskInput{
+	tasks, err := ensurePlannedTasksForTest(ctx, repo, runID, []SyncTaskInput{
 		{Kind: "week_matrix", Required: true, BuildingID: "Q10", Week: 20},
 		{Kind: "cell_detail", BuildingID: "Q10", RoomID: "r101", Weekday: 1, Block: "0102"},
 	}, now)
@@ -455,7 +489,7 @@ func TestSyncTaskWritesRejectMissingRunOrTaskAgainstRealDB(t *testing.T) {
 		{
 			name: "落任务-轮次不存在且清单为空",
 			call: func() error {
-				_, err := repo.EnsureSyncTasks(ctx, missingID, nil, now)
+				_, err := repo.EnsureWeekMatrixTasks(ctx, missingID, nil, now)
 				return err
 			},
 		},
@@ -505,28 +539,59 @@ func TestRecordWeekResultsRejectRunWithoutTermAgainstRealDB(t *testing.T) {
 	}
 }
 
-// TestEnsureSyncTasksRejectsMissingRoomAgainstRealDB 覆盖 minor 8 的前提：
-// sync_task.room_id 外键要求 room 已在任务 8 中 upsert；缺房号时整批插入失败并
-// 包装成 ErrRunStoreFailed，不静默丢任务。
-func TestEnsureSyncTasksRejectsMissingRoomAgainstRealDB(t *testing.T) {
+// TestSplitEnsureTasksKeepsWeekMatrixWhenRoomMissingAgainstRealDB 覆盖两段插入的核心：
+// 新库里还没有 room 时，周矩阵段照常落库；占用说明段因外键失败也不回滚周矩阵段，
+// 等归属写进 room 后重试占用说明段即可成功。整批失败不再发生。
+func TestSplitEnsureTasksKeepsWeekMatrixWhenRoomMissingAgainstRealDB(t *testing.T) {
 	ctx, pool := openCollectRunTestDB(t)
 	repo := NewSyncTaskRepo(pool)
 	runID := seedSyncTaskRun(ctx, t, pool)
 	now := time.Date(2026, 11, 4, 9, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
 
-	_, err := repo.EnsureSyncTasks(ctx, runID, []SyncTaskInput{
+	weekTasks, err := repo.EnsureWeekMatrixTasks(ctx, runID, []SyncTaskInput{
 		{Kind: "week_matrix", Required: true, BuildingID: "Q10", Week: 20},
-		{Kind: "cell_detail", BuildingID: "Q10", RoomID: "r404", Weekday: 1, Block: "0102"},
 	}, now)
-	if !errors.Is(err, model.ErrRunStoreFailed) {
-		t.Fatalf("缺房号应因外键失败返回 ErrRunStoreFailed，实际 %v", err)
+	if err != nil {
+		t.Fatalf("周矩阵段应在新库落库成功，实际 %v", err)
+	}
+	if len(weekTasks) != 1 {
+		t.Fatalf("周矩阵段应落 1 条，实际 %d 条: %+v", len(weekTasks), weekTasks)
 	}
 
-	var tasks int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM sync_task WHERE run_id = $1", runID).Scan(&tasks); err != nil {
+	plannedCells := []SyncTaskInput{
+		{Kind: "cell_detail", BuildingID: "Q10", RoomID: "r404", Weekday: 1, Block: "0102"},
+	}
+	if _, err := repo.EnsureCellDetailTasks(ctx, runID, plannedCells, now); !errors.Is(err, model.ErrRunStoreFailed) {
+		t.Fatalf("缺房号时占用说明段应因外键失败返回 ErrRunStoreFailed，实际 %v", err)
+	}
+
+	// 占用说明段失败不能把已落的周矩阵任务带走，也不能留下半截占用说明任务。
+	var weekCount, cellCount int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*) FILTER (WHERE kind = 'week_matrix'), count(*) FILTER (WHERE kind = 'cell_detail')
+  FROM sync_task WHERE run_id = $1`, runID).Scan(&weekCount, &cellCount); err != nil {
 		t.Fatalf("统计任务失败: %v", err)
 	}
-	if tasks != 0 {
-		t.Fatalf("外键失败时整批不应落库，实际 %d 条", tasks)
+	if weekCount != 1 || cellCount != 0 {
+		t.Fatalf("周矩阵段应保留 1 条、占用说明段应为 0 条，实际 week=%d cell=%d", weekCount, cellCount)
+	}
+
+	// 归属落库（周矩阵响应的结果）之后重试占用说明段：外键满足，任务落库成功。
+	mustExec(ctx, t, pool, `
+INSERT INTO room (room_id, name, name_raw, building_id)
+VALUES ('r404', 'F404', 'F404', 'Q10')
+ON CONFLICT (room_id) DO NOTHING`)
+	cells, err := repo.EnsureCellDetailTasks(ctx, runID, plannedCells, now)
+	if err != nil {
+		t.Fatalf("归属落库后占用说明段应成功，实际 %v", err)
+	}
+	if len(cells) != 1 || cells[0].RoomID != "r404" {
+		t.Fatalf("占用说明段应返回 r404，实际 %+v", cells)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM sync_task WHERE run_id = $1", runID).Scan(&cellCount); err != nil {
+		t.Fatalf("统计任务失败: %v", err)
+	}
+	if cellCount != 2 {
+		t.Fatalf("两段合计应有 2 条任务，实际 %d 条", cellCount)
 	}
 }
