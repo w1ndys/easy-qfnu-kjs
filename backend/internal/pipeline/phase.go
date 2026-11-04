@@ -234,6 +234,9 @@ func EvaluateRun(
 // 语义如下：
 //   - 仍有 pending 任务（必需或可选）时拒绝收口：执行循环没跑完就写终态会把
 //     「还没做」记成「已完成」，续跑也补不回来；
+//   - 一条必需任务都没有 → failed：本轮没有规划出任何窗口采集，不能记成成功，
+//     与发布校验的「必需任务 0/0」拦截同口径；原因写一句固定说明。空窗 skipped 与
+//     空白名单 blocked 不经过本函数：它们由规划阶段直接调用 FinishRun 写终态，不进入 CloseRun。
 //   - 有 failed 必需任务，或被丢弃的必需明细任务 → failed：整轮失败、不发布，
 //     保留线上版本；
 //   - 只有 failed 可选任务或被丢弃的可选明细任务 → partial：可用性数据完整，
@@ -294,10 +297,14 @@ func CloseRun(
 			finish.ErrorMessage = droppedMessage(dropped)
 		}
 	case StatusFailed:
-		// 失败全部来自被丢弃的必需明细、库里没有任何 failed 行时才用丢弃说明；
-		// 一旦库里有失败任务（哪怕只是可选明细），保留它记录的码与最早原因，
-		// 不要用丢弃说明覆盖，否则 code 与 message 会来自两套口径。
-		if summary.RequiredFailed == 0 && summary.OptionalFailed == 0 {
+		// 零必需任务没有 failed 行可引用，写一句固定说明；失败全部来自被丢弃的
+		// 必需明细、库里也没有任何 failed 行时才用丢弃说明。一旦库里有失败任务
+		// （哪怕只是可选明细），保留它记录的码与最早原因，不要用丢弃说明覆盖，
+		// 否则 code 与 message 会来自两套口径。
+		switch {
+		case summary.RequiredTotal == 0:
+			finish.ErrorMessage = noRequiredTaskMessage
+		case summary.RequiredFailed == 0 && summary.OptionalFailed == 0:
 			finish.ErrorMessage = droppedMessage(dropped)
 		}
 	}
@@ -306,6 +313,10 @@ func CloseRun(
 	}
 	return status, nil
 }
+
+// noRequiredTaskMessage 是零必需任务轮次的失败原因：库里没有 failed 任务行可引用，
+// 用固定说明写清「这一轮没有窗口采集」，不把空串落库。
+const noRequiredTaskMessage = "本轮没有必需任务，未执行窗口采集，不发布"
 
 // droppedMessage 把归属过滤丢弃的明细任务写成一句可读原因，供收口在没有
 // sync_task 失败行可引用时写进 error_message（明细全被丢弃的轮次，库里一条
@@ -322,8 +333,17 @@ func droppedMessage(dropped DroppedTasks) string {
 //
 // 必需失败优先于可选失败：两者同时存在时轮次仍是 failed，因为缺了必需周矩阵
 // 就没有完整可用性，partial 只描述「可用性完整、明细不全」这一种情况。
-// 没有必需任务的轮次按成功处理：计划里每栋楼每周必有一条必需任务，出现零必需
-// 任务只可能是空计划，候选集是否为空由发布校验（任务 10）另外拒绝。
+// 一条必需任务都没有的轮次同样按 failed 处理：计划里每栋楼每周必有一条必需任务，
+// 零必需任务只可能是空计划、或没按规划结果执行的轮次，这种轮次没有任何可发布的
+// 窗口采集，收成 success 会跳过发布校验、把线上版本留在原处却记一次成功；这与
+// Validate 对「必需任务 0/0」的拦截同口径（用户拍板）。
+//
+// 空窗与空白名单不从这里走：Requirement 1.2 的空窗（skipped）与 Requirement 1.3 的
+// 空白名单（blocked）在规划阶段就由调用方直接写终态（FinishRun），不进入
+// CloseRun / decideOutcome。所以这里出现「零必需任务」，只可能是没按规划结果执行
+// 就收口的轮次，按 failed 收口不会把本该 skipped / blocked 的轮次误判成失败。
+// 这条接线约定由任务 12 的端到端检查点落实：Plan 返回 skipped / blocked 时，
+// 调用方直接 FinishRun 写对应状态，不调用 CloseRun。
 //
 // dropped 在这里当作失败计入：被归属过滤丢弃的明细没有写 sync_task，汇总里看不到
 // 它们，不补这一笔就会把「明细全部被丢弃」收口成 success。Plan 目前只把占用说明
@@ -335,6 +355,13 @@ func decideOutcome(summary store.RunTaskSummary, dropped DroppedTasks) (RunStatu
 	}
 	if pending := summary.OptionalTotal - summary.OptionalDone - summary.OptionalFailed; pending > 0 {
 		return "", fmt.Errorf("pipeline: 轮次还有 %d 条可选任务未完成，不能收口", pending)
+	}
+
+	// 零必需任务不是「全做完了」，而是「本轮根本没规划出窗口采集」。
+	// 必须在 success 之前挡住，不能靠发布校验兜底：校验只在发布链路上跑，
+	// 收口却会先写 success 并结束这一轮。
+	if summary.RequiredTotal == 0 {
+		return StatusFailed, nil
 	}
 
 	requiredFailed := summary.RequiredFailed + dropped.Required

@@ -44,7 +44,7 @@ type RunTaskSummary struct {
 // 各持一份可能已经过期的数字。
 type RunFinish struct {
 	RunID        int64     // 轮次编号，collect_run.run_id
-	Status       string    // 终态：success、partial 或 failed；不能是 running
+	Status       string    // 终态：success、partial、failed、blocked 或 skipped；不能是 running
 	ErrorCode    string    // 失败错误码；空串写 NULL
 	ErrorMessage string    // 失败原因；空串写 NULL
 	FinishedAt   time.Time // 收口时刻，同时写 finished_at 与 updated_at

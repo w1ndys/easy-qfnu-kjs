@@ -560,14 +560,46 @@ func TestCloseRunPropagatesStoreErrors(t *testing.T) {
 // TestCloseRunLoadsSummaryOnce 覆盖收口的数据来源：终态只从库里的任务汇总读，
 // 每个决策只读一次，不靠调用方传入的内存进度。
 func TestCloseRunLoadsSummaryOnce(t *testing.T) {
-	phases := &phaseStoreStub{}
+	phases := &phaseStoreStub{summary: store.RunTaskSummary{
+		RequiredTotal: 2,
+		RequiredDone:  2,
+	}}
 	if _, err := CloseRun(context.Background(), phases, 7, DroppedTasks{}, fixedClock(shanghaiMorning())); err != nil {
 		t.Fatalf("收口不应报错，实际 %v", err)
 	}
-	// 没有任何任务时按成功收口：计划保证每栋楼每周都有必需任务，
-	// 零任务只可能是空计划，候选集是否为空留给发布校验（任务 10）。
+	// 汇总来自库里的替身：全部必需任务完成时按 success 收口。
 	if phases.finish == nil || phases.finish.Status != string(StatusSuccess) {
-		t.Fatalf("零任务应按 success 收口，实际 %+v", phases.finish)
+		t.Fatalf("必需任务全部完成应按 success 收口，实际 %+v", phases.finish)
+	}
+}
+
+// TestCloseRunFailsWithoutRequiredTasks 覆盖用户拍板 2：零必需任务不能收成 success。
+// 空计划（或没按规划结果执行）的轮次没有任何窗口采集，收口写 failed 并给一句可读原因；
+// 不编业务错误码（不是页面结构失败）。
+//
+// 这里刻意不覆盖 skipped / blocked：Requirement 1.2 的空窗与 Requirement 1.3 的
+// 空白名单由规划阶段直接 FinishRun 写终态，不进入 CloseRun（接线约定见 decideOutcome
+// 的注释，由任务 12 的端到端检查点落实）。因此 CloseRun 里只应出现「规划过却一条
+// 必需任务都没有」这种自相矛盾的轮次。
+func TestCloseRunFailsWithoutRequiredTasks(t *testing.T) {
+	now := shanghaiMorning()
+	phases := &phaseStoreStub{}
+
+	status, err := CloseRun(context.Background(), phases, 7, DroppedTasks{}, fixedClock(now))
+	if err != nil {
+		t.Fatalf("收口不应报错，实际 %v", err)
+	}
+	if status != StatusFailed {
+		t.Fatalf("零必需任务应收口为 failed，实际 %q", status)
+	}
+	if phases.finish == nil || phases.finish.Status != string(StatusFailed) {
+		t.Fatalf("终态入参不符: %+v", phases.finish)
+	}
+	if phases.finish.ErrorCode != "" {
+		t.Fatalf("零必需任务不是结构失败，不应编错误码，实际 %q", phases.finish.ErrorCode)
+	}
+	if phases.finish.ErrorMessage == "" {
+		t.Fatalf("失败轮次必须写一句原因，实际 %+v", *phases.finish)
 	}
 }
 
@@ -885,6 +917,7 @@ func TestEvaluateRunDecidesWithoutWriting(t *testing.T) {
 		dropped DroppedTasks
 		want    RunStatus
 	}{
+		{name: "零必需任务", want: StatusFailed, summary: store.RunTaskSummary{}},
 		{name: "必需失败", want: StatusFailed, summary: store.RunTaskSummary{
 			RequiredTotal: 2, RequiredDone: 1, RequiredFailed: 1,
 			FirstFailureMessage: "矩阵结构不符合预期",
@@ -932,7 +965,11 @@ func TestEvaluateRunDecidesWithoutWriting(t *testing.T) {
 // 只能由收口写（minor 3）。
 func TestAdvancePhaseCoversFullLifecycle(t *testing.T) {
 	now := shanghaiMorning()
-	phases := &phaseStoreStub{}
+	// 收口要求有且全部完成必需任务：这里给两条已完成任务，只验证阶段推进。
+	phases := &phaseStoreStub{summary: store.RunTaskSummary{
+		RequiredTotal: 2,
+		RequiredDone:  2,
+	}}
 	steps := []Phase{
 		PhaseLogin,
 		PhaseCalendar,
