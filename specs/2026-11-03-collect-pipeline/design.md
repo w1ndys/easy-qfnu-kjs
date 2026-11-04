@@ -30,7 +30,7 @@ flowchart LR
 - `clean.State(raw string, dict model.Dict) model.Observation`：整词命中、空文本、复合、未知，保留原文，`available` 只按字典投影。
 - `clean.RoomName(raw string) string`：全半角归一、反复删容量片段、压缩空白，保留原始名。
 - `clean.ExpandNodes(block string) []string`：5 大节映射 12 小节，同一大节内状态一致。
-- `pipeline.Plan(now, term, whitelist, window) []Task`：窗口 `C..min(Y,C+3)`、每楼每周一条矩阵任务、占用说明任务；空窗 `skipped`、空白名单 `blocked`。
+- `pipeline.Plan(window Window, buildingIDs []string, unavailable []Cell) PlanResult`：纯规划、不读时钟；窗口 `C..min(Y,C+3)`、每楼每周一条矩阵任务、占用说明任务；空窗 `skipped`、空白名单 `blocked`。
 - `pipeline.Run(ctx, runID, tasks)`：单轮互斥、断点续跑、归属落库、失败分层。
 - `publish.Build(runID) Candidate`：组装观测、说明、归属快照、派生状态。
 - `publish.Validate(candidate) error`：候选集非空、必需任务完成、未知/复合计数。
