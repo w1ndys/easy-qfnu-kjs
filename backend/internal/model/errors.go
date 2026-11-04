@@ -49,7 +49,8 @@ var ErrStatsFailed = errors.New("访问统计失败")
 // matrix_structure_invalid 之类的业务错误码。
 var ErrRunStoreFailed = errors.New("采集轮次读写失败")
 
-// ErrRunConflict 表示创建轮次撞上 collect_run_single_running 唯一索引、随后却查不到
-// 进行中轮次。唯一索引保证同一时刻至多一轮，查不到说明那一轮在冲突与查询之间刚好结束。
-// 按约定这里不重试，由调用方在下一轮重新尝试。
+// ErrRunConflict 表示创建轮次撞上 collect_run_single_running 唯一索引后仍无法安全复用：
+// 补查不到进行中轮次（那一轮在冲突与查询之间刚好结束），或补查到的进行中轮次记录的
+// 学期与本轮不一致（含旧轮次没写学期）。此时既不能复用旧轮次、也不能新建，更不改写
+// 旧轮次的学期；按约定这里不重试，由调用方在下一轮重新尝试。
 var ErrRunConflict = errors.New("采集轮次冲突")

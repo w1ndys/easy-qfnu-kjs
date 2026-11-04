@@ -2,8 +2,11 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
+	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
 )
 
@@ -23,8 +26,9 @@ type Clock func() time.Time
 // RunStore 是单轮互斥与过期收敛需要的最小仓储能力，由 store.CollectRunRepo 实现。
 // pipeline 只调这两个方法，不接触 pgx 与 SQL（依赖方向见 backend/.golangci.yml）。
 type RunStore interface {
-	// StartCollectRun 尝试新建一轮 running；已有一轮在跑时返回该轮次并置 reused=true。
-	StartCollectRun(ctx context.Context, startedAt time.Time) (store.CollectRun, bool, error)
+	// StartCollectRun 建轮时一并写入学期；已有一轮在跑且学期一致才返回该轮次并置
+	// reused=true，学期不一致（含旧轮次没写学期）返回 model.ErrRunConflict。
+	StartCollectRun(ctx context.Context, term string, startedAt time.Time) (store.CollectRun, bool, error)
 	// FailStaleRuns 把 started_at 早于 cutoff 的 running 置为 failed，返回被收敛的轮次编号。
 	FailStaleRuns(ctx context.Context, now, cutoff time.Time) ([]int64, error)
 }
@@ -48,18 +52,29 @@ func ConvergeStaleRuns(ctx context.Context, runs RunStore, clock Clock) ([]int64
 }
 
 // StartRun 开始一轮采集（Requirement 8.3、design CP6）：
-//   - 先收敛过期轮次，避免崩溃留下的 running 永久锁死；
-//   - 再尝试新建 running；唯一索引冲突时返回已有轮次（Reused=true），不报错也不重试。
+//   - 先校验学期非空：term 只去两侧空白，缺失时返回包装了 model.ErrRunStoreFailed
+//     的可读错误——错误契约与 store 层一致，调用方 errors.Is 一次即可，且不去建一条
+//     collect_run.term 为空、后续周结果写不进去的轮次，也不先做无谓的过期收敛；
+//   - 再收敛过期轮次，避免崩溃留下的 running 永久锁死；
+//   - 最后尝试新建 running；唯一索引冲突时复用已有轮次（Reused=true），但已有轮次的
+//     学期与本轮不一致时由 store 返回 model.ErrRunConflict，这里原样上抛。
 //
-// 返回的 Run 状态恒为 running；后续执行、收尾与阶段推进由任务 7/9 负责。
-func StartRun(ctx context.Context, runs RunStore, clock Clock) (RunStart, error) {
+// 学期随建轮一并写入 collect_run.term，后续 RecordWeekFetch 直接从该列取，
+// 执行循环不需要再传一次。返回的 Run 状态恒为 running；后续执行、收尾与阶段推进
+// 由任务 7/9 负责。
+func StartRun(ctx context.Context, runs RunStore, term string, clock Clock) (RunStart, error) {
+	term = strings.TrimSpace(term)
+	if term == "" {
+		return RunStart{}, fmt.Errorf("%w: 缺少学期，无法开始采集轮次", model.ErrRunStoreFailed)
+	}
+
 	now := nowIn(clock)
 	staleRunIDs, err := convergeStaleRuns(ctx, runs, now)
 	if err != nil {
 		return RunStart{}, err
 	}
 
-	run, reused, err := runs.StartCollectRun(ctx, now)
+	run, reused, err := runs.StartCollectRun(ctx, term, now)
 	if err != nil {
 		return RunStart{}, err
 	}

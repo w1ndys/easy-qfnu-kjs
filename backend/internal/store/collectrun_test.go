@@ -19,6 +19,9 @@ import (
 // 这里放一份同值常量，避免 store 反向依赖 pipeline。
 const staleThreshold = 2 * time.Hour
 
+// collectRunTestTerm 是 store 单测使用的学期编号。
+const collectRunTestTerm = "2026-2027-1"
+
 // runRowFunc 是 pgx.Row 的函数式替身：测试只关心 Scan 的返回与写入值。
 type runRowFunc func(dest ...any) error
 
@@ -34,7 +37,7 @@ func errRunRow(err error) pgx.Row {
 	})
 }
 
-// runningRunRow 回一条 running 轮次：列顺序与 SELECT/RETURNING 一致。
+// runningRunRow 回一条新建轮次：INSERT ... RETURNING 的列顺序是 run_id、started_at、status。
 func runningRunRow(t *testing.T, runID int64, startedAt time.Time) pgx.Row {
 	t.Helper()
 	return runRowFunc(func(dest ...any) error {
@@ -56,6 +59,38 @@ func runningRunRow(t *testing.T, runID int64, startedAt time.Time) pgx.Row {
 		*id = runID
 		*at = startedAt
 		*status = "running"
+		return nil
+	})
+}
+
+// runningRunLookupRow 回一条复用候选项：runningCollectRunSQL 比 RETURNING 多一列
+// term（SQL 里已 COALESCE，旧轮次没写学期时是空串）。
+func runningRunLookupRow(t *testing.T, runID int64, startedAt time.Time, term string) pgx.Row {
+	t.Helper()
+	return runRowFunc(func(dest ...any) error {
+		if len(dest) != 4 {
+			return fmt.Errorf("期望 4 个扫描目标，实际 %d 个", len(dest))
+		}
+		id, ok := dest[0].(*int64)
+		if !ok {
+			return fmt.Errorf("第 1 个目标期望 *int64，实际 %T", dest[0])
+		}
+		at, ok := dest[1].(*time.Time)
+		if !ok {
+			return fmt.Errorf("第 2 个目标期望 *time.Time，实际 %T", dest[1])
+		}
+		status, ok := dest[2].(*string)
+		if !ok {
+			return fmt.Errorf("第 3 个目标期望 *string，实际 %T", dest[2])
+		}
+		existingTerm, ok := dest[3].(*string)
+		if !ok {
+			return fmt.Errorf("第 4 个目标期望 *string，实际 %T", dest[3])
+		}
+		*id = runID
+		*at = startedAt
+		*status = "running"
+		*existingTerm = term
 		return nil
 	})
 }
@@ -177,7 +212,7 @@ func TestStartCollectRunCreatesRunningRound(t *testing.T) {
 	startedAt := time.Date(2026, 11, 4, 11, 37, 31, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
 	querier := &runQuerierStub{rowResults: []pgx.Row{runningRunRow(t, 7, startedAt)}}
 
-	run, reused, err := StartCollectRun(context.Background(), querier, startedAt)
+	run, reused, err := StartCollectRun(context.Background(), querier, collectRunTestTerm, startedAt)
 	if err != nil {
 		t.Fatalf("创建轮次不应报错，实际 %v", err)
 	}
@@ -193,32 +228,125 @@ func TestStartCollectRunCreatesRunningRound(t *testing.T) {
 	if got := querier.rowArgs[0][0].(time.Time); !got.Equal(startedAt) {
 		t.Fatalf("插入 started_at 期望 %s，实际 %s", startedAt, got)
 	}
+	if got := querier.rowArgs[0][1].(string); got != collectRunTestTerm {
+		t.Fatalf("插入 term 期望 %q，实际 %q", collectRunTestTerm, got)
+	}
 }
 
-// TestStartCollectRunReusesRunningRoundOnUniqueViolation 覆盖 CP6 的冲突路径：
-// 撞上 collect_run_single_running 时返回已有轮次，不报错也不重试。
-func TestStartCollectRunReusesRunningRoundOnUniqueViolation(t *testing.T) {
+// TestStartCollectRunRejectsMissingTerm 覆盖空学期：不访问数据库直接报可读错误，
+// 避免把 term 缺失留到 collect_run_week 的 NOT NULL 才炸。
+func TestStartCollectRunRejectsMissingTerm(t *testing.T) {
+	for _, term := range []string{"", "   "} {
+		querier := &runQuerierStub{}
+
+		_, _, err := StartCollectRun(context.Background(), querier, term, time.Now())
+		if !errors.Is(err, model.ErrRunStoreFailed) {
+			t.Fatalf("空学期应包装成 ErrRunStoreFailed，实际 %v", err)
+		}
+		if !strings.Contains(err.Error(), "缺少学期") {
+			t.Fatalf("错误应说明缺少学期，实际 %v", err)
+		}
+		if querier.rowCalls != 0 {
+			t.Fatalf("空学期不应访问数据库，实际查询 %d 次", querier.rowCalls)
+		}
+	}
+}
+
+// TestStartCollectRunReusesRunningRoundWithSameTerm 覆盖 CP6 的冲突路径：
+// 撞上 collect_run_single_running 且已有轮次记录的学期与本轮一致时，返回已有轮次，
+// 不报错也不重试。两侧空白去掉后相同也算一致，入参或库里任一侧带空白都能复用。
+func TestStartCollectRunReusesRunningRoundWithSameTerm(t *testing.T) {
+	existingStartedAt := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name       string
+		inputTerm  string
+		storedTerm string
+	}{
+		{name: "学期完全一致", inputTerm: collectRunTestTerm, storedTerm: collectRunTestTerm},
+		{name: "入参学期带首尾空白", inputTerm: "  " + collectRunTestTerm + "  ", storedTerm: collectRunTestTerm},
+		{name: "库侧学期带首尾空白", inputTerm: collectRunTestTerm, storedTerm: "  " + collectRunTestTerm + " "},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			querier := &runQuerierStub{rowResults: []pgx.Row{
+				errRunRow(&pgconn.PgError{Code: "23505", ConstraintName: collectRunSingleRunningIndex}),
+				runningRunLookupRow(t, 42, existingStartedAt, testCase.storedTerm),
+			}}
+
+			run, reused, err := StartCollectRun(context.Background(), querier, testCase.inputTerm, time.Now())
+			if err != nil {
+				t.Fatalf("学期 %q 与已有轮次 %q 一致时应复用而不是报错，实际 %v",
+					testCase.inputTerm, testCase.storedTerm, err)
+			}
+			if !reused {
+				t.Fatalf("学期 %q 与已有轮次 %q 一致时应标记为复用", testCase.inputTerm, testCase.storedTerm)
+			}
+			if run.RunID != 42 || !run.StartedAt.Equal(existingStartedAt) || run.Status != "running" {
+				t.Fatalf("应原样返回已有轮次，实际 %+v", run)
+			}
+			if querier.rowCalls != 2 {
+				t.Fatalf("冲突后只应补查一次已有轮次，实际 %d 次查询", querier.rowCalls)
+			}
+			if got := querier.rowArgs[0][1].(string); got != collectRunTestTerm {
+				t.Fatalf("建轮入参应先去掉两侧空白，期望 %q，实际 %q", collectRunTestTerm, got)
+			}
+			if !strings.Contains(querier.rowSQL[1], "WHERE status = 'running'") {
+				t.Fatalf("第二次查询应取进行中轮次，实际语句 %q", querier.rowSQL[1])
+			}
+		})
+	}
+}
+
+// TestStartCollectRunRejectsRunningRoundWithDifferentTerm 覆盖用户拍板的口径：
+// 补查到的进行中轮次学期与本轮不一致时返回 ErrRunConflict，既不复用也不新建，
+// 更不改写旧轮次的学期（old term 仍是库里的值）。
+func TestStartCollectRunRejectsRunningRoundWithDifferentTerm(t *testing.T) {
 	existingStartedAt := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
 	querier := &runQuerierStub{rowResults: []pgx.Row{
 		errRunRow(&pgconn.PgError{Code: "23505", ConstraintName: collectRunSingleRunningIndex}),
-		runningRunRow(t, 42, existingStartedAt),
+		runningRunLookupRow(t, 42, existingStartedAt, "2025-2026-2"),
 	}}
 
-	run, reused, err := StartCollectRun(context.Background(), querier, time.Now())
-	if err != nil {
-		t.Fatalf("冲突应返回已有轮次而不是报错，实际 %v", err)
+	run, reused, err := StartCollectRun(context.Background(), querier, collectRunTestTerm, time.Now())
+	if !errors.Is(err, model.ErrRunConflict) {
+		t.Fatalf("学期不一致应返回 ErrRunConflict，实际 %v", err)
 	}
-	if !reused {
-		t.Fatal("撞上唯一索引时应标记为复用")
+	if errors.Is(err, model.ErrRunStoreFailed) {
+		t.Fatalf("学期不一致不是数据库读写失败，不应包装 ErrRunStoreFailed，实际 %v", err)
 	}
-	if run.RunID != 42 || !run.StartedAt.Equal(existingStartedAt) || run.Status != "running" {
-		t.Fatalf("应原样返回已有轮次，实际 %+v", run)
+	if !strings.Contains(err.Error(), "2025-2026-2") || !strings.Contains(err.Error(), collectRunTestTerm) {
+		t.Fatalf("错误应同时给出旧学期与本轮学期，实际 %v", err)
+	}
+	if reused || run.RunID != 0 {
+		t.Fatalf("学期不一致时不应返回可复用轮次: reused=%v run=%+v", reused, run)
 	}
 	if querier.rowCalls != 2 {
-		t.Fatalf("冲突后只应补查一次已有轮次，实际 %d 次查询", querier.rowCalls)
+		t.Fatalf("学期不一致只应补查一次，实际 %d 次查询", querier.rowCalls)
 	}
-	if !strings.Contains(querier.rowSQL[1], "WHERE status = 'running'") {
-		t.Fatalf("第二次查询应取进行中轮次，实际语句 %q", querier.rowSQL[1])
+}
+
+// TestStartCollectRunRejectsRunningRoundWithoutTerm 覆盖旧轮次 term 为 NULL：
+// SQL 读回空串，与本轮学期必然不一致，返回 ErrRunConflict 而不是静默复用。
+func TestStartCollectRunRejectsRunningRoundWithoutTerm(t *testing.T) {
+	existingStartedAt := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+	querier := &runQuerierStub{rowResults: []pgx.Row{
+		errRunRow(&pgconn.PgError{Code: "23505", ConstraintName: collectRunSingleRunningIndex}),
+		runningRunLookupRow(t, 42, existingStartedAt, ""),
+	}}
+
+	run, reused, err := StartCollectRun(context.Background(), querier, collectRunTestTerm, time.Now())
+	if !errors.Is(err, model.ErrRunConflict) {
+		t.Fatalf("旧轮次没写学期时应返回 ErrRunConflict，实际 %v", err)
+	}
+	if errors.Is(err, model.ErrRunStoreFailed) {
+		t.Fatalf("旧轮次没写学期不是数据库读写失败，实际 %v", err)
+	}
+	if reused || run.RunID != 0 {
+		t.Fatalf("旧轮次没写学期时不应复用: reused=%v run=%+v", reused, run)
+	}
+	if querier.rowCalls != 2 {
+		t.Fatalf("只应补查一次，实际 %d 次查询", querier.rowCalls)
 	}
 }
 
@@ -230,7 +358,7 @@ func TestStartCollectRunReportsConflictWhenRunningRoundDisappeared(t *testing.T)
 		errRunRow(pgx.ErrNoRows),
 	}}
 
-	_, _, err := StartCollectRun(context.Background(), querier, time.Now())
+	_, _, err := StartCollectRun(context.Background(), querier, collectRunTestTerm, time.Now())
 	if !errors.Is(err, model.ErrRunConflict) {
 		t.Fatalf("期望 ErrRunConflict，实际 %v", err)
 	}
@@ -251,7 +379,7 @@ func TestStartCollectRunWrapsExistingLookupFailure(t *testing.T) {
 		errRunRow(lookupErr),
 	}}
 
-	_, _, err := StartCollectRun(context.Background(), querier, time.Now())
+	_, _, err := StartCollectRun(context.Background(), querier, collectRunTestTerm, time.Now())
 	if !errors.Is(err, model.ErrRunStoreFailed) {
 		t.Fatalf("期望 ErrRunStoreFailed，实际 %v", err)
 	}
@@ -269,7 +397,7 @@ func TestStartCollectRunRejectsOtherInsertErrors(t *testing.T) {
 	insertErr := errors.New("连接断开")
 	querier := &runQuerierStub{rowResults: []pgx.Row{errRunRow(insertErr)}}
 
-	_, _, err := StartCollectRun(context.Background(), querier, time.Now())
+	_, _, err := StartCollectRun(context.Background(), querier, collectRunTestTerm, time.Now())
 	if !errors.Is(err, model.ErrRunStoreFailed) {
 		t.Fatalf("期望 ErrRunStoreFailed，实际 %v", err)
 	}
@@ -288,7 +416,7 @@ func TestStartCollectRunRejectsOtherUniqueViolations(t *testing.T) {
 		errRunRow(&pgconn.PgError{Code: "23505", ConstraintName: "collect_run_pkey"}),
 	}}
 
-	_, _, err := StartCollectRun(context.Background(), querier, time.Now())
+	_, _, err := StartCollectRun(context.Background(), querier, collectRunTestTerm, time.Now())
 	if !errors.Is(err, model.ErrRunStoreFailed) {
 		t.Fatalf("期望 ErrRunStoreFailed，实际 %v", err)
 	}

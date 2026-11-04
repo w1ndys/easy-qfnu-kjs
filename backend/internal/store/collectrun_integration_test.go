@@ -2,12 +2,15 @@ package store
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 )
 
 // openCollectRunTestDB 连真实 PostgreSQL 并重建 schema；未设置 KJS_TEST_DSN 时跳过。
@@ -65,6 +68,18 @@ SELECT status, COALESCE(error_code, ''), COALESCE(error_message, ''), finished_a
 	return status, errorCode, errorMessage, finished
 }
 
+// collectRunFixtureTerm 是 collect_run 集成测试使用的学期；collect_run.term 有
+// 外键指向 term(term)，建轮前必须先落这一行。
+const collectRunFixtureTerm = "2026-2027-1"
+
+// seedCollectRunTerm 落一条学期；重复调用不报错，便于同一用例里多次建轮。
+func seedCollectRunTerm(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	mustExec(ctx, t, pool,
+		"INSERT INTO term (term, total_weeks) VALUES ($1, 20) ON CONFLICT (term) DO NOTHING",
+		collectRunFixtureTerm)
+}
+
 // insertRunningCollectRun 跳过仓储直接造一条 running 轮次，用来覆盖任意的 started_at。
 func insertRunningCollectRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, startedAt time.Time) int64 {
 	t.Helper()
@@ -79,13 +94,14 @@ func insertRunningCollectRun(ctx context.Context, t *testing.T, pool *pgxpool.Po
 }
 
 // TestCollectRunMutexAgainstRealDB 覆盖 design CP6：部分唯一索引保证同一时刻至多一轮，
-// 冲突时仓储返回已有轮次；已收官的轮次不再占位。
+// 冲突且学期一致时仓储返回已有轮次；已收官的轮次不再占位。
 func TestCollectRunMutexAgainstRealDB(t *testing.T) {
 	ctx, pool := openCollectRunTestDB(t)
+	seedCollectRunTerm(ctx, t, pool)
 	repo := NewCollectRunRepo(pool)
 	now := time.Date(2026, 11, 4, 11, 37, 31, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
 
-	first, reused, err := repo.StartCollectRun(ctx, now)
+	first, reused, err := repo.StartCollectRun(ctx, collectRunFixtureTerm, now)
 	if err != nil {
 		t.Fatalf("首轮创建失败: %v", err)
 	}
@@ -98,12 +114,19 @@ func TestCollectRunMutexAgainstRealDB(t *testing.T) {
 	if !first.StartedAt.Equal(now) {
 		t.Fatalf("开始时刻期望 %s，实际 %s", now, first.StartedAt)
 	}
+	var storedTerm string
+	if err := pool.QueryRow(ctx, "SELECT term FROM collect_run WHERE run_id = $1", first.RunID).Scan(&storedTerm); err != nil {
+		t.Fatalf("读取轮次学期失败: %v", err)
+	}
+	if storedTerm != collectRunFixtureTerm {
+		t.Fatalf("建轮时应写入学期 %q，实际 %q", collectRunFixtureTerm, storedTerm)
+	}
 	if got := countRunningCollectRuns(ctx, t, pool); got != 1 {
 		t.Fatalf("首轮后应只有 1 条进行中，实际 %d 条", got)
 	}
 
 	// 已有一轮在跑：返回同一轮次，且库里仍然只有一条 running。
-	existing, reused, err := repo.StartCollectRun(ctx, now.Add(time.Minute))
+	existing, reused, err := repo.StartCollectRun(ctx, collectRunFixtureTerm, now.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("冲突时应返回已有轮次而不是报错: %v", err)
 	}
@@ -121,7 +144,7 @@ func TestCollectRunMutexAgainstRealDB(t *testing.T) {
 	mustExec(ctx, t, pool,
 		"UPDATE collect_run SET status = 'success', finished_at = $2 WHERE run_id = $1",
 		first.RunID, now.Add(2*time.Minute))
-	next, reused, err := repo.StartCollectRun(ctx, now.Add(3*time.Minute))
+	next, reused, err := repo.StartCollectRun(ctx, collectRunFixtureTerm, now.Add(3*time.Minute))
 	if err != nil {
 		t.Fatalf("上一轮已收官时创建新一轮失败: %v", err)
 	}
@@ -136,11 +159,76 @@ func TestCollectRunMutexAgainstRealDB(t *testing.T) {
 	}
 }
 
+// TestStartCollectRunTermMismatchAgainstRealDB 覆盖用户拍板的口径：冲突后补查到的
+// 进行中轮次只有学期一致才复用。不同学期、或旧轮次根本没写学期，都返回
+// ErrRunConflict——既不新建第二轮，也不把旧轮次的学期改写成本轮的值。
+func TestStartCollectRunTermMismatchAgainstRealDB(t *testing.T) {
+	ctx, pool := openCollectRunTestDB(t)
+	seedCollectRunTerm(ctx, t, pool)
+	// 下一个学期也先落库：让插入只可能因为部分唯一索引失败，而不是 term 外键。
+	mustExec(ctx, t, pool,
+		"INSERT INTO term (term, total_weeks) VALUES ($1, 20) ON CONFLICT (term) DO NOTHING",
+		"2026-2027-2")
+	repo := NewCollectRunRepo(pool)
+	now := time.Date(2026, 11, 4, 11, 37, 31, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+
+	first, reused, err := repo.StartCollectRun(ctx, collectRunFixtureTerm, now)
+	if err != nil {
+		t.Fatalf("首轮创建失败: %v", err)
+	}
+	if reused {
+		t.Fatal("空库首轮不应标记为复用")
+	}
+
+	// 同为第一学期（两侧空白也要抹平）：复用成功。
+	same, reused, err := repo.StartCollectRun(ctx, "  "+collectRunFixtureTerm+"  ", now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("学期一致时应复用已有轮次: %v", err)
+	}
+	if !reused || same.RunID != first.RunID {
+		t.Fatalf("学期一致时应复用轮次 %d，实际 reused=%v run=%+v", first.RunID, reused, same)
+	}
+
+	// 不同学期：报 ErrRunConflict，不新建，也不改写旧轮次的 term。
+	if _, reused, err := repo.StartCollectRun(ctx, "2026-2027-2", now.Add(2*time.Minute)); !errors.Is(err, model.ErrRunConflict) {
+		t.Fatalf("学期不一致应返回 ErrRunConflict，实际 reused=%v err=%v", reused, err)
+	}
+	if got := countRunningCollectRuns(ctx, t, pool); got != 1 {
+		t.Fatalf("学期冲突后仍应只有 1 条进行中，实际 %d 条", got)
+	}
+	if got := storedCollectRunTerm(ctx, t, pool, first.RunID); got != collectRunFixtureTerm {
+		t.Fatalf("冲突不应改写旧轮次的学期，期望 %q，实际 %q", collectRunFixtureTerm, got)
+	}
+
+	// 旧轮次 term 为 NULL：同样不可复用，NULL 也不能被本轮学期覆盖。
+	mustExec(ctx, t, pool, "UPDATE collect_run SET term = NULL WHERE run_id = $1", first.RunID)
+	if _, reused, err := repo.StartCollectRun(ctx, collectRunFixtureTerm, now.Add(3*time.Minute)); !errors.Is(err, model.ErrRunConflict) {
+		t.Fatalf("旧轮次没写学期时应返回 ErrRunConflict，实际 reused=%v err=%v", reused, err)
+	}
+	if got := storedCollectRunTerm(ctx, t, pool, first.RunID); got != "" {
+		t.Fatalf("旧轮次的空学期不应被改写，实际 %q", got)
+	}
+	if got := countRunningCollectRuns(ctx, t, pool); got != 1 {
+		t.Fatalf("空学期冲突后仍应只有 1 条进行中，实际 %d 条", got)
+	}
+}
+
+// storedCollectRunTerm 读轮次的学期，NULL 折成空串。
+func storedCollectRunTerm(ctx context.Context, t *testing.T, pool *pgxpool.Pool, runID int64) string {
+	t.Helper()
+	var term string
+	if err := pool.QueryRow(ctx, "SELECT COALESCE(term, '') FROM collect_run WHERE run_id = $1", runID).Scan(&term); err != nil {
+		t.Fatalf("读取轮次 %d 的学期失败: %v", runID, err)
+	}
+	return term
+}
+
 // TestCollectRunMutexUnderConcurrencyAgainstRealDB 覆盖 CP6 的并发路径：N 个 goroutine
 // 同一刻开始一轮，唯一索引决定胜负——恰好一个新建成功，其余全部复用同一个轮次编号，
 // 库里始终只有一条 running。顺序用例见 TestCollectRunMutexAgainstRealDB。
 func TestCollectRunMutexUnderConcurrencyAgainstRealDB(t *testing.T) {
 	ctx, pool := openCollectRunTestDB(t)
+	seedCollectRunTerm(ctx, t, pool)
 	repo := NewCollectRunRepo(pool)
 	now := time.Date(2026, 11, 4, 11, 37, 31, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
 
@@ -160,7 +248,7 @@ func TestCollectRunMutexUnderConcurrencyAgainstRealDB(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-gate // 同一刻放行，尽量让 INSERT 撞在唯一索引上
-			run, reused, err := repo.StartCollectRun(ctx, now)
+			run, reused, err := repo.StartCollectRun(ctx, collectRunFixtureTerm, now)
 			results[i] = startResult{run: run, reused: reused, err: err}
 		}(i)
 	}
@@ -215,6 +303,7 @@ func TestCollectRunMutexUnderConcurrencyAgainstRealDB(t *testing.T) {
 // 被置为 failed 并记 stale_run；恰好 2 小时不算过期；收敛后可以开新一轮。
 func TestFailStaleRunsAgainstRealDB(t *testing.T) {
 	ctx, pool := openCollectRunTestDB(t)
+	seedCollectRunTerm(ctx, t, pool)
 	repo := NewCollectRunRepo(pool)
 	now := time.Date(2026, 11, 4, 11, 37, 31, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
 	cutoff := now.Add(-2 * time.Hour)
@@ -285,7 +374,7 @@ func TestFailStaleRunsAgainstRealDB(t *testing.T) {
 	})
 
 	t.Run("收敛后可以开新一轮", func(t *testing.T) {
-		next, reused, err := repo.StartCollectRun(ctx, now)
+		next, reused, err := repo.StartCollectRun(ctx, collectRunFixtureTerm, now)
 		if err != nil {
 			t.Fatalf("收敛后创建新一轮失败: %v", err)
 		}

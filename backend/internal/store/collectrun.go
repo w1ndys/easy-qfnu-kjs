@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -41,17 +42,21 @@ const (
 	staleRunErrorMessage = "过期轮次"
 )
 
-// startCollectRunSQL 插入一条 running 轮次。其余列全部走表默认值；
+// startCollectRunSQL 插入一条 running 轮次，并在建轮时就写入学期。
+// term 不能留到后续阶段补：collect_run_week.term 是 NOT NULL，且周结果依赖它，
+// 缺学期必须在建轮阶段就报错，而不是让周结果写入撞上 NOT NULL 中断整轮。
 // status='running' 会触发 collect_run_single_running 部分唯一索引。
 const startCollectRunSQL = `
-INSERT INTO collect_run (started_at, status)
-VALUES ($1, 'running')
+INSERT INTO collect_run (started_at, status, term)
+VALUES ($1, 'running', $2)
 RETURNING run_id, started_at, status`
 
-// runningCollectRunSQL 取当前进行中轮次；唯一索引保证至多一行，
+// runningCollectRunSQL 取当前进行中轮次及其学期；唯一索引保证至多一行，
 // 仍加 ORDER BY 与 LIMIT 1 是为了索引被误删时输出仍然确定。
+// term 用 COALESCE 折成空串：历史/手工建出的轮次可能没写学期，复用前要能判出这种
+// 「没有学期」而不是把 NULL 扫进 string 报错。
 const runningCollectRunSQL = `
-SELECT run_id, started_at, status
+SELECT run_id, started_at, status, COALESCE(term, '')
   FROM collect_run
  WHERE status = 'running'
  ORDER BY run_id
@@ -73,15 +78,24 @@ RETURNING run_id`
 
 // StartCollectRun 尝试开始一轮采集，返回本轮轮次、是否复用了已有轮次与错误。
 //
-// 第二个返回值 reused 为 false 表示本轮新建；为 true 表示撞上唯一索引、
-// 复用了已有的进行中轮次。冲突时不再插入、也不重试，只把已有 running 轮次
-// 原样返回（Requirement 8.3、design CP6）。
+// term 在插入时一并写入 collect_run.term；空学期直接报错，不把非法值交给外键
+// 或让后续周结果写入撞上 NOT NULL。第二个返回值 reused 为 false 表示本轮新建；
+// 为 true 表示撞上唯一索引、复用了已有的进行中轮次（Requirement 8.3、design CP6）。
+//
+// 复用前必须核对学期：补查到的 running 轮次 term 与传入 term（都去两侧空白）不一致，
+// 或该轮次根本没写学期时返回 ErrRunConflict——既不能复用（会把本轮结果写进旧学期），
+// 也不能新建（唯一索引仍被它占着），更不改写旧轮次的 term。一致才返回 Reused=true。
 //
 // 只应传连接池或单语句连接，不要传已开启的事务：唯一索引冲突会让事务进入
 // aborted 状态，冲突后的那次 SELECT 将无法执行。
-func StartCollectRun(ctx context.Context, q collectRunQuerier, startedAt time.Time) (CollectRun, bool, error) {
+func StartCollectRun(ctx context.Context, q collectRunQuerier, term string, startedAt time.Time) (CollectRun, bool, error) {
+	term = strings.TrimSpace(term)
+	if term == "" {
+		return CollectRun{}, false, fmt.Errorf("%w: 缺少学期，无法创建采集轮次", model.ErrRunStoreFailed)
+	}
+
 	var run CollectRun
-	err := q.QueryRow(ctx, startCollectRunSQL, startedAt).Scan(&run.RunID, &run.StartedAt, &run.Status)
+	err := q.QueryRow(ctx, startCollectRunSQL, startedAt, term).Scan(&run.RunID, &run.StartedAt, &run.Status)
 	if err == nil {
 		return run, false, nil
 	}
@@ -91,7 +105,7 @@ func StartCollectRun(ctx context.Context, q collectRunQuerier, startedAt time.Ti
 		return CollectRun{}, false, fmt.Errorf("%w: 创建采集轮次失败: %w", model.ErrRunStoreFailed, err)
 	}
 
-	existing, found, findErr := runningCollectRun(ctx, q)
+	existing, found, findErr := runningCollectRun(ctx, q, term)
 	if findErr != nil {
 		return CollectRun{}, false, findErr
 	}
@@ -125,15 +139,28 @@ func FailStaleRuns(ctx context.Context, q collectRunQuerier, now, cutoff time.Ti
 	return runIDs, nil
 }
 
-// runningCollectRun 取唯一一行进行中轮次；没有时返回 found=false 而不是报错。
-func runningCollectRun(ctx context.Context, q collectRunQuerier) (CollectRun, bool, error) {
+// runningCollectRun 取唯一一行进行中轮次，并核对它记录的学期与本轮 term 是否一致。
+// 没有进行中轮次时返回 found=false 而不是报错（那是冲突与补查之间的竞态）。
+// 学期不一致（含旧轮次 term 为 NULL，读回空串）返回 ErrRunConflict：此时既不能复用
+// 这条轮次，也不能新建，只能让调用方下一轮再来。两边都去空白后比较，避免同一学期
+// 因为多一个空格被判成冲突。
+func runningCollectRun(ctx context.Context, q collectRunQuerier, term string) (CollectRun, bool, error) {
 	var run CollectRun
-	err := q.QueryRow(ctx, runningCollectRunSQL).Scan(&run.RunID, &run.StartedAt, &run.Status)
+	var runningTerm string
+	err := q.QueryRow(ctx, runningCollectRunSQL).Scan(&run.RunID, &run.StartedAt, &run.Status, &runningTerm)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CollectRun{}, false, nil
 	}
 	if err != nil {
 		return CollectRun{}, false, fmt.Errorf("%w: 查询进行中轮次失败: %w", model.ErrRunStoreFailed, err)
+	}
+	if strings.TrimSpace(runningTerm) != term {
+		shown := strings.TrimSpace(runningTerm)
+		if shown == "" {
+			shown = "未写学期"
+		}
+		return CollectRun{}, false, fmt.Errorf("%w: 进行中轮次 %d 的学期为 %s，与本轮学期 %s 不一致，不能复用",
+			model.ErrRunConflict, run.RunID, shown, term)
 	}
 	return run, true, nil
 }
@@ -160,8 +187,8 @@ func NewCollectRunRepo(q collectRunQuerier) CollectRunRepo {
 }
 
 // StartCollectRun 见同名函数：开始一轮，已有一轮在跑时返回该轮次。
-func (r CollectRunRepo) StartCollectRun(ctx context.Context, startedAt time.Time) (CollectRun, bool, error) {
-	return StartCollectRun(ctx, r.q, startedAt)
+func (r CollectRunRepo) StartCollectRun(ctx context.Context, term string, startedAt time.Time) (CollectRun, bool, error) {
+	return StartCollectRun(ctx, r.q, term, startedAt)
 }
 
 // FailStaleRuns 见同名函数：把 started_at 早于 cutoff 的 running 轮次置为失败。

@@ -3,9 +3,11 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
 )
 
@@ -20,13 +22,15 @@ type runStoreStub struct {
 
 	calls       []string
 	startedAt   time.Time
+	term        string
 	staleNow    time.Time
 	staleCutoff time.Time
 }
 
 // StartCollectRun 实现 RunStore。
-func (s *runStoreStub) StartCollectRun(_ context.Context, startedAt time.Time) (store.CollectRun, bool, error) {
+func (s *runStoreStub) StartCollectRun(_ context.Context, term string, startedAt time.Time) (store.CollectRun, bool, error) {
 	s.calls = append(s.calls, "start")
+	s.term = term
 	s.startedAt = startedAt
 	return s.run, s.reused, s.startErr
 }
@@ -44,6 +48,9 @@ func fixedClock(at time.Time) Clock {
 	return func() time.Time { return at }
 }
 
+// runTestTerm 是开始一轮时使用的学期编号；真实库用例还会校验它落到 collect_run.term。
+const runTestTerm = "2026-2027-1"
+
 // TestStartRunCreatesFirstRound 覆盖没有进行中轮次时的正常开始：先收敛、再新建。
 func TestStartRunCreatesFirstRound(t *testing.T) {
 	now := time.Date(2026, 11, 4, 11, 37, 31, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
@@ -51,7 +58,7 @@ func TestStartRunCreatesFirstRound(t *testing.T) {
 		run: store.CollectRun{RunID: 7, StartedAt: now, Status: "running"},
 	}
 
-	start, err := StartRun(context.Background(), runs, fixedClock(now))
+	start, err := StartRun(context.Background(), runs, runTestTerm, fixedClock(now))
 	if err != nil {
 		t.Fatalf("开始一轮不应报错，实际 %v", err)
 	}
@@ -73,6 +80,45 @@ func TestStartRunCreatesFirstRound(t *testing.T) {
 	if !runs.startedAt.Equal(now) {
 		t.Fatalf("开始时刻期望 %s，实际 %s", now, runs.startedAt)
 	}
+	if runs.term != runTestTerm {
+		t.Fatalf("建轮时应写入学期 %q，实际 %q", runTestTerm, runs.term)
+	}
+}
+
+// TestStartRunRejectsMissingTerm 覆盖学期缺失：不收敛、不建轮次，直接返回可读错误。
+// 错误契约与 store 层统一成 model.ErrRunStoreFailed，调用方 errors.Is 一次即可，
+// 不必按层区分「pipeline 的学期错误」与「store 的学期错误」。
+func TestStartRunRejectsMissingTerm(t *testing.T) {
+	for _, term := range []string{"", "   "} {
+		runs := &runStoreStub{}
+
+		_, err := StartRun(context.Background(), runs, term, fixedClock(time.Now()))
+		if err == nil {
+			t.Fatalf("学期 %q 缺失时应报错", term)
+		}
+		if !errors.Is(err, model.ErrRunStoreFailed) {
+			t.Fatalf("学期 %q 缺失时应命中 model.ErrRunStoreFailed，实际 %v", term, err)
+		}
+		if !strings.Contains(err.Error(), "缺少学期") {
+			t.Fatalf("错误应说明缺少学期，实际 %v", err)
+		}
+		if len(runs.calls) != 0 {
+			t.Fatalf("学期缺失时不应访问仓储，实际调用 %v", runs.calls)
+		}
+	}
+}
+
+// TestStartRunTrimsTerm 覆盖输入归一：学期两侧空白被去掉后再写入轮次。
+func TestStartRunTrimsTerm(t *testing.T) {
+	now := time.Date(2026, 11, 4, 11, 37, 31, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	runs := &runStoreStub{run: store.CollectRun{RunID: 7, StartedAt: now, Status: "running"}}
+
+	if _, err := StartRun(context.Background(), runs, "  "+runTestTerm+"  ", fixedClock(now)); err != nil {
+		t.Fatalf("开始一轮不应报错，实际 %v", err)
+	}
+	if runs.term != runTestTerm {
+		t.Fatalf("学期两侧空白应被去掉，期望 %q，实际 %q", runTestTerm, runs.term)
+	}
 }
 
 // TestStartRunReturnsExistingRoundWhenOneIsRunning 覆盖 Requirement 8.3 的互斥：
@@ -85,7 +131,7 @@ func TestStartRunReturnsExistingRoundWhenOneIsRunning(t *testing.T) {
 		reused: true,
 	}
 
-	start, err := StartRun(context.Background(), runs, fixedClock(now))
+	start, err := StartRun(context.Background(), runs, runTestTerm, fixedClock(now))
 	if err != nil {
 		t.Fatalf("已有一轮时应返回该轮次而不是报错，实际 %v", err)
 	}
@@ -112,7 +158,7 @@ func TestStartRunConvergesStaleRoundsBeforeCreating(t *testing.T) {
 		staleIDs: []int64{3, 4},
 	}
 
-	start, err := StartRun(context.Background(), runs, fixedClock(now))
+	start, err := StartRun(context.Background(), runs, runTestTerm, fixedClock(now))
 	if err != nil {
 		t.Fatalf("开始一轮不应报错，实际 %v", err)
 	}
@@ -135,7 +181,7 @@ func TestStartRunUsesBusinessZoneForDatabaseTimes(t *testing.T) {
 		run: store.CollectRun{RunID: 7, StartedAt: utcNow, Status: "running"},
 	}
 
-	if _, err := StartRun(context.Background(), runs, fixedClock(utcNow)); err != nil {
+	if _, err := StartRun(context.Background(), runs, runTestTerm, fixedClock(utcNow)); err != nil {
 		t.Fatalf("开始一轮不应报错，实际 %v", err)
 	}
 
@@ -160,7 +206,7 @@ func TestStartRunStopsWhenConvergenceFails(t *testing.T) {
 	convergeErr := errors.New("数据库不可用")
 	runs := &runStoreStub{staleErr: convergeErr}
 
-	_, err := StartRun(context.Background(), runs, fixedClock(time.Now()))
+	_, err := StartRun(context.Background(), runs, runTestTerm, fixedClock(time.Now()))
 	if !errors.Is(err, convergeErr) {
 		t.Fatalf("应上抛收敛错误，实际 %v", err)
 	}
@@ -174,11 +220,33 @@ func TestStartRunStopsWhenStartingFails(t *testing.T) {
 	startErr := errors.New("连接断开")
 	runs := &runStoreStub{startErr: startErr}
 
-	_, err := StartRun(context.Background(), runs, fixedClock(time.Now()))
+	_, err := StartRun(context.Background(), runs, runTestTerm, fixedClock(time.Now()))
 	if !errors.Is(err, startErr) {
 		t.Fatalf("应上抛开始错误，实际 %v", err)
 	}
 	if len(runs.calls) != 2 || runs.calls[1] != "start" {
+		t.Fatalf("应先收敛再开始，实际调用 %v", runs.calls)
+	}
+}
+
+// TestStartRunPropagatesRunConflict 覆盖 store 判定的学期冲突：
+// model.ErrRunConflict 原样上抛，既不吞成新建成功，也不误包装成数据库读写失败，
+// 调用方才能用 errors.Is 区分「等下一轮」与「真故障」。
+func TestStartRunPropagatesRunConflict(t *testing.T) {
+	now := time.Date(2026, 11, 4, 11, 37, 31, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	runs := &runStoreStub{startErr: model.ErrRunConflict}
+
+	start, err := StartRun(context.Background(), runs, runTestTerm, fixedClock(now))
+	if !errors.Is(err, model.ErrRunConflict) {
+		t.Fatalf("应原样上抛 model.ErrRunConflict，实际 %v", err)
+	}
+	if errors.Is(err, model.ErrRunStoreFailed) {
+		t.Fatalf("学期冲突不是数据库读写失败，不应命中 model.ErrRunStoreFailed，实际 %v", err)
+	}
+	if start.Run.RunID != 0 || start.Status != "" || start.Reused || len(start.StaleRunIDs) != 0 {
+		t.Fatalf("冲突时不应返回半成品结果，实际 %+v", start)
+	}
+	if len(runs.calls) != 2 || runs.calls[0] != "fail-stale" || runs.calls[1] != "start" {
 		t.Fatalf("应先收敛再开始，实际调用 %v", runs.calls)
 	}
 }
@@ -248,7 +316,7 @@ func TestStartRunDefaultsToWallClock(t *testing.T) {
 	runs := &runStoreStub{run: store.CollectRun{RunID: 7, Status: "running"}}
 
 	before := time.Now()
-	if _, err := StartRun(context.Background(), runs, nil); err != nil {
+	if _, err := StartRun(context.Background(), runs, runTestTerm, nil); err != nil {
 		t.Fatalf("不传时钟也应能开始一轮，实际 %v", err)
 	}
 	after := time.Now()

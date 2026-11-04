@@ -22,7 +22,7 @@
   - 启动时把超过 2 小时的 `running` 置为失败并记 `stale_run`
 - [ ] 7. pipeline 执行循环与断点续跑
   - 从第一个 `pending` 继续，跳过 `done`，`failed` 不在本轮重试
-  - 每任务完成即写 `collect_run_week`（含 `fetched_at` 与页面哈希）并回写轮次计数
+  - 周矩阵抓取成功后先写 `collect_run_week`（含 `fetched_at` 与页面哈希）再置 `done`；明细任务不写周结果，失败周矩阵写 `ok=false` 行
 - [ ] 8. pipeline 归属落库与冲突处理
   - 每楼响应内房号归属该楼，写 `room.building_id` 与当轮归属集合
   - 冲突按白名单顺序 + 周次升序取首个命中，后续楼该房号整行丢弃，一轮只记一次冲突
