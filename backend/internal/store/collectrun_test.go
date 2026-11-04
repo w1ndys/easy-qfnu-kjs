@@ -495,6 +495,10 @@ func TestFailStaleRunsReturnsConvergedRunIDs(t *testing.T) {
 	if !strings.Contains(querier.querySQL, "stale_run") || !strings.Contains(querier.querySQL, "started_at < $2") {
 		t.Fatalf("过期收敛语句应写 stale_run 且按 started_at 判定，实际 %q", querier.querySQL)
 	}
+	// minor 4：过期收敛同时写 phase='finished'，与收口保持同一套终态口径。
+	if !strings.Contains(querier.querySQL, "phase = 'finished'") {
+		t.Fatalf("过期收敛语句应同步写 phase = 'finished'，实际 %q", querier.querySQL)
+	}
 }
 
 // TestFailStaleRunsWrapsQueryFailure 覆盖 UPDATE 本身失败。

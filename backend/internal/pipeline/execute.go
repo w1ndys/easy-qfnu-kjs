@@ -69,24 +69,65 @@ type RoomStore interface {
 	RecordAttrConflicts(ctx context.Context, runID int64, conflicts int, now time.Time) error
 }
 
-// RunDeps 是执行一轮采集所需的注入项：任务仓储、归属仓储、任务执行函数与时钟。
+// RunDeps 是执行一轮采集所需的注入项：任务仓储、归属仓储、阶段仓储、
+// 任务执行函数与时钟。
 type RunDeps struct {
-	Tasks TaskStore   // 任务与周结果的仓储
-	Rooms RoomStore   // 教室归属与冲突计数的仓储
-	Fetch TaskFetcher // 一条任务的执行函数
-	Clock Clock       // 完成时刻来源；nil 退回 time.Now
+	Tasks  TaskStore   // 任务与周结果的仓储
+	Rooms  RoomStore   // 教室归属与冲突计数的仓储
+	Phases PhaseStore  // 阶段推进与轮次收口的仓储
+	Fetch  TaskFetcher // 一条任务的执行函数
+	Clock  Clock       // 完成时刻来源；nil 退回 time.Now
 }
 
-// RunProgress 是一轮执行循环的计数，供后续失败分层与阶段推进使用。
-// 各字段互斥：SkippedDone/SkippedFailed 是续跑跳过，Completed/Failed 是本轮实际执行结果。
-// Failed 也包含被归属校验丢弃、从未落库的占用说明任务（口径见 Run 与
-// attributedCellInputs）：它们不会出现在 sync_task，也就不会进入轮次的
-// required_total/optional_total 计数。
+// RunProgress 是一轮执行循环的计数，供失败分层与轮次收口使用。
+//
+// Completed 是本轮实际执行成功并置 done 的任务数；Failed 是本轮失败的任务数，
+// 包含两类：执行失败并写进 sync_task 置 failed 的任务，以及被归属过滤丢弃、
+// 从未落库的占用说明任务。后者没有真实执行，但同样是一条没拿到的明细，算进
+// Failed 才能让「明细全部被丢弃」的一轮在收口时不再静默成功。
+// SkippedDone/SkippedFailed 是续跑跳过的任务，不属于本轮结果；它们与
+// Completed/Failed 不互斥：续跑一轮里既可能跳过已完成的，也可能新执行几条。
 type RunProgress struct {
 	Completed     int // 本轮执行成功并置 done 的任务数
-	Failed        int // 本轮执行失败并置 failed 的任务数；含被归属校验丢弃的明细任务
+	Failed        int // 本轮失败的任务数；含被归属过滤丢弃的明细（细分见 DroppedTasks）
 	SkippedDone   int // 续跑时跳过的已完成任务数
 	SkippedFailed int // 续跑时保留失败、不重试的任务数
+
+	// dropped 是 Failed 里被归属过滤丢弃的那部分，按必需性分开。丢弃任务不写
+	// sync_task，收口只读库里的 failed 数会漏掉它们，所以调用方要用 Dropped()
+	// 取出来交给 CloseRun / EvaluateRun。字段不导出：它是 Failed 的细分，
+	// 不是与 Failed 并列的第二个计数，避免被再次加成一份。
+	dropped DroppedTasks
+}
+
+// DroppedTasks 是被归属过滤丢弃的占用说明任务数，按必需性分开。
+// 它们没有真实执行、也不写 sync_task，但收口必须算进失败：可选明细丢弃 →
+// partial，必需明细丢弃 → failed（口径见 phase.go 的 decideOutcome）。
+type DroppedTasks struct {
+	Required int // 被丢弃的必需明细任务数
+	Optional int // 被丢弃的可选明细任务数
+}
+
+// Total 返回被丢弃的明细任务总数。
+func (d DroppedTasks) Total() int {
+	return d.Required + d.Optional
+}
+
+// Dropped 返回已计入 Failed 的归属过滤丢弃数，供收口在库里的 failed 行之外补上
+// 这批从未落库的失败。
+func (p RunProgress) Dropped() DroppedTasks {
+	return p.dropped
+}
+
+// markDropped 记一条被归属过滤丢弃的明细任务：既计入 Failed（它同样是一条没拿到
+// 的明细），也按必需性记进 dropped 供收口使用。
+func (p *RunProgress) markDropped(required bool) {
+	p.Failed++
+	if required {
+		p.dropped.Required++
+		return
+	}
+	p.dropped.Optional++
 }
 
 // Run 执行一轮已规划的任务（本 spec Requirement 8.4、5.1–5.3，原 spec Requirement
@@ -117,11 +158,17 @@ type RunProgress struct {
 //     任务；只有仓储写入失败这类编排错误才立即中止整轮；
 //   - 周矩阵段跑完、归属已落库后，先按本轮归属过滤占用说明任务，再落这一段并执行：
 //     明细任务的楼必须等于 Attribution.BuildingOf(房号) 的归属楼；房号归了别的楼、
-//     或本轮根本没有归属时，整条任务丢弃——不落库、不执行，并计入 RunProgress.Failed。
+//     或本轮根本没有归属时，整条任务丢弃——不落库、不执行，并计入 RunProgress.Failed
+//     （细分记在 DroppedTasks 里）。丢弃不进 sync_task，所以收口单读库里的 failed 行会
+//     漏掉它们；调用方要把 RunProgress.Dropped() 交给 CloseRun，让这批失败参与收口。
 //     Plan 只能按白名单 rank 给格子挑楼，不知道这个房号最终归谁；不挡就会把
 //     「靠后的楼报了首见楼的格子」下钻到非归属楼上。sync_task.room_id 的外键也因此
 //     不会在 room 尚不存在时把两段任务一起打挂；
-//   - 任务失败置 failed 后继续下一条，是否让整轮失败由任务 9 的失败分层决定；
+//   - 每段落库成功之后、执行这一段任务之前推进 collect_run.phase（周矩阵 → 占用说明），
+//     供管理端看到当前进度。阶段只前进：续跑时已经过了的阶段不再写回去，已经收口的
+//     轮次直接拒绝执行（终态只能由收口写）。任务失败怎么影响轮次由本包的
+//     CloseRun / FailCalendar（phase.go）决定，本函数只负责执行任务、落库结果并返回计数；
+//   - 任务失败置 failed 后继续下一条，是否让整轮失败由失败分层决定；
 //   - 调用方取消或超时不把当前任务记成 failed，留给下一次续跑。
 //
 // 落库顺序是刻意的：先写归属与周结果、再改任务状态。两者之间崩溃时任务仍是 pending，
@@ -143,6 +190,9 @@ func Run(
 	}
 	if deps.Rooms == nil {
 		return RunProgress{}, errors.New("pipeline: 缺少归属仓储")
+	}
+	if deps.Phases == nil {
+		return RunProgress{}, errors.New("pipeline: 缺少阶段仓储")
 	}
 	if deps.Fetch == nil {
 		return RunProgress{}, errors.New("pipeline: 缺少任务执行函数")
@@ -177,9 +227,26 @@ func Run(
 		return RunProgress{}, err
 	}
 
+	// 阶段只前进：先读一次当前阶段，据此决定哪些推进要跳过。已收口的轮次不能再执行——
+	// 终态（status + phase=finished）只由 CloseRun / FailCalendar / FailStaleRuns 写，
+	// 这里读到 finished 说明有人把一条已结束的轮次又拿来跑了。
+	current, err := currentPhase(ctx, deps.Phases, runID)
+	if err != nil {
+		return RunProgress{}, err
+	}
+
 	persistedWeeks, err := deps.Tasks.EnsureWeekMatrixTasks(ctx, runID, weekInputs, nowIn(deps.Clock))
 	if err != nil {
 		return RunProgress{}, err
+	}
+	// 推进放在 Ensure 成功之后：任务还没落库就把阶段写成周矩阵，管理端会看到
+	// 「已到周矩阵」却一条任务都没有；Ensure 失败时阶段保持原样，续跑照常重来。
+	// 续跑已经过了这一段时跳过，阶段不回退（minor 2）。
+	if phaseBefore(current, PhaseWeekMatrix) {
+		if err := AdvancePhase(ctx, deps.Phases, runID, PhaseWeekMatrix, deps.Clock); err != nil {
+			return RunProgress{}, err
+		}
+		current = PhaseWeekMatrix
 	}
 
 	buildings, err = resolveWhitelist(buildings, persistedWeeks)
@@ -213,6 +280,13 @@ func Run(
 	persistedCells, err := deps.Tasks.EnsureCellDetailTasks(ctx, runID, cellInputs, nowIn(deps.Clock))
 	if err != nil {
 		return progress, err
+	}
+	// 同样在 Ensure 成功之后推进：即使本段没有任务，阶段也如实反映
+	// 「矩阵已结束、明细尚未完成」。续跑已经过了这一段时跳过。
+	if phaseBefore(current, PhaseCellDetail) {
+		if err := AdvancePhase(ctx, deps.Phases, runID, PhaseCellDetail, deps.Clock); err != nil {
+			return progress, err
+		}
 	}
 	if err := executeTasks(ctx, deps, runID, persistedCells, attribution, &progress); err != nil {
 		return progress, err
@@ -254,7 +328,7 @@ func executeTasks(
 
 		now := nowIn(deps.Clock)
 		if fetchErr != nil {
-			if err := failTask(ctx, deps, runID, task, fetchErr.Error(), now); err != nil {
+			if err := failTask(ctx, deps, runID, task, fetchErr, now); err != nil {
 				return err
 			}
 			progress.Failed++
@@ -271,7 +345,7 @@ func executeTasks(
 					return err
 				}
 				// 坏响应只废掉这一份响应：按任务失败处理，别把整轮打挂。
-				if failErr := failTask(ctx, deps, runID, task, err.Error(), now); failErr != nil {
+				if failErr := failTask(ctx, deps, runID, task, err, now); failErr != nil {
 					return failErr
 				}
 				progress.Failed++
@@ -298,9 +372,21 @@ func executeTasks(
 	return nil
 }
 
-// failTask 把一条任务走失败路径：周矩阵先写 ok=false 的周结果，再置 failed；
-// 占用说明没有「楼 × 周」行，只置 failed。失败原因原样落库，便于管理端排查。
-func failTask(ctx context.Context, deps RunDeps, runID int64, task store.SyncTask, message string, now time.Time) error {
+// failTask 把一条任务走失败路径：先按错误分层写轮次错误码，再写 ok=false 的
+// 周结果（仅周矩阵），最后置 failed。占用说明没有「楼 × 周」行，只写错误码与失败状态。
+//
+// 错误码只写结构失败（errorCodeFor 按哨兵映射）：网络、超时这类非结构失败没有
+// 对应业务码，不写。轮次只保留第一个结构失败码——可能有多条任务各自撞上结构失败，
+// 轮次级记最先发生的那一个，逐条原因仍留在 sync_task 与 collect_run_week。
+// 写码放在置 failed 之前：两者之间崩溃时续跑会重做这条任务并重新写码，COALESCE
+// 保证不会把先到的码覆盖掉。
+func failTask(ctx context.Context, deps RunDeps, runID int64, task store.SyncTask, cause error, now time.Time) error {
+	message := cause.Error()
+	if code := errorCodeFor(cause); code != "" {
+		if err := deps.Phases.RecordRunErrorCode(ctx, runID, code, now); err != nil {
+			return err
+		}
+	}
 	if TaskKind(task.Kind) == TaskWeekMatrix {
 		failure := store.RunWeekFailure{
 			RunID:        runID,
@@ -472,14 +558,15 @@ func checkWeekMatrixOrder(keys []weekMatrixKey) ([]string, error) {
 
 // attributedCellInputs 只保留本轮归属能验证的占用说明任务：任务里的楼必须等于
 // Attribution.BuildingOf(房号) 的归属楼。房号已归别的楼、或本轮还没有归属时，
-// 整条任务丢弃——不落库、不执行，并计入 progress.Failed。
+// 整条任务丢弃——不落库、不执行，并计入 progress.Failed（细分见 DroppedTasks）。
 //
 // 挡的是 Plan 的盲区：规划只看得到「哪个格不可用」，不知道这个房号最终归谁；
 // 靠后的楼报了首见楼的格子时，规划出来的明细会带着非归属楼，真去下钻就会把
 // 明细算到错的楼上（Q10 首见 r101、Q11 也报 r101 且该格不可用就是这种）。
-// 口径：丢弃的明细按失败计数，与执行失败同落在 RunProgress.Failed，但不写
-// sync_task、不写 collect_run_week，也不会给 collect_run.attr_conflict_count 加数
-// （那是房号级冲突，两者不能混算）。
+// 口径：丢弃任务不写 sync_task、不写 collect_run_week，也不给
+// collect_run.attr_conflict_count 加数（那是房号级冲突，两者不能混算）；但它同样
+// 是一条没拿到的明细，必须计入 Failed 并随 RunProgress.Dropped() 参与收口，
+// 否则明细全被丢弃的一轮会静默收口成 success。
 func attributedCellInputs(cellInputs []store.SyncTaskInput, attribution *Attribution, progress *RunProgress) []store.SyncTaskInput {
 	if len(cellInputs) == 0 {
 		return nil
@@ -489,7 +576,7 @@ func attributedCellInputs(cellInputs []store.SyncTaskInput, attribution *Attribu
 	for _, input := range cellInputs {
 		owner, ok := attribution.BuildingOf(strings.TrimSpace(input.RoomID))
 		if !ok || owner != strings.TrimSpace(input.BuildingID) {
-			progress.Failed++
+			progress.markDropped(input.Required)
 			continue
 		}
 		kept = append(kept, input)

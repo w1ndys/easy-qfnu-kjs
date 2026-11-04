@@ -332,6 +332,11 @@ func TestFailStaleRunsAgainstRealDB(t *testing.T) {
 		if !finished {
 			t.Fatal("过期轮次应写入 finished_at")
 		}
+		// minor 4：过期收敛与收口是同一类终止写入，phase 必须同步到 finished，
+		// 不能停在崩溃时那一格（这里默认是 login）。
+		if _, phase, _, _, _, _, _, _, _ := collectRunPhaseState(ctx, t, pool, runID); phase != "finished" {
+			t.Fatalf("过期轮次的阶段应同步为 finished，实际 %q", phase)
+		}
 		if got := countRunningCollectRuns(ctx, t, pool); got != 0 {
 			t.Fatalf("收敛后不应再有进行中轮次，实际 %d 条", got)
 		}

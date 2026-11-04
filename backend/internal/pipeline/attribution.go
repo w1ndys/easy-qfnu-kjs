@@ -8,11 +8,28 @@ import (
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 )
 
-// errAttributionData 标记「这份响应不能用于归属」的数据类错误：坏响应（空房号、
-// 响应内重复房号、缺楼编号）与晚到楼。执行循环把它当任务失败处理——写失败周结果
-// 并把任务置 failed——而不是中断整轮；仓储写入失败等编排错误不包这个哨兵，
-// 仍直接上抛（见 execute.go 的 Run）。
-var errAttributionData = errors.New("pipeline: 归属响应不可用")
+// 归属响应的数据类错误。执行循环把这三个哨兵代表的错误都当任务失败处理——写失败
+// 周结果并把任务置 failed——而不是中断整轮；它们都包着 errAttributionData，调用方
+// 用 errors.Is(err, errAttributionData) 一次就能认出来。仓储写入失败等编排错误
+// 不包这个父哨兵，仍直接上抛（见 execute.go 的 Run）。
+//
+// 分成三个子哨兵是为了错误码：只有「响应自身的行结构异常」才映射
+// matrix_structure_invalid，晚到楼与缺楼编号是调用顺序/编排问题，不是页面结构
+// 失败，不能编一个码让管理端误判成「页面结构变了」（见 phase.go 的 errorCodeFor）。
+var (
+	// errAttributionData 是父哨兵：这份响应不能用于归属。
+	errAttributionData = errors.New("pipeline: 归属响应不可用")
+	// errAttributionRows 是响应自身的行结构错误：空房号、响应内重复房号。
+	// design 把「数据行结构异常、重复房号」归为矩阵结构失败，这类响应映射
+	// matrix_structure_invalid。
+	errAttributionRows = fmt.Errorf("%w: 数据行结构异常", errAttributionData)
+	// errAttributionLateArrival 是「更靠前的楼晚到」：调用方没有按白名单顺序
+	// 逐份响应调用 Offer，已落库的归属无法回退。这是编排顺序问题，不是页面结构失败。
+	errAttributionLateArrival = fmt.Errorf("%w: 楼到达顺序被破坏", errAttributionData)
+	// errAttributionNoBuilding 是归属请求缺少教学楼编号：任务或白名单自身的问题，
+	// 不是页面结构失败。
+	errAttributionNoBuilding = fmt.Errorf("%w: 缺少教学楼编号", errAttributionData)
+)
 
 // RoomConflict 是一次被裁决掉的跨楼重复：同一房号先出现在 KeptBuildingID 的响应里，
 // 后又出现在 DroppedBuildingID 的响应里，后者的整行格子按裁决丢弃。
@@ -137,17 +154,19 @@ func (a *Attribution) Seed(roomID, buildingID string, conflict bool, conflictBui
 //   - 已归别的楼：进入 Dropped，整行丢弃；若这是该房号本轮第一次冲突，
 //     同时记一条 RoomConflict（同一房号一轮只记一次，不按周次重复计）。
 //
-// 同一份响应里房号为空或重复直接报 errAttributionData：parser 已把这两种情况判成
-// 结构失败（当前 spec Requirement 2.4、2.5），这里再兜一层，避免用坏数据覆盖 room。
-// 比已归属楼更靠前的楼晚到时报 errAttributionData，不静默改写归属：后到的响应
-// 不能让已落库的房号换楼，否则「首个命中」就失去意义。
+// 同一份响应里房号为空或重复直接报 errAttributionRows（行结构错误，映射
+// matrix_structure_invalid）：parser 已把这两种情况判成结构失败（当前 spec
+// Requirement 2.4、2.5），这里再兜一层，避免用坏数据覆盖 room。
+// 比已归属楼更靠前的楼晚到时报 errAttributionLateArrival，不静默改写归属：后到的
+// 响应不能让已落库的房号换楼，否则「首个命中」就失去意义；它不是页面结构失败，
+// 因此不映射矩阵结构错误码。缺教学楼编号报 errAttributionNoBuilding，同理不映射。
 //
 // Offer 对一份响应是原子的：先把整份响应校验完，再一次写入归属。
 // 校验失败时累计器保持原状，不会留下半份归属；执行循环据此把该任务判失败。
 func (a *Attribution) Offer(buildingID string, rooms []model.MatrixRoom) (AttributionOffer, error) {
 	buildingID = strings.TrimSpace(buildingID)
 	if buildingID == "" {
-		return AttributionOffer{}, fmt.Errorf("%w: 归属缺少教学楼编号", errAttributionData)
+		return AttributionOffer{}, fmt.Errorf("%w: 归属缺少教学楼编号", errAttributionNoBuilding)
 	}
 
 	// 先整体校验：坏房号、响应内重复、以及会破坏「首个命中」的晚到楼，
@@ -155,11 +174,11 @@ func (a *Attribution) Offer(buildingID string, rooms []model.MatrixRoom) (Attrib
 	seen := make(map[string]struct{}, len(rooms))
 	for _, room := range rooms {
 		if room.RoomID == "" {
-			return AttributionOffer{}, fmt.Errorf("%w: 楼 %s 的响应里有空房号", errAttributionData, buildingID)
+			return AttributionOffer{}, fmt.Errorf("%w: 楼 %s 的响应里有空房号", errAttributionRows, buildingID)
 		}
 		if _, ok := seen[room.RoomID]; ok {
 			return AttributionOffer{}, fmt.Errorf("%w: 楼 %s 的响应里房号 %q 重复",
-				errAttributionData, buildingID, room.RoomID)
+				errAttributionRows, buildingID, room.RoomID)
 		}
 		seen[room.RoomID] = struct{}{}
 
@@ -171,7 +190,7 @@ func (a *Attribution) Offer(buildingID string, rooms []model.MatrixRoom) (Attrib
 		if buildingRank(a.ranks, buildingID) < buildingRank(a.ranks, kept) {
 			return AttributionOffer{}, fmt.Errorf(
 				"%w: 楼 %s 的响应晚于白名单更靠后的楼 %s 到达，房号 %q 的归属无法回退",
-				errAttributionData, buildingID, kept, room.RoomID)
+				errAttributionLateArrival, buildingID, kept, room.RoomID)
 		}
 	}
 

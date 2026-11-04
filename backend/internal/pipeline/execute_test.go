@@ -9,16 +9,103 @@ import (
 	"time"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/parser"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
 )
 
 // 编译期确认真实仓储与替身都满足执行循环的窄接口，签名漂移会直接让测试编译失败。
 var (
-	_ TaskStore = store.SyncTaskRepo{}
-	_ TaskStore = (*taskStoreStub)(nil)
-	_ RoomStore = store.RoomRepo{}
-	_ RoomStore = (*roomStoreStub)(nil)
+	_ TaskStore  = store.SyncTaskRepo{}
+	_ TaskStore  = (*taskStoreStub)(nil)
+	_ RoomStore  = store.RoomRepo{}
+	_ RoomStore  = (*roomStoreStub)(nil)
+	_ PhaseStore = store.RunPhaseRepo{}
+	_ PhaseStore = (*phaseStoreStub)(nil)
 )
+
+// phaseStoreStub 替身记录阶段推进、阶段读取、错误码写入与收口写库，
+// 并按预置返回任务汇总。
+//
+// 默认当前阶段是 PhaseLogin（全新的轮次）；续跑用例显式设置 current。
+// 阶段写入默认不混进 taskStoreStub 的 events：两段任务的调用顺序断言不受影响；
+// 需要断言「阶段推进与任务落库的相对顺序」的用例把 events 指到同一个切片上。
+type phaseStoreStub struct {
+	phases  []phaseCall
+	codes   []errorCodeCall
+	summary store.RunTaskSummary
+	finish  *store.RunFinish
+	current Phase
+
+	events *[]string // 与 taskStoreStub 共用的事件流；nil 时只记在 phases 里
+
+	loadErr       error
+	loadPhaseErr  error
+	phaseErr      error
+	recordCodeErr error
+	finishErr     error
+}
+
+// phaseCall 是一次阶段推进的入参、可接受的当前阶段与时刻。
+type phaseCall struct {
+	runID       int64
+	phase       string
+	allowedFrom []string
+	at          time.Time
+}
+
+// errorCodeCall 是一次轮次错误码写入的入参。
+type errorCodeCall struct {
+	runID int64
+	code  string
+	at    time.Time
+}
+
+// record 把事件追加到共用事件流（nil 时忽略）。
+func (s *phaseStoreStub) record(event string) {
+	if s.events == nil {
+		return
+	}
+	*s.events = append(*s.events, event)
+}
+
+// SetRunPhase 实现 PhaseStore。
+func (s *phaseStoreStub) SetRunPhase(_ context.Context, runID int64, phase string, allowedFrom []string, now time.Time) error {
+	s.phases = append(s.phases, phaseCall{runID: runID, phase: phase, allowedFrom: allowedFrom, at: now})
+	s.record("phase:" + phase)
+	if s.phaseErr != nil {
+		return s.phaseErr
+	}
+	s.current = Phase(phase)
+	return nil
+}
+
+// LoadRunPhase 实现 PhaseStore。
+func (s *phaseStoreStub) LoadRunPhase(_ context.Context, _ int64) (string, error) {
+	if s.loadPhaseErr != nil {
+		return "", s.loadPhaseErr
+	}
+	if s.current == "" {
+		return string(PhaseLogin), nil
+	}
+	return string(s.current), nil
+}
+
+// RecordRunErrorCode 实现 PhaseStore。
+func (s *phaseStoreStub) RecordRunErrorCode(_ context.Context, runID int64, code string, now time.Time) error {
+	s.codes = append(s.codes, errorCodeCall{runID: runID, code: code, at: now})
+	return s.recordCodeErr
+}
+
+// LoadRunTaskSummary 实现 PhaseStore。
+func (s *phaseStoreStub) LoadRunTaskSummary(_ context.Context, _ int64) (store.RunTaskSummary, error) {
+	return s.summary, s.loadErr
+}
+
+// FinishRun 实现 PhaseStore。
+func (s *phaseStoreStub) FinishRun(_ context.Context, finish store.RunFinish) error {
+	s.finish = &finish
+	return s.finishErr
+}
 
 // taskStoreStub 替身记录执行循环对仓储的每一次调用，并按预置返回任务清单。
 // 两段 Ensure 都从 persisted 里按 kind 过滤，保持段内顺序；真实 SQL 行为由
@@ -251,10 +338,11 @@ func TestRunResumesFromFirstPendingAndSkipsDone(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if err != nil {
 		t.Fatalf("续跑不应报错，实际 %v", err)
@@ -297,10 +385,11 @@ func TestRunSkipsDoneAndKeepsFailedWithoutRetry(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if err != nil {
 		t.Fatalf("续跑不应报错，实际 %v", err)
@@ -328,10 +417,11 @@ func TestRunRecordsWeekFetchWithFetchedAtAndPageHash(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(now),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(now),
 	})
 	if err != nil {
 		t.Fatalf("执行不应报错，实际 %v", err)
@@ -367,10 +457,11 @@ func TestRunDoesNotRecordWeekForCellDetail(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, nil, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if err != nil {
 		t.Fatalf("执行不应报错，实际 %v", err)
@@ -402,10 +493,11 @@ func TestRunMarksFailedTaskAndContinues(t *testing.T) {
 	}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(now),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(now),
 	})
 	if err != nil {
 		t.Fatalf("任务失败不应让执行循环报错，实际 %v", err)
@@ -446,10 +538,11 @@ func TestRunDoesNotWriteWeekFailureForCellDetail(t *testing.T) {
 	}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if err != nil {
 		t.Fatalf("任务失败不应让执行循环报错，实际 %v", err)
@@ -486,10 +579,11 @@ func TestRunWritesWeekFailureRowAndKeepsFailed(t *testing.T) {
 	}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if err != nil {
 		t.Fatalf("任务失败不应让执行循环报错，实际 %v", err)
@@ -526,10 +620,11 @@ func TestRunReturnsErrorWhenRecordWeekFetchFails(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, recordErr) {
 		t.Fatalf("应上抛周结果写入错误，实际 %v", err)
@@ -555,10 +650,11 @@ func TestRunReturnsErrorWhenRecordWeekFailureFails(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, recordFailureErr) {
 		t.Fatalf("应上抛失败周结果写入错误，实际 %v", err)
@@ -584,10 +680,11 @@ func TestRunReturnsErrorWhenCompleteSyncTaskFails(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, nil, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, completeErr) {
 		t.Fatalf("应上抛置 done 错误，实际 %v", err)
@@ -613,10 +710,11 @@ func TestRunReturnsErrorWhenFailSyncTaskFails(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, nil, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, failErr) {
 		t.Fatalf("应上抛置 failed 错误，实际 %v", err)
@@ -629,6 +727,66 @@ func TestRunReturnsErrorWhenFailSyncTaskFails(t *testing.T) {
 	}
 }
 
+// TestRunPropagatesPhaseLoadError 覆盖 minor 6：读当前阶段失败属于编排错误，
+// 立即上抛，不落任务、不发请求——阶段判断不出来就不知道哪些推进要跳过。
+func TestRunPropagatesPhaseLoadError(t *testing.T) {
+	loadErr := errors.New("读阶段失败")
+	phases := &phaseStoreStub{loadPhaseErr: loadErr}
+	storeStub := &taskStoreStub{}
+	fetch := &taskFetchStub{}
+
+	_, err := Run(context.Background(), 7, []string{"Q10"}, []Task{
+		{Kind: TaskWeekMatrix, Required: true, BuildingID: "Q10", Week: 20},
+	}, RunDeps{
+		Phases: phases,
+		Tasks:  storeStub,
+		Rooms:  &roomStoreStub{},
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
+	})
+	if !errors.Is(err, loadErr) {
+		t.Fatalf("应上抛读阶段错误，实际 %v", err)
+	}
+	if len(storeStub.events) != 0 || len(fetch.calls) != 0 {
+		t.Fatalf("读阶段失败时不应落库或发请求: events=%v calls=%+v", storeStub.events, fetch.calls)
+	}
+}
+
+// TestRunPropagatesRecordErrorCodeFailure 覆盖 minor 6：写轮次错误码失败属于编排错误，
+// failTask 立即返回，失败周结果与 failed 状态都不写，进度也不记失败（任务保持 pending）。
+func TestRunPropagatesRecordErrorCodeFailure(t *testing.T) {
+	codeErr := errors.New("写轮次错误码失败")
+	phases := &phaseStoreStub{recordCodeErr: codeErr}
+	storeStub := &taskStoreStub{
+		persisted: []store.SyncTask{weekTask(1, "Q10", 20, store.SyncTaskPending)},
+	}
+	fetch := &taskFetchStub{errs: map[string]error{
+		taskKey(Task{Kind: TaskWeekMatrix, BuildingID: "Q10", Week: 20}): fmt.Errorf(
+			"解析周矩阵失败: %w", parser.ErrMatrixStructureInvalid),
+	}}
+
+	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
+		Phases: phases,
+		Tasks:  storeStub,
+		Rooms:  &roomStoreStub{},
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
+	})
+	if !errors.Is(err, codeErr) {
+		t.Fatalf("应上抛写错误码错误，实际 %v", err)
+	}
+	if len(phases.codes) != 1 || phases.codes[0].code != "matrix_structure_invalid" {
+		t.Fatalf("应尝试写一次矩阵结构失败码，实际 %+v", phases.codes)
+	}
+	if len(storeStub.weekFailures) != 0 || len(storeStub.fails) != 0 {
+		t.Fatalf("写码失败后不应继续写周失败或置 failed: failures=%+v fails=%+v",
+			storeStub.weekFailures, storeStub.fails)
+	}
+	if progress != (RunProgress{}) {
+		t.Fatalf("写码失败时进度应全零，实际 %+v", progress)
+	}
+}
+
 // TestRunWithEmptyTaskList 覆盖空任务清单：只落一次任务（不新增），
 // 不执行任何请求，进度全零。
 func TestRunWithEmptyTaskList(t *testing.T) {
@@ -636,10 +794,11 @@ func TestRunWithEmptyTaskList(t *testing.T) {
 	fetch := &taskFetchStub{}
 
 	progress, err := Run(context.Background(), 7, nil, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if err != nil {
 		t.Fatalf("空任务清单不应报错，实际 %v", err)
@@ -668,15 +827,17 @@ func TestRunWithEmptyTaskList(t *testing.T) {
 func TestRunReturnsErrorWhenEnsureWeekMatrixTasksFails(t *testing.T) {
 	ensureErr := errors.New("写任务清单失败")
 	storeStub := &taskStoreStub{ensureWeekErr: ensureErr}
+	phases := &phaseStoreStub{}
 	fetch := &taskFetchStub{}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, []Task{
 		{Kind: TaskWeekMatrix, Required: true, BuildingID: "Q10", Week: 20},
 	}, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: phases,
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, ensureErr) {
 		t.Fatalf("应上抛任务落库错误，实际 %v", err)
@@ -689,6 +850,10 @@ func TestRunReturnsErrorWhenEnsureWeekMatrixTasksFails(t *testing.T) {
 	}
 	if want := []string{"ensure-week"}; fmt.Sprint(storeStub.events) != fmt.Sprint(want) {
 		t.Fatalf("周矩阵段落库失败后不应再调用仓储，期望 %v，实际 %v", want, storeStub.events)
+	}
+	// minor 3：任务还没落库，阶段也必须原地不动——不能出现「已到周矩阵却一条任务都没有」。
+	if len(phases.phases) != 0 {
+		t.Fatalf("周矩阵段落库失败时不应推进阶段，实际 %+v", phases.phases)
 	}
 }
 
@@ -708,10 +873,11 @@ func TestRunDoesNotFailTaskWhenContextCanceled(t *testing.T) {
 	}
 
 	progress, err := Run(ctx, 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Fetch: fetch.fetch,
-		Rooms: &roomStoreStub{},
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  fetch.fetch,
+		Rooms:  &roomStoreStub{},
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("取消时应返回 context.Canceled，实际 %v", err)
@@ -739,10 +905,11 @@ func TestRunSeedsPlannedTasks(t *testing.T) {
 	}}
 
 	if _, err := Run(context.Background(), 7, []string{"Q10"}, planned, RunDeps{
-		Tasks: storeStub,
-		Fetch: (&taskFetchStub{}).fetch,
-		Rooms: roomStub,
-		Clock: fixedClock(now),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Fetch:  (&taskFetchStub{}).fetch,
+		Rooms:  roomStub,
+		Clock:  fixedClock(now),
 	}); err != nil {
 		t.Fatalf("执行不应报错，实际 %v", err)
 	}
@@ -769,19 +936,33 @@ func TestRunSeedsPlannedTasks(t *testing.T) {
 	}
 }
 
-// TestRunRequiresDependencies 覆盖装配错误：缺仓储、归属仓储或执行函数时立即报错。
+// TestRunRequiresDependencies 覆盖装配错误：缺任务仓储、归属仓储、阶段仓储或
+// 执行函数时立即报错。
 func TestRunRequiresDependencies(t *testing.T) {
-	if _, err := Run(context.Background(), 7, nil, nil, RunDeps{}); err == nil {
+	if _, err := Run(context.Background(), 7, nil, nil, RunDeps{
+		Phases: &phaseStoreStub{},
+	}); err == nil {
 		t.Fatal("缺任务仓储时应报错")
 	}
-	if _, err := Run(context.Background(), 7, nil, nil, RunDeps{Tasks: &taskStoreStub{}}); err == nil {
+	if _, err := Run(context.Background(), 7, nil, nil, RunDeps{
+		Phases: &phaseStoreStub{},
+		Tasks:  &taskStoreStub{},
+	}); err == nil {
 		t.Fatal("缺归属仓储时应报错")
+	}
+	if _, err := Run(context.Background(), 7, nil, nil, RunDeps{
+		Phases: &phaseStoreStub{},
+		Tasks:  &taskStoreStub{},
+		Rooms:  &roomStoreStub{},
+	}); err == nil {
+		t.Fatal("缺任务执行函数时应报错")
 	}
 	if _, err := Run(context.Background(), 7, nil, nil, RunDeps{
 		Tasks: &taskStoreStub{},
 		Rooms: &roomStoreStub{},
+		Fetch: (&taskFetchStub{}).fetch,
 	}); err == nil {
-		t.Fatal("缺任务执行函数时应报错")
+		t.Fatal("缺阶段仓储时应报错")
 	}
 }
 
@@ -834,10 +1015,11 @@ func TestRunAttributesFirstHitAndDropsCrossBuildingConflict(t *testing.T) {
 	}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(now),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(now),
 	})
 	if err != nil {
 		t.Fatalf("执行不应报错，实际 %v", err)
@@ -932,10 +1114,11 @@ func TestRunDroppedRoomDoesNotEnterRunSnapshot(t *testing.T) {
 	}}
 
 	if _, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	}); err != nil {
 		t.Fatalf("执行不应报错，实际 %v", err)
 	}
@@ -998,10 +1181,11 @@ func TestRunDropsCellDetailForNonAttributedBuilding(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, planned, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(now),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(now),
 	})
 	if err != nil {
 		t.Fatalf("执行不应报错，实际 %v", err)
@@ -1028,9 +1212,14 @@ func TestRunDropsCellDetailForNonAttributedBuilding(t *testing.T) {
 	if cellCalls != 1 {
 		t.Fatalf("应只执行 1 条明细任务，实际 %d 条: %+v", cellCalls, fetch.calls)
 	}
-	// 丢弃按失败计数，但落库执行的三条任务照常完成。
+	// 丢弃的明细计入失败（它们同样是一条没拿到的明细），并按必需性记进
+	// DroppedTasks 供收口使用：丢弃任务没有写 sync_task，单读库里的 failed 行会漏掉它们。
+	// 落库执行的三条任务照常完成。
 	if progress.Completed != 3 || progress.Failed != 2 {
 		t.Fatalf("进度不符: %+v", progress)
+	}
+	if want := (DroppedTasks{Optional: 2}); progress.Dropped() != want {
+		t.Fatalf("丢弃明细期望 %+v，实际 %+v", want, progress.Dropped())
 	}
 	if len(storeStub.completes) != 3 {
 		t.Fatalf("三条有效任务都应置 done，实际 %+v", storeStub.completes)
@@ -1073,10 +1262,11 @@ func TestRunRecordsSameRoomConflictOncePerRound(t *testing.T) {
 	fetch := &taskFetchStub{rooms: rooms}
 
 	if _, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	}); err != nil {
 		t.Fatalf("执行不应报错，实际 %v", err)
 	}
@@ -1112,10 +1302,11 @@ func TestRunReturnsErrorWhenRoomAttributionFails(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, upsertErr) {
 		t.Fatalf("应上抛归属写入错误，实际 %v", err)
@@ -1145,10 +1336,11 @@ func TestRunReturnsErrorWhenRecordAttrConflictsFails(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, conflictErr) {
 		t.Fatalf("应上抛冲突回写错误，实际 %v", err)
@@ -1180,10 +1372,11 @@ func TestRunResumeKeepsCompletedAttribution(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(now),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(now),
 	})
 	if err != nil {
 		t.Fatalf("续跑不应报错，实际 %v", err)
@@ -1244,10 +1437,11 @@ func TestRunResumeKeepsConflictCount(t *testing.T) {
 	}}
 
 	if _, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	}); err != nil {
 		t.Fatalf("续跑不应报错，实际 %v", err)
 	}
@@ -1280,10 +1474,11 @@ func TestRunResumeRewritesSeededConflictCount(t *testing.T) {
 	}}
 
 	if _, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	}); err != nil {
 		t.Fatalf("续跑不应报错，实际 %v", err)
 	}
@@ -1320,11 +1515,13 @@ func TestRunFailsWeekTaskWhenAttributionResponseInvalid(t *testing.T) {
 		},
 	}}
 
+	phases := &phaseStoreStub{}
 	progress, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: phases,
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if err != nil {
 		t.Fatalf("数据类错误不应中断整轮，实际 %v", err)
@@ -1340,6 +1537,10 @@ func TestRunFailsWeekTaskWhenAttributionResponseInvalid(t *testing.T) {
 	failure := storeStub.weekFailures[0]
 	if failure.BuildingID != "Q10" || failure.Week != 20 || !strings.Contains(failure.ErrorMessage, "重复") {
 		t.Fatalf("失败周结果不符: %+v", failure)
+	}
+	// 响应内重复房号属于结构类数据错误，按矩阵结构失败写轮次错误码。
+	if len(phases.codes) != 1 || phases.codes[0].code != "matrix_structure_invalid" {
+		t.Fatalf("坏响应应写 matrix_structure_invalid，实际 %+v", phases.codes)
 	}
 	if len(storeStub.fails) != 1 || storeStub.fails[0].taskID != 1 {
 		t.Fatalf("应把 Q10 任务置 failed，实际 %+v", storeStub.fails)
@@ -1377,10 +1578,11 @@ func TestRunRequiresExplicitWhitelistOrder(t *testing.T) {
 			storeStub := &taskStoreStub{persisted: persisted}
 			fetch := &taskFetchStub{}
 			if _, err := Run(context.Background(), 7, c.whitelist, nil, RunDeps{
-				Tasks: storeStub,
-				Rooms: &roomStoreStub{},
-				Fetch: fetch.fetch,
-				Clock: fixedClock(shanghaiMorning()),
+				Phases: &phaseStoreStub{},
+				Tasks:  storeStub,
+				Rooms:  &roomStoreStub{},
+				Fetch:  fetch.fetch,
+				Clock:  fixedClock(shanghaiMorning()),
 			}); err == nil {
 				t.Fatal("白名单顺序不合法时应报错")
 			}
@@ -1412,10 +1614,11 @@ func TestRunRejectsIllegalWhitelistBeforePersistingTasks(t *testing.T) {
 			storeStub := &taskStoreStub{}
 			fetch := &taskFetchStub{}
 			if _, err := Run(context.Background(), 7, c.whitelist, planned, RunDeps{
-				Tasks: storeStub,
-				Rooms: &roomStoreStub{},
-				Fetch: fetch.fetch,
-				Clock: fixedClock(shanghaiMorning()),
+				Phases: &phaseStoreStub{},
+				Tasks:  storeStub,
+				Rooms:  &roomStoreStub{},
+				Fetch:  fetch.fetch,
+				Clock:  fixedClock(shanghaiMorning()),
 			}); err == nil {
 				t.Fatal("非法白名单应报错")
 			}
@@ -1444,10 +1647,11 @@ func TestRunTrimsWhitelistEntries(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{" Q10 ", "\tQ11"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if err != nil {
 		t.Fatalf("带空白但去空白后合法的白名单不应报错，实际 %v", err)
@@ -1493,10 +1697,11 @@ func TestRunRequiresAscendingWeeksWithinBuilding(t *testing.T) {
 			storeStub := &taskStoreStub{persisted: c.persist}
 			fetch := &taskFetchStub{}
 			_, err := Run(context.Background(), 7, c.whitelist, nil, RunDeps{
-				Tasks: storeStub,
-				Rooms: &roomStoreStub{},
-				Fetch: fetch.fetch,
-				Clock: fixedClock(shanghaiMorning()),
+				Phases: &phaseStoreStub{},
+				Tasks:  storeStub,
+				Rooms:  &roomStoreStub{},
+				Fetch:  fetch.fetch,
+				Clock:  fixedClock(shanghaiMorning()),
 			})
 			if err == nil {
 				t.Fatal("周矩阵任务顺序不合法时应报错")
@@ -1542,10 +1747,11 @@ func TestRunRejectsBadWeekOrderBeforePersistingTasks(t *testing.T) {
 			roomStub := &roomStoreStub{}
 			fetch := &taskFetchStub{}
 			_, err := Run(context.Background(), 7, c.whitelist, c.planned, RunDeps{
-				Tasks: storeStub,
-				Rooms: roomStub,
-				Fetch: fetch.fetch,
-				Clock: fixedClock(shanghaiMorning()),
+				Phases: &phaseStoreStub{},
+				Tasks:  storeStub,
+				Rooms:  roomStub,
+				Fetch:  fetch.fetch,
+				Clock:  fixedClock(shanghaiMorning()),
 			})
 			if err == nil {
 				t.Fatal("规划里的周矩阵顺序不合法时应报错")
@@ -1593,10 +1799,11 @@ func TestRunRejectsPlannedWhitelistMismatchBeforePersistingTasks(t *testing.T) {
 			roomStub := &roomStoreStub{}
 			fetch := &taskFetchStub{}
 			_, err := Run(context.Background(), 7, c.whitelist, c.planned, RunDeps{
-				Tasks: storeStub,
-				Rooms: roomStub,
-				Fetch: fetch.fetch,
-				Clock: fixedClock(shanghaiMorning()),
+				Phases: &phaseStoreStub{},
+				Tasks:  storeStub,
+				Rooms:  roomStub,
+				Fetch:  fetch.fetch,
+				Clock:  fixedClock(shanghaiMorning()),
 			})
 			if err == nil {
 				t.Fatal("规划楼顺序与白名单不一致时应报错")
@@ -1623,10 +1830,11 @@ func TestRunRejectsPlannedWhitelistMismatchBeforePersistingTasks(t *testing.T) {
 func TestRunSkipsPlannedWhitelistCheckWhenNoWeekTasks(t *testing.T) {
 	storeStub := &taskStoreStub{}
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: &roomStoreStub{},
-		Fetch: (&taskFetchStub{}).fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  &roomStoreStub{},
+		Fetch:  (&taskFetchStub{}).fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if err != nil {
 		t.Fatalf("没有周矩阵任务时白名单应被跳过，实际 %v", err)
@@ -1647,13 +1855,15 @@ func TestRunReturnsErrorWhenEnsureCellDetailTasksFails(t *testing.T) {
 		persisted:     []store.SyncTask{weekTask(1, "Q10", 20, store.SyncTaskDone)},
 		ensureCellErr: ensureErr,
 	}
+	phases := &phaseStoreStub{}
 	fetch := &taskFetchStub{}
 
 	_, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: &roomStoreStub{},
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: phases,
+		Tasks:  storeStub,
+		Rooms:  &roomStoreStub{},
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, ensureErr) {
 		t.Fatalf("应上抛占用说明段落库错误，实际 %v", err)
@@ -1664,6 +1874,21 @@ func TestRunReturnsErrorWhenEnsureCellDetailTasksFails(t *testing.T) {
 	if want := []string{"ensure-week", "ensure-cell"}; fmt.Sprint(storeStub.events) != fmt.Sprint(want) {
 		t.Fatalf("调用顺序不符: 期望 %v，实际 %v", want, storeStub.events)
 	}
+	// minor 3：周矩阵段已落库、阶段已到 week_matrix；占用说明段没落库，
+	// 阶段不能推进到 cell_detail。
+	wantPhases := []string{string(PhaseWeekMatrix)}
+	if got := phaseNames(phases.phases); fmt.Sprint(got) != fmt.Sprint(wantPhases) {
+		t.Fatalf("占用说明段落库失败时阶段应停在 %v，实际 %v", wantPhases, got)
+	}
+}
+
+// phaseNames 取阶段推进的入参阶段名，便于断言阶段序列。
+func phaseNames(calls []phaseCall) []string {
+	names := make([]string, 0, len(calls))
+	for _, call := range calls {
+		names = append(names, call.phase)
+	}
+	return names
 }
 
 // TestRunReturnsErrorWhenUpsertRunRoomsFails 覆盖每轮归属写入失败：
@@ -1677,10 +1902,11 @@ func TestRunReturnsErrorWhenUpsertRunRoomsFails(t *testing.T) {
 	}}
 
 	progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
-		Tasks: storeStub,
-		Rooms: roomStub,
-		Fetch: fetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  roomStub,
+		Fetch:  fetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	})
 	if !errors.Is(err, runRoomErr) {
 		t.Fatalf("应上抛每轮归属写入错误，实际 %v", err)
@@ -1698,9 +1924,10 @@ func TestRunReturnsErrorWhenUpsertRunRoomsFails(t *testing.T) {
 func TestRunRejectsUnknownTaskKind(t *testing.T) {
 	storeStub := &taskStoreStub{}
 	if _, err := Run(context.Background(), 7, nil, []Task{{Kind: TaskKind("unknown")}}, RunDeps{
-		Tasks: storeStub,
-		Rooms: &roomStoreStub{},
-		Fetch: (&taskFetchStub{}).fetch,
+		Phases: &phaseStoreStub{},
+		Tasks:  storeStub,
+		Rooms:  &roomStoreStub{},
+		Fetch:  (&taskFetchStub{}).fetch,
 	}); err == nil {
 		t.Fatal("未知任务种类应报错")
 	}
@@ -1730,10 +1957,11 @@ func TestRunDoesNotReuseAttributionAcrossRuns(t *testing.T) {
 		taskKey(Task{Kind: TaskWeekMatrix, BuildingID: "Q11", Week: 20}): {matrixRoom("r101", "F101")},
 	}}
 	if _, err := Run(context.Background(), 7, []string{"Q10", "Q11"}, nil, RunDeps{
-		Tasks: firstRun,
-		Rooms: firstRooms,
-		Fetch: firstFetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  firstRun,
+		Rooms:  firstRooms,
+		Fetch:  firstFetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	}); err != nil {
 		t.Fatalf("第 7 轮续跑不应报错，实际 %v", err)
 	}
@@ -1751,10 +1979,11 @@ func TestRunDoesNotReuseAttributionAcrossRuns(t *testing.T) {
 		taskKey(Task{Kind: TaskWeekMatrix, BuildingID: "Q11", Week: 20}): {matrixRoom("r101", "F101")},
 	}}
 	if _, err := Run(context.Background(), 8, []string{"Q11"}, nil, RunDeps{
-		Tasks: secondRun,
-		Rooms: secondRooms,
-		Fetch: secondFetch.fetch,
-		Clock: fixedClock(shanghaiMorning()),
+		Phases: &phaseStoreStub{},
+		Tasks:  secondRun,
+		Rooms:  secondRooms,
+		Fetch:  secondFetch.fetch,
+		Clock:  fixedClock(shanghaiMorning()),
 	}); err != nil {
 		t.Fatalf("第 8 轮不应报错，实际 %v", err)
 	}
@@ -1799,6 +2028,81 @@ func TestPageSHA256MatchesKnownDigest(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := pageSHA256(tc.page); got != tc.want {
 				t.Fatalf("sha256 期望 %s，实际 %s", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestRunWritesStructuralErrorCodeOnTaskFailure 覆盖用户拍板 1：任务失败时按
+// errors.Is 哨兵映射出具体 error_code 写进轮次；网络、超时这类非结构失败不写码。
+// 任务失败本身仍照常置 failed，原因原样落库。
+func TestRunWritesStructuralErrorCodeOnTaskFailure(t *testing.T) {
+	cases := []struct {
+		name     string
+		cause    error
+		wantCode string
+	}{
+		{
+			name:     "矩阵结构失败",
+			cause:    fmt.Errorf("解析周矩阵失败: %w", parser.ErrMatrixStructureInvalid),
+			wantCode: "matrix_structure_invalid",
+		},
+		{
+			name:     "明细结构失败",
+			cause:    fmt.Errorf("解析占用说明失败: %w", parser.ErrDetailStructureInvalid),
+			wantCode: "detail_structure_invalid",
+		},
+		{
+			name:     "轴变化",
+			cause:    fmt.Errorf("节次轴不可用: %w", parser.ErrAxisInvalid),
+			wantCode: "axis_changed",
+		},
+		{
+			name:     "网络失败",
+			cause:    fmt.Errorf("请求失败: %w", model.ErrUpstreamFailed),
+			wantCode: "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			now := shanghaiMorning()
+			storeStub := &taskStoreStub{persisted: []store.SyncTask{
+				weekTask(1, "Q10", 20, store.SyncTaskPending),
+			}}
+			phases := &phaseStoreStub{}
+			fetch := &taskFetchStub{errs: map[string]error{
+				taskKey(Task{Kind: TaskWeekMatrix, BuildingID: "Q10", Week: 20}): c.cause,
+			}}
+
+			progress, err := Run(context.Background(), 7, []string{"Q10"}, nil, RunDeps{
+				Phases: phases,
+				Tasks:  storeStub,
+				Rooms:  &roomStoreStub{},
+				Fetch:  fetch.fetch,
+				Clock:  fixedClock(now),
+			})
+			if err != nil {
+				t.Fatalf("任务失败不应让执行循环报错，实际 %v", err)
+			}
+			if progress.Failed != 1 {
+				t.Fatalf("任务应记 1 次失败，实际 %+v", progress)
+			}
+			if len(storeStub.fails) != 1 || storeStub.fails[0].message != c.cause.Error() {
+				t.Fatalf("失败原因应原样落库，实际 %+v", storeStub.fails)
+			}
+
+			if c.wantCode == "" {
+				if len(phases.codes) != 0 {
+					t.Fatalf("非结构失败不应写错误码，实际 %+v", phases.codes)
+				}
+				return
+			}
+			if len(phases.codes) != 1 {
+				t.Fatalf("结构失败应写 1 个错误码，实际 %+v", phases.codes)
+			}
+			call := phases.codes[0]
+			if call.runID != 7 || call.code != c.wantCode || !call.at.Equal(now) {
+				t.Fatalf("错误码入参不符: %+v（期望 %s）", call, c.wantCode)
 			}
 		})
 	}
