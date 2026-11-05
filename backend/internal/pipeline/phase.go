@@ -14,9 +14,11 @@ import (
 // Phase 是一轮采集的阶段，取值必须与 collect_run.phase 的 CHECK 约束一致
 // （登录 → 学期周历 → 周矩阵 → 占用说明 → 校验 → 发布 → 结束）。
 //
-// 阶段只表示进度，不表示结果：轮次是否失败由 status 表达，阶段停在失败发生的
-// 那一格直到收口写 finished。计划里的「planning/fetching/cleaning/publishing」
-// 是口语描述，落库只认这七个值，否则会撞上表上的 CHECK。
+// 阶段只表示进度，不表示结果：轮次成功、部分成功还是失败由 status 表达。
+// 失败停在失败发生的那一格直到收口写 finished；发布成功的轮次停在 publish，
+// 所以「这一轮结束没有」只看 status，不能只看阶段。计划里的
+// 「planning/fetching/cleaning/publishing」是口语描述，落库只认这七个值，
+// 否则会撞上表上的 CHECK。
 type Phase string
 
 // 一轮采集的全部合法阶段，顺序即推进顺序。
@@ -26,8 +28,8 @@ const (
 	PhaseWeekMatrix Phase = "week_matrix" // 周矩阵：逐楼逐周取矩阵
 	PhaseCellDetail Phase = "cell_detail" // 占用说明：对不可用格下钻明细
 	PhaseValidate   Phase = "validate"    // 校验：组装候选集并做发布前校验
-	PhasePublish    Phase = "publish"     // 发布：单事务版本切换
-	PhaseFinished   Phase = "finished"    // 结束：轮次已收口，只能由收口写入
+	PhasePublish    Phase = "publish"     // 发布：单事务版本切换，成功后在此写终态
+	PhaseFinished   Phase = "finished"    // 结束：失败收口写入；发布成功的轮次停在 publish
 )
 
 // declaredPhases 是全部合法阶段，按推进顺序排列。
@@ -104,8 +106,10 @@ type PhaseStore interface {
 	// SetRunPhase 推进阶段，并按 sync_task 现状刷新轮次计数。
 	// allowedFrom 是可接受的当前阶段列表，当前阶段不在其中时一行都不更新。
 	SetRunPhase(ctx context.Context, runID int64, phase string, allowedFrom []string, now time.Time) error
-	// LoadRunPhase 读当前阶段，供续跑判断「这一格已经过了」与「这一轮已收口」。
-	LoadRunPhase(ctx context.Context, runID int64) (string, error)
+	// LoadRunPhase 读当前阶段与轮次状态，供续跑判断「这一格已经过了」与
+	// 「这一轮已收口」。已收口按 status != running 判：发布成功/部分成功时
+	// phase 停在 publish，不是 finished。
+	LoadRunPhase(ctx context.Context, runID int64) (phase string, status string, err error)
 	// RecordRunErrorCode 写轮次错误码，只保留第一个（后到的结构失败不覆盖先到的）。
 	RecordRunErrorCode(ctx context.Context, runID int64, code string, now time.Time) error
 	// LoadRunTaskSummary 聚合必需/可选任务的总数、完成数、失败数与已记录的错误码。
@@ -118,8 +122,9 @@ type PhaseStore interface {
 //
 // 推进只允许前进：
 //   - next 必须是 collect_run.phase 认识的值，未知阶段直接拒绝，不写库；
-//   - 终态 PhaseFinished 不能用推进写入：一轮结束只能由 CloseRun / FailCalendar /
-//     FailStaleRuns 收口，它们同时写 status 与 finished_at，推进只改进度；
+//   - 终态 PhaseFinished 不能用推进写入：失败由 CloseRun / FailCalendar /
+//     FailStaleRuns 收口，成功由 publish.Commit 在发布事务里写终态（phase 停在
+//     publish），它们同时写 status 与 finished_at，推进只改进度；
 //   - 当前阶段已经超过 next 时拒绝（回退），报错而不是把进度改回去；
 //   - 当前阶段恰好等于 next 时按幂等处理，照常落库以刷新计数。
 //
@@ -145,13 +150,13 @@ func AdvancePhase(ctx context.Context, phases PhaseStore, runID int64, next Phas
 	return phases.SetRunPhase(ctx, runID, string(next), phasePredecessors(next), nowIn(clock))
 }
 
-// currentPhase 读本轮当前阶段并校验取值：不是合法阶段或已经是终态时直接拒绝。
+// currentPhase 读本轮当前阶段与状态：阶段不是合法值或轮次已收口时直接拒绝。
 //
-// 终态拒绝放在这里，是为了让「已收口的轮次不能再推进 / 再执行」只有一个口径：
-// 收口写的是 status 加 phase=finished，读到 finished 说明这一轮已经结束，
-// 任何后续的推进都会把管理端的进度改回中间态。
+// 「已收口」只认 status != running，不认 phase：发布事务写 success/partial 时
+// 阶段停在 publish，并不是 finished。收口与发布事务都会同时写 status 与
+// finished_at，之后任何推进或再执行都会把管理端的进度改回中间态，所以一律拒绝。
 func currentPhase(ctx context.Context, phases PhaseStore, runID int64) (Phase, error) {
-	raw, err := phases.LoadRunPhase(ctx, runID)
+	raw, status, err := phases.LoadRunPhase(ctx, runID)
 	if err != nil {
 		return "", err
 	}
@@ -159,8 +164,8 @@ func currentPhase(ctx context.Context, phases PhaseStore, runID int64) (Phase, e
 	if !current.valid() {
 		return "", fmt.Errorf("pipeline: 轮次 %d 的阶段 %q 不在 collect_run.phase 的取值集合内", runID, raw)
 	}
-	if current == PhaseFinished {
-		return "", fmt.Errorf("pipeline: 轮次 %d 已收口，不能再推进或执行", runID)
+	if status = strings.TrimSpace(status); status != "running" {
+		return "", fmt.Errorf("pipeline: 轮次 %d 已收口（status=%s），不能再推进或执行", runID, status)
 	}
 	return current, nil
 }
@@ -195,7 +200,8 @@ func errorCodeFor(err error) string {
 // 它是收口前的决策点：调用方在发布之前用它判断「必需任务是否已失败」——
 // 必需失败就跳过发布、直接 CloseRun 收口；没有失败才进入发布。
 // 不在这里写库，是因为发布尚未发生：过早写 finished_at 会把「任务跑完」误记成
-// 「一轮结束」。收口本身仍由 CloseRun 一次性写状态、阶段、计数与完成时刻。
+// 「一轮结束」。失败路径的收口由 CloseRun 一次性写状态、阶段、计数与完成时刻；
+// success/partial 由发布事务（publish.Commit）收口，本包不再写。
 //
 // dropped 是执行循环丢弃、从未落库的明细任务数（RunProgress.Dropped()），
 // 与交给 CloseRun 的必须是同一个值：库里没有这批任务的 failed 行，只看汇总会把
@@ -227,9 +233,18 @@ func EvaluateRun(
 // 参与收口：可选明细全部被丢弃时轮次是 partial，不能静默收成 success；必需明细
 // 被丢弃时是 failed。只读库里的 failed 行会漏掉整批失败，所以这个数必须传进来。
 //
-// 收口时机由调用方决定：success 与 partial 在发布事务提交之后调用（先发布再收口），
-// failed 在发布之前调用（必需任务失败或校验拦截时跳过发布，直接收口保留线上版本）。
-// 两种时机都不能提前：任务还没跑完就收口会把「还没做」记成「已完成」。
+// 收口时机由调用方决定，但发布链路上的 success / partial 不再经过本函数：
+//   - 发布成功后不要再调用 CloseRun：publish.Commit 的发布事务已经在同一条
+//     UPDATE 里写死 status、phase=publish、finished_at 与 released_at，轮次
+//     离开 running；再收口会撞上 FinishRun 的「已收口」守卫并报错，也不会改写
+//     已经写好的终态；
+//   - CloseRun 只用于发布之前收口 failed：必需任务失败、必需明细被归属过滤丢弃、
+//     或发布前校验拦截时跳过发布，直接收口以保留线上版本。任务还没跑完就收口会
+//     把「还没做」记成「已完成」，所以只能在这些失败路径上提前收口。
+//
+// 本函数保留 success / partial 的判定（decideOutcome 的完整口径），供尚未接线的
+// 调用方与测试使用；发布链路的编排（发布成功后不再 CloseRun）由任务 12 落实，
+// 本轮只把口径写清楚，不改行为。
 //
 // 语义如下：
 //   - 仍有 pending 任务（必需或可选）时拒绝收口：执行循环没跑完就写终态会把

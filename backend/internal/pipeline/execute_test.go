@@ -27,6 +27,8 @@ var (
 // 并按预置返回任务汇总。
 //
 // 默认当前阶段是 PhaseLogin（全新的轮次）；续跑用例显式设置 current。
+// status 默认 running；已收口的用例只设 status（可配合任意 phase），因为
+// 「这一轮是否结束」只看状态，不看阶段。
 // 阶段写入默认不混进 taskStoreStub 的 events：两段任务的调用顺序断言不受影响；
 // 需要断言「阶段推进与任务落库的相对顺序」的用例把 events 指到同一个切片上。
 type phaseStoreStub struct {
@@ -35,6 +37,7 @@ type phaseStoreStub struct {
 	summary store.RunTaskSummary
 	finish  *store.RunFinish
 	current Phase
+	status  string // collect_run.status；空串按 running 处理
 
 	events *[]string // 与 taskStoreStub 共用的事件流；nil 时只记在 phases 里
 
@@ -79,15 +82,21 @@ func (s *phaseStoreStub) SetRunPhase(_ context.Context, runID int64, phase strin
 	return nil
 }
 
-// LoadRunPhase 实现 PhaseStore。
-func (s *phaseStoreStub) LoadRunPhase(_ context.Context, _ int64) (string, error) {
+// LoadRunPhase 实现 PhaseStore。status 默认 running（全新或进行中的轮次），
+// 「已收口」用例显式设置 status；phase 单独一个字段，便于验证「停在 publish
+// 的成功轮次也算已收口」这类只有状态能表达的情况。
+func (s *phaseStoreStub) LoadRunPhase(_ context.Context, _ int64) (string, string, error) {
 	if s.loadPhaseErr != nil {
-		return "", s.loadPhaseErr
+		return "", "", s.loadPhaseErr
+	}
+	status := s.status
+	if status == "" {
+		status = "running"
 	}
 	if s.current == "" {
-		return string(PhaseLogin), nil
+		return string(PhaseLogin), status, nil
 	}
-	return string(s.current), nil
+	return string(s.current), status, nil
 }
 
 // RecordRunErrorCode 实现 PhaseStore。

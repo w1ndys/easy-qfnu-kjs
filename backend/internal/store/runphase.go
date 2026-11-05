@@ -64,7 +64,8 @@ type runPhaseQuerier interface {
 // 本函数不重复维护一份白名单。
 //
 // 两条守卫写在 WHERE 里而不是先读后写：
-//   - status = 'running'：收口之后不得再改阶段，终态只由 FinishRun 与过期收敛写；
+//   - status = 'running'：收口之后不得再改阶段，终态只由 FinishRun、过期收敛
+//     与发布事务写；
 //   - phase = ANY($4)：$4 是调用方给的「可接受的当前阶段」列表（目标阶段及其之前），
 //     当前阶段不在里面就一行都不更新。续跑因此不能把阶段写回去，并发推进也不会
 //     让阶段倒退。
@@ -83,7 +84,7 @@ UPDATE collect_run
    AND phase = ANY($4::text[])`
 
 // loadRunStateSQL 读轮次的状态与阶段。它只服务两个地方：0 行更新时判别失败原因，
-// 以及调用方读取当前阶段（LoadRunPhase）。
+// 以及调用方读取当前阶段与状态（LoadRunPhase）。
 const loadRunStateSQL = `
 SELECT status, phase
   FROM collect_run
@@ -124,6 +125,8 @@ SELECT count(*) FILTER (WHERE required),
 // 中间态。error_code/error_message 用 NULLIF 把空串折成 NULL，与 stale_run
 // 收敛写入的列语义一致：成功轮次留空而不是留一个空字符串。
 // phase 固定写 finished：收口之后没有下一个阶段，即便终态是 failed 也停在结束。
+// 这一列不是「已结束」的唯一标志：发布事务写 success/partial 时 phase 停在
+// publish（最后一个业务阶段），判定已收口请看 status。
 //
 // WHERE 带 status = 'running'：一条轮次只能收口一次，重复收口（迟到的重试、
 // 并发调用）一行都不更新，由 FinishRun 报错，不会把第一次的终态与 finished_at 盖掉。
@@ -224,18 +227,20 @@ func SetRunPhase(
 		model.ErrRunStoreFailed, runID, state.Phase, phase)
 }
 
-// LoadRunPhase 读一轮当前的阶段。终态轮次的 phase 恒为 finished（收口与过期收敛
-// 都写这一列），调用方据此判断「这一轮还能不能继续执行」。
+// LoadRunPhase 读一轮当前的阶段与状态。终态轮次的 phase 并不唯一：失败收口
+// （FinishRun 与过期收敛）写 finished，发布事务写 success/partial 时停在
+// publish——发布本身就是最后一个业务阶段。所以「这一轮还能不能继续执行」只能按
+// status 判：status != running 即已收口；只看 phase 会把发布成功的轮次当成还在跑。
 // 轮次不存在时返回可读错误，不把空串当成一个阶段。
-func LoadRunPhase(ctx context.Context, q runPhaseQuerier, runID int64) (string, error) {
+func LoadRunPhase(ctx context.Context, q runPhaseQuerier, runID int64) (string, string, error) {
 	state, found, err := loadRunState(ctx, q, runID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if !found {
-		return "", fmt.Errorf("%w: 轮次 %d 不存在，无法读取阶段", model.ErrRunStoreFailed, runID)
+		return "", "", fmt.Errorf("%w: 轮次 %d 不存在，无法读取阶段", model.ErrRunStoreFailed, runID)
 	}
-	return state.Phase, nil
+	return state.Phase, state.Status, nil
 }
 
 // RecordRunErrorCode 把一条结构失败的 error_code 写进轮次，只保留第一个。
@@ -344,7 +349,7 @@ func (r RunPhaseRepo) SetRunPhase(ctx context.Context, runID int64, phase string
 }
 
 // LoadRunPhase 见同名函数。
-func (r RunPhaseRepo) LoadRunPhase(ctx context.Context, runID int64) (string, error) {
+func (r RunPhaseRepo) LoadRunPhase(ctx context.Context, runID int64) (string, string, error) {
 	return LoadRunPhase(ctx, r.q, runID)
 }
 

@@ -66,9 +66,10 @@ SELECT run_id, started_at, status, COALESCE(term, '')
 // 判定看 started_at 而不是 updated_at：崩溃留下的轮次可能从未更新过 updated_at。
 // 终止条件用「<」而不是「<=」：恰好两小时不算「超过」，与 Requirement 11.4 的措辞一致。
 //
-// phase 同步写成 finished：过期收敛与收口是同一类「这一轮结束了」的写入，阶段不能
-// 停在崩溃时那一格——否则管理端会把一条 failed 轮次显示成还在周矩阵阶段，
-// 收口 SQL（phase='finished'）与这里也必须一致，终态轮次不留中间阶段。
+// phase 同步写成 finished：过期收敛与失败收口是同一类「这一轮结束了」的写入，阶段不能
+// 停在崩溃时那一格——否则管理端会把一条 failed 轮次显示成还在周矩阵阶段。
+// 终态的 phase 并不总是 finished：发布事务写 success/partial 时停在 publish
+// （发布是最后一个业务阶段）。判断「已结束」只看 status != 'running'，不要只认这一列。
 const failStaleRunsSQL = `
 UPDATE collect_run
    SET status = 'failed',

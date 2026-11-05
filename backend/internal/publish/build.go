@@ -74,6 +74,13 @@ type RunInput struct {
 	AxisNodes   []model.AxisNode  // 本轴版本的全部节点
 	Cells       []CellObservation // 矩阵观测，按采集顺序
 	Details     []CellDetail      // 占用说明，按采集顺序
+
+	// DroppedRequired/DroppedOptional 是执行循环按归属过滤丢弃、从未写进
+	// sync_task 的明细任务数，来自 pipeline.RunProgress.Dropped()（按必需性分开）。
+	// 它们不在库里的任务汇总里，发布终态必须单独看这两个数：库里查不到这批任务，
+	// 只按汇总判会把「明细全被丢弃」发布成 success。
+	DroppedRequired int
+	DroppedOptional int
 }
 
 // RoomBuilding 是版本归属快照的一行：房号 → 教学楼。
@@ -113,8 +120,11 @@ type OccupancyDetail struct {
 // Candidate 是一轮采集组装完成、可以写入新版本的候选集（尚未落库）。
 //
 // 字段分成三组：版本身份（RunID、Term、GeneratedAt、DictVersion、AxisVersion、
-// WindowStart/End、HasAttrConflict）、发布门槛所需的轮次事实（三个必需任务计数）、
-// 以及要写进版本的数据（归属快照、观测、说明与未知/复合/派生计数）。
+// WindowStart/End、HasAttrConflict）、发布门槛所需的轮次事实（必需/可选任务计数
+// 与归属过滤丢弃数）以及要写进版本的数据（归属快照、观测、说明与未知/复合/派生计数）。
+// RoomsTotal 与 WeeksTotal 是发布时要回写 collect_run 的两个汇总：
+// 前者是归属快照覆盖的房号数，后者是采集窗口 `window_end - window_start + 1`
+// （窗口已校验为合法，周数至少 1）。
 // DroppedDetails 是诊断计数，不写进版本，只用来解释「说明为什么比明细任务少」。
 type Candidate struct {
 	RunID           int64     // 轮次编号
@@ -129,6 +139,28 @@ type Candidate struct {
 	RequiredTotal  int // 必需任务总数
 	RequiredDone   int // 必需任务已完成数
 	RequiredFailed int // 必需任务已失败数
+	OptionalTotal  int // 可选任务总数
+	OptionalDone   int // 可选任务已完成数
+	OptionalFailed int // 可选任务已失败数
+
+	// FirstFailureMessage 是当轮最早失败任务（按 task_id 升序的第一条 failed）的原因，
+	// 来自 store.RunTaskSummary，原样带进候选集。Commit 在 partial 时把它写进
+	// collect_run.error_message，与 pipeline.CloseRun 的 partial 口径一致：没有失败
+	// 任务、只有被归属过滤丢弃的可选明细时改用丢弃计数写一句原因（见 Commit）。
+	// success 不用这一列，发布事务会清空 error_message。
+	FirstFailureMessage string
+
+	// DroppedRequired/DroppedOptional 是归属过滤丢弃、从未落库的明细任务数，
+	// 来自 pipeline.RunProgress.Dropped()，经 RunInput 原样带进候选集。
+	// 它们和下面的 DroppedDetails 不是一回事：DroppedDetails 是 Build 期因周次
+	// 范围解析失败或与窗口无交集而整条丢弃的「说明」数，只用于解释「说明为什么
+	// 比明细任务少」，不写进版本、不参与发布终态；这两个字段是「已经规划出来、
+	// 但因房号归属对不上而没执行」的明细任务，决定 partial 与拒绝发布。
+	DroppedRequired int // 被归属过滤丢弃的必需明细任务数
+	DroppedOptional int // 被归属过滤丢弃的可选明细任务数
+
+	RoomsTotal int // 归属快照覆盖的房号数，发布时回写 collect_run.rooms_total
+	WeeksTotal int // 采集窗口周数，发布时回写 collect_run.weeks_total
 
 	Rooms          []RoomBuilding    // 归属快照
 	Observations   []Observation     // 逐格观测，已展开到小节
@@ -136,7 +168,7 @@ type Candidate struct {
 	UnknownCells   int               // 未知状态格数（按大节计，不按展开后的小节计）
 	CompositeCells int               // 复合状态格数（同上）
 	DerivedCells   int               // 由占用说明补写状态的格数（按大节计）
-	DroppedDetails int               // 整条丢弃的说明数（周次范围解析失败或与窗口无交集）
+	DroppedDetails int               // Build 期整条丢弃的说明数（周次范围解析失败或与窗口无交集），仅诊断，不参与发布终态
 }
 
 // Reader 是发布组装需要的只读仓储能力，由 store.PublishRepo 实现。
@@ -167,6 +199,11 @@ type Reader interface {
 //     并按时间标志的奇偶约束决定补哪几周（Requirement 6.1–6.3）；
 //   - 未知/复合只计数、不在这里拦截：同一大节展开出的多个小节只算一格，
 //     阈值判断在 Validate；
+//   - 汇总计数随候选集一起产出：RoomsTotal 取归属快照的房号数，WeeksTotal 取
+//     采集窗口的周数，发布时原样回写 collect_run（管理端进度条要用）；
+//   - 归属过滤丢弃的明细任务数（RunInput.DroppedRequired/DroppedOptional）原样
+//     带进候选集：这批任务没有写进 sync_task，任务汇总里根本看不到，只能由采集
+//     编排从 pipeline.RunProgress.Dropped() 传进来，供 Commit 判终态；
 //   - 组装完成后没有任何观测时返回带 ReasonEmptyCandidate 的校验拦截，
 //     拒绝发布（Requirement 7.5）。
 //
@@ -236,8 +273,17 @@ func Build(ctx context.Context, reader Reader, runID int64, input RunInput) (Can
 		RequiredTotal:   summary.RequiredTotal,
 		RequiredDone:    summary.RequiredDone,
 		RequiredFailed:  summary.RequiredFailed,
-		Rooms:           roomsOf(attribution, names),
+		OptionalTotal:   summary.OptionalTotal,
+		OptionalDone:    summary.OptionalDone,
+		OptionalFailed:  summary.OptionalFailed,
+
+		FirstFailureMessage: summary.FirstFailureMessage,
+		DroppedRequired:     input.DroppedRequired,
+		DroppedOptional:     input.DroppedOptional,
+		Rooms:               roomsOf(attribution, names),
 	}
+	candidate.RoomsTotal = len(candidate.Rooms)
+	candidate.WeeksTotal = candidate.WindowEnd - candidate.WindowStart + 1
 	if candidate.GeneratedAt.IsZero() {
 		candidate.GeneratedAt = time.Now()
 	}

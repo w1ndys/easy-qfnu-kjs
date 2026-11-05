@@ -160,14 +160,16 @@ func (p *RunProgress) markDropped(required bool) {
 //     明细任务的楼必须等于 Attribution.BuildingOf(房号) 的归属楼；房号归了别的楼、
 //     或本轮根本没有归属时，整条任务丢弃——不落库、不执行，并计入 RunProgress.Failed
 //     （细分记在 DroppedTasks 里）。丢弃不进 sync_task，所以收口单读库里的 failed 行会
-//     漏掉它们；调用方要把 RunProgress.Dropped() 交给 CloseRun，让这批失败参与收口。
+//     漏掉它们；调用方要把 RunProgress.Dropped() 同时交给 CloseRun（失败收口）和
+//     publish.Build 的 RunInput（发布终态判定），两处必须是同一份值。
 //     Plan 只能按白名单 rank 给格子挑楼，不知道这个房号最终归谁；不挡就会把
 //     「靠后的楼报了首见楼的格子」下钻到非归属楼上。sync_task.room_id 的外键也因此
 //     不会在 room 尚不存在时把两段任务一起打挂；
 //   - 每段落库成功之后、执行这一段任务之前推进 collect_run.phase（周矩阵 → 占用说明），
 //     供管理端看到当前进度。阶段只前进：续跑时已经过了的阶段不再写回去，已经收口的
-//     轮次直接拒绝执行（终态只能由收口写）。任务失败怎么影响轮次由本包的
-//     CloseRun / FailCalendar（phase.go）决定，本函数只负责执行任务、落库结果并返回计数；
+//     轮次直接拒绝执行（终态由失败收口或发布事务写）。success/partial 由
+//     publish.Commit 写，失败由本包的 CloseRun / FailCalendar（phase.go）写；
+//     本函数只负责执行任务、落库结果并返回计数；
 //   - 任务失败置 failed 后继续下一条，是否让整轮失败由失败分层决定；
 //   - 调用方取消或超时不把当前任务记成 failed，留给下一次续跑。
 //
@@ -228,8 +230,9 @@ func Run(
 	}
 
 	// 阶段只前进：先读一次当前阶段，据此决定哪些推进要跳过。已收口的轮次不能再执行——
-	// 终态（status + phase=finished）只由 CloseRun / FailCalendar / FailStaleRuns 写，
-	// 这里读到 finished 说明有人把一条已结束的轮次又拿来跑了。
+	// 「已结束」按 collect_run.status 判（status != running），不按 phase：发布事务
+	// 写 success/partial 时阶段停在 publish，不是 finished。失败收口（CloseRun /
+	// FailCalendar / FailStaleRuns）与发布事务都会同时写 status 与 finished_at。
 	current, err := currentPhase(ctx, deps.Phases, runID)
 	if err != nil {
 		return RunProgress{}, err

@@ -191,6 +191,67 @@ func TestBuildAssemblesExpandedCandidate(t *testing.T) {
 	if len(candidate.Rooms) != 1 || candidate.Rooms[0] != wantRooms[0] {
 		t.Fatalf("归属快照不符: got %+v want %+v", candidate.Rooms, wantRooms)
 	}
+	// 发布时要回写的两个汇总：房号数取归属快照、周数取窗口（5..8 → 4 周）。
+	if candidate.RoomsTotal != 1 || candidate.WeeksTotal != 4 {
+		t.Fatalf("房号数/窗口周数不符: rooms=%d weeks=%d", candidate.RoomsTotal, candidate.WeeksTotal)
+	}
+}
+
+// TestBuildCopiesRunTotals 覆盖两个发布汇总、可选任务计数与最早失败原因：
+// RoomsTotal 取归属快照的房号数，WeeksTotal 取窗口周数（含首尾），可选任务计数
+// 与 FirstFailureMessage 原样带进候选集，供 Commit 决定 success/partial 并写原因。
+func TestBuildCopiesRunTotals(t *testing.T) {
+	reader := newFakeReader()
+	reader.facts.WindowStart = 5
+	reader.facts.WindowEnd = 10
+	reader.rooms = []store.RunRoom{
+		{RoomID: "r101", BuildingID: "Q10"},
+		{RoomID: "r102", BuildingID: "Q10"},
+	}
+	reader.summary = store.RunTaskSummary{
+		RequiredTotal: 2, RequiredDone: 2,
+		OptionalTotal: 3, OptionalDone: 2, OptionalFailed: 1,
+		FirstFailureMessage: "明细页结构异常",
+	}
+
+	candidate, err := Build(context.Background(), reader, 1, baseInput())
+	if err != nil {
+		t.Fatalf("组装候选集失败: %v", err)
+	}
+	if candidate.RoomsTotal != 2 {
+		t.Fatalf("房号数应取归属快照的 2 条，实际 %d", candidate.RoomsTotal)
+	}
+	if candidate.WeeksTotal != 6 {
+		t.Fatalf("窗口 5..10 应为 6 周，实际 %d", candidate.WeeksTotal)
+	}
+	if candidate.OptionalTotal != 3 || candidate.OptionalDone != 2 || candidate.OptionalFailed != 1 {
+		t.Fatalf("可选任务计数不符: %+v", candidate)
+	}
+	// 失败原因要原样带进候选集：partial 时 Commit 把它写进 collect_run.error_message。
+	if candidate.FirstFailureMessage != "明细页结构异常" {
+		t.Fatalf("最早失败原因应原样透传，实际 %q", candidate.FirstFailureMessage)
+	}
+}
+
+// TestBuildCopiesDroppedTaskCounts 覆盖归属过滤丢弃数的透传：这两个数来自
+// pipeline.RunProgress.Dropped()，库里没有对应任务，Build 只负责原样带进候选集，
+// 供 Commit 判 partial 或拒绝发布。它们和 Build 期丢弃的说明数（DroppedDetails）
+// 是两回事，不能互相折算——一个描述「明细任务没执行」，一个描述「说明没进版本」。
+func TestBuildCopiesDroppedTaskCounts(t *testing.T) {
+	input := baseInput()
+	input.DroppedRequired = 1
+	input.DroppedOptional = 2
+
+	candidate, err := Build(context.Background(), newFakeReader(), 1, input)
+	if err != nil {
+		t.Fatalf("组装候选集失败: %v", err)
+	}
+	if candidate.DroppedRequired != 1 || candidate.DroppedOptional != 2 {
+		t.Fatalf("丢弃明细任务的计数应原样带进候选集: %+v", candidate)
+	}
+	if candidate.DroppedDetails != 0 {
+		t.Fatalf("丢弃明细任务不应计入 DroppedDetails，实际 %d", candidate.DroppedDetails)
+	}
 }
 
 // TestBuildRejectsEmptyCandidate 覆盖 Requirement 7.5 的空候选：

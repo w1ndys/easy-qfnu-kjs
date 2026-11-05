@@ -64,8 +64,22 @@ func TestMigrateAgainstRealDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migration").Scan(&applied); err != nil {
 		t.Fatalf("迁移记录缺失: %v", err)
 	}
-	if applied != 2 {
-		t.Fatalf("schema_migration 期望 2 行（0001 基线 + 0002 每轮归属），实际 %d", applied)
+	if applied != 3 {
+		t.Fatalf("schema_migration 期望 3 行（0001 基线 + 0002 每轮归属 + 0003 发布标记），实际 %d", applied)
+	}
+
+	// 0003 只新增列、不改 0001/0002：发布标记必须存在且是可空 timestamptz，
+	// 这样「一轮只能发布一次」才不依赖会被 ON DELETE SET NULL 重置的 release_id。
+	var releasedAtType string
+	if err := pool.QueryRow(ctx, `
+SELECT data_type
+  FROM information_schema.columns
+ WHERE table_name = 'collect_run'
+   AND column_name = 'released_at'`).Scan(&releasedAtType); err != nil {
+		t.Fatalf("collect_run 缺少 released_at 列: %v", err)
+	}
+	if releasedAtType != "timestamp with time zone" {
+		t.Fatalf("released_at 应是 timestamptz，实际 %q", releasedAtType)
 	}
 
 	// 0002 的 conflict 不变量落在 DB 里，不只是一段注释：约束必须存在，
@@ -155,5 +169,61 @@ SELECT run_id, term, 'r103', 'Q10', true, '   ' FROM collect_run`,
 	}
 	if rejectedRows != 0 {
 		t.Fatalf("被约束拒绝的写入不应留下任何行，实际 %d 行", rejectedRows)
+	}
+}
+
+// TestMigrateBackfillsReleasedAtAgainstRealDB 覆盖 0003 的升级路径：迁移前已经
+// 关联过版本的轮次在建列后要回填 released_at，否则升级后它们还能再发布一次。
+// 通过「删列 + 清记账 + 重跑迁移」模拟从 0002 升级到 0003。
+func TestMigrateBackfillsReleasedAtAgainstRealDB(t *testing.T) {
+	ctx, pool := openCollectRunTestDB(t)
+
+	if _, err := pool.Exec(ctx, "ALTER TABLE collect_run DROP COLUMN released_at"); err != nil {
+		t.Fatalf("删除 released_at 失败: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM schema_migration WHERE version = '0003_collect_run_released'"); err != nil {
+		t.Fatalf("清理 0003 记账失败: %v", err)
+	}
+
+	publishedAt := time.Date(2026, 11, 4, 20, 0, 0, 0, time.UTC)
+	mustExec(ctx, t, pool, "INSERT INTO term (term, total_weeks) VALUES ('2026-2027-1', 20)")
+	mustExec(ctx, t, pool, `
+INSERT INTO release (release_id, term, generated_at, dict_version, axis_version, is_current)
+VALUES ('rel-legacy', '2026-2027-1', $1, 1, 1, false)`, publishedAt)
+
+	var linkedRunID, unlinkedRunID int64
+	if err := pool.QueryRow(ctx, `
+INSERT INTO collect_run (started_at, status, term, release_id, updated_at)
+VALUES ($1, 'success', '2026-2027-1', 'rel-legacy', $2)
+RETURNING run_id`, publishedAt.Add(-time.Hour), publishedAt).Scan(&linkedRunID); err != nil {
+		t.Fatalf("创建已关联版本的轮次失败: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+INSERT INTO collect_run (started_at, status, term, updated_at)
+VALUES ($1, 'failed', '2026-2027-1', $1)
+RETURNING run_id`, publishedAt).Scan(&unlinkedRunID); err != nil {
+		t.Fatalf("创建未发布轮次失败: %v", err)
+	}
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("从 0002 升级到 0003 失败: %v", err)
+	}
+
+	var releasedAt time.Time
+	if err := pool.QueryRow(ctx,
+		"SELECT released_at FROM collect_run WHERE run_id = $1", linkedRunID).Scan(&releasedAt); err != nil {
+		t.Fatalf("读取回填后的 released_at 失败: %v", err)
+	}
+	if !releasedAt.Equal(publishedAt) {
+		t.Fatalf("升级回填不符: got %s want %s", releasedAt, publishedAt)
+	}
+
+	var unlinked *time.Time
+	if err := pool.QueryRow(ctx,
+		"SELECT released_at FROM collect_run WHERE run_id = $1", unlinkedRunID).Scan(&unlinked); err != nil {
+		t.Fatalf("读取未发布轮次的 released_at 失败: %v", err)
+	}
+	if unlinked != nil {
+		t.Fatalf("未发布轮次不应被回填，实际 %s", unlinked)
 	}
 }

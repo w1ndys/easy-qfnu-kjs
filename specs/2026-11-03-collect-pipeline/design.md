@@ -34,13 +34,15 @@ flowchart LR
 - `pipeline.Run(ctx, runID, whitelist []string, planned []Task, deps RunDeps) (RunProgress, error)`：断点续跑、归属落库、两段执行（周矩阵 → 归属 → 明细）；单轮互斥由 StartRun 的唯一索引负责，整轮失败分层见任务 9。
   - 契约：计划里的楼序列必须与白名单逐位一致，不一致在落库前拒绝，一条任务都不写（命中这种情况的是 `checkPlannedWhitelist`）。
   - 契约：`collect_run_room` 的 `conflict` 与 `conflict_building_id` 同进同出——有冲突必须有被丢弃的楼，没冲突必须留空；DB CHECK 兜最后一道，Go 侧 `normalizeRunRooms` 先挡一道。
-- `publish.Build(runID) Candidate`：组装观测、说明、归属快照、派生状态。
-- `publish.Validate(candidate) error`：候选集非空、必需任务完成、未知/复合计数。
-- `publish.Commit(candidate) error`：单事务写 release → 观测 → 说明 → 归属快照 → 降原 current → 抬新 current → 删更早版本。
+- `publish.Build(ctx context.Context, reader Reader, runID int64, input RunInput) (Candidate, error)`：读轮次事实（学期、窗口、归属冲突）、归属快照与任务汇总，把内存里的观测/说明组装成候选集并派生状态；空候选、坏轴、窗口外观测直接拒绝。
+- `publish.Validate(candidate Candidate, thresholds Thresholds) error`：候选集非空、必需任务完成、归属快照覆盖全部房号、未知/复合格数阈值；只做校验、不读库。
+- `publish.Commit(ctx context.Context, committer Committer, candidate Candidate, now time.Time) (CommitResult, error)`：转成 `store.ReleaseDraft` 并交给仓储的单个事务——事务内复核必需任务完成度 → 写 release（非 current）→ 观测 → 说明 → 归属快照 → 降原 current → 抬新 current → 删更早版本 → 回写 `collect_run`（汇总、`release_id`、`released_at`、终态 success/partial、`phase=publish`、`finished_at`，partial 另写最早失败原因或丢弃说明到 `error_message`，success 清空）。轮次在事务结束时离开 `running`，调用方不再对它收口。
 
 ## Data Models
 
-复用 `migrations/0001_baseline.sql`：`collect_run`、`collect_run_week`、`sync_task`、`release`、`release_room_building`、`observation`、`occupancy_detail`、`room`、`term`、`term_week`、`dict_state`、`dict_symbol`、`axis_node`。另新增 `migrations/0002_collect_run_room.sql` 的 `collect_run_room`（每轮房号→楼归属快照，供续跑重建累计器、任务 10 发布读取；用户已批准新增表）。除此之外不新增表；若确实缺列，先报告再定，不擅自改 migration。
+复用 `migrations/0001_baseline.sql`：`collect_run`、`collect_run_week`、`sync_task`、`release`、`release_room_building`、`observation`、`occupancy_detail`、`room`、`term`、`term_week`、`dict_state`、`dict_symbol`、`axis_node`。另新增 `migrations/0002_collect_run_room.sql` 的 `collect_run_room`（每轮房号→楼归属快照，供续跑重建累计器、任务 10 发布读取；用户已批准新增表）。`migrations/0003_collect_run_released.sql` 只新增 `collect_run.released_at`（发布标记，一轮只能发布一次；不随删旧版本的 `ON DELETE SET NULL` 重置；用户已批准新增列）。除此之外不新增表；若确实缺列，先报告再定，不擅自改 migration。
+
+版本标识 `release.release_id` 固定为 `<UTC 秒级>Z`（例如 `20261023T071012Z`），不含轮次编号；同一秒生成的两个轮次会得到同一标识，由发布前置检查拒绝。
 
 ## Correctness Properties
 
@@ -51,7 +53,7 @@ flowchart LR
 - CP5：同一楼同一周、同一格至多一条任务。
 - CP6：同一时刻至多一个 `running` 轮次。
 - CP7：发布事务任一步失败后，原 current 仍可用。
-- CP8：连续发布三次后 `release` 只保留当前与上一版。
+- CP8：连续发布三次后 `release` 只保留当前与上一版。「上一版」= 生成时间次新的版本（按 `generated_at` 倒序取非当前版本的第一条，同一生成时刻用 `release_id` 定序），不是「上一次发布的那一版」。发布事务同时把 `collect_run` 写成终态（success/partial）、`phase=publish` 与 `released_at`，轮次不再 `running`。
 
 ## Error Handling
 

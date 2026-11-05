@@ -197,20 +197,33 @@ func TestAdvancePhaseAllowsSamePhase(t *testing.T) {
 	}
 }
 
-// TestAdvancePhaseRejectsFinishedRun 覆盖 minor 3 / minor 5：收口之后阶段已经是
-// finished，迟到的推进直接拒绝，阶段不变。
-func TestAdvancePhaseRejectsFinishedRun(t *testing.T) {
-	phases := &phaseStoreStub{current: PhaseFinished}
+// TestAdvancePhaseRejectsClosedRun 覆盖已收口的两种终态：失败收口停在 finished、
+// 发布成功停在 publish。判定只看 status（status != running），不看 phase——
+// 停在 publish 的发布成功轮次同样是已收口，迟到的推进必须拒绝且不写库。
+func TestAdvancePhaseRejectsClosedRun(t *testing.T) {
+	cases := []struct {
+		name   string
+		phase  Phase
+		status string
+	}{
+		{name: "失败收口停在 finished", phase: PhaseFinished, status: "failed"},
+		{name: "发布成功停在 publish", phase: PhasePublish, status: store.RunStatusSuccess},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			phases := &phaseStoreStub{current: c.phase, status: c.status}
 
-	err := AdvancePhase(context.Background(), phases, 7, PhasePublish, fixedClock(shanghaiMorning()))
-	if err == nil {
-		t.Fatal("已收口的轮次不应还能推进阶段")
-	}
-	if !strings.Contains(err.Error(), "已收口") {
-		t.Fatalf("错误应说明轮次已收口，实际 %v", err)
-	}
-	if len(phases.phases) != 0 {
-		t.Fatalf("已收口时不应写库，实际 %+v", phases.phases)
+			err := AdvancePhase(context.Background(), phases, 7, PhasePublish, fixedClock(shanghaiMorning()))
+			if err == nil {
+				t.Fatal("已收口的轮次不应还能推进阶段")
+			}
+			if !strings.Contains(err.Error(), "已收口") {
+				t.Fatalf("错误应说明轮次已收口，实际 %v", err)
+			}
+			if len(phases.phases) != 0 {
+				t.Fatalf("已收口时不应写库，实际 %+v", phases.phases)
+			}
+		})
 	}
 }
 
@@ -881,30 +894,44 @@ func TestRunResumeDoesNotRegressPhase(t *testing.T) {
 	}
 }
 
-// TestRunRejectsFinishedRun 覆盖 minor 3：已收口的轮次不能再执行——终态由收口写，
-// 执行循环读到 finished 直接报错，不落任务、不发请求。
-func TestRunRejectsFinishedRun(t *testing.T) {
-	storeStub := &taskStoreStub{}
-	phases := &phaseStoreStub{current: PhaseFinished}
-	fetch := &taskFetchStub{}
+// TestRunRejectsClosedRun 覆盖已收口判定：终态由收口或发布事务写，执行循环读到
+// status != running 直接报错，不落任务、不发请求。阶段不一定是 finished——
+// 发布成功/部分成功的轮次停在 publish，只有状态能说明这一轮已经结束。
+func TestRunRejectsClosedRun(t *testing.T) {
+	cases := []struct {
+		name   string
+		phase  Phase
+		status string
+	}{
+		{name: "失败收口停在 finished", phase: PhaseFinished, status: "failed"},
+		{name: "发布成功停在 publish", phase: PhasePublish, status: store.RunStatusSuccess},
+		{name: "发布部分成功停在 publish", phase: PhasePublish, status: store.RunStatusPartial},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			storeStub := &taskStoreStub{}
+			phases := &phaseStoreStub{current: c.phase, status: c.status}
+			fetch := &taskFetchStub{}
 
-	_, err := Run(context.Background(), 7, []string{"Q10"}, []Task{
-		{Kind: TaskWeekMatrix, Required: true, BuildingID: "Q10", Week: 20},
-	}, RunDeps{
-		Tasks:  storeStub,
-		Rooms:  &roomStoreStub{},
-		Phases: phases,
-		Fetch:  fetch.fetch,
-		Clock:  fixedClock(shanghaiMorning()),
-	})
-	if err == nil {
-		t.Fatal("已收口的轮次不应还能执行")
-	}
-	if !strings.Contains(err.Error(), "已收口") {
-		t.Fatalf("错误应说明轮次已收口，实际 %v", err)
-	}
-	if len(storeStub.events) != 0 || len(fetch.calls) != 0 {
-		t.Fatalf("已收口时不应落库或发请求: events=%v calls=%v", storeStub.events, fetch.calls)
+			_, err := Run(context.Background(), 7, []string{"Q10"}, []Task{
+				{Kind: TaskWeekMatrix, Required: true, BuildingID: "Q10", Week: 20},
+			}, RunDeps{
+				Tasks:  storeStub,
+				Rooms:  &roomStoreStub{},
+				Phases: phases,
+				Fetch:  fetch.fetch,
+				Clock:  fixedClock(shanghaiMorning()),
+			})
+			if err == nil {
+				t.Fatal("已收口的轮次不应还能执行")
+			}
+			if !strings.Contains(err.Error(), "已收口") {
+				t.Fatalf("错误应说明轮次已收口，实际 %v", err)
+			}
+			if len(storeStub.events) != 0 || len(fetch.calls) != 0 {
+				t.Fatalf("已收口时不应落库或发请求: events=%v calls=%v", storeStub.events, fetch.calls)
+			}
+		})
 	}
 }
 

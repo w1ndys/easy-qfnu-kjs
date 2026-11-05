@@ -255,18 +255,23 @@ func TestSetRunPhaseWrapsStoreFailure(t *testing.T) {
 	}
 }
 
-// TestLoadRunPhaseScansCurrentPhase 覆盖阶段读取：续跑与 0 行更新的判别都靠这一列。
-func TestLoadRunPhaseScansCurrentPhase(t *testing.T) {
+// TestLoadRunPhaseReturnsPhaseAndStatus 覆盖阶段与状态一起读出：
+// 续跑靠 phase 判断「这一格已经过了」，靠 status 判断「这一轮已收口」——
+// 发布成功/部分成功时 phase 停在 publish，只看 phase 会把已结束的轮次当成还在跑。
+func TestLoadRunPhaseReturnsPhaseAndStatus(t *testing.T) {
 	querier := &runPhaseQuerierStub{
-		stateRow: &runStateRowStub{status: "running", phase: "cell_detail", found: true},
+		stateRow: &runStateRowStub{status: "success", phase: "publish", found: true},
 	}
 
-	phase, err := LoadRunPhase(context.Background(), querier, 7)
+	phase, status, err := LoadRunPhase(context.Background(), querier, 7)
 	if err != nil {
 		t.Fatalf("读阶段不应报错，实际 %v", err)
 	}
-	if phase != "cell_detail" {
-		t.Fatalf("阶段期望 cell_detail，实际 %q", phase)
+	if phase != "publish" {
+		t.Fatalf("阶段期望 publish，实际 %q", phase)
+	}
+	if status != "success" {
+		t.Fatalf("状态期望 success，实际 %q", status)
 	}
 	if querier.queryRowCalls != 1 || querier.queryRowSQL != loadRunStateSQL {
 		t.Fatalf("应只执行状态 SQL，实际 %v", querier.queryRowSQL)
@@ -280,7 +285,7 @@ func TestLoadRunPhaseScansCurrentPhase(t *testing.T) {
 func TestLoadRunPhaseRejectsMissingRun(t *testing.T) {
 	querier := &runPhaseQuerierStub{stateRow: &runStateRowStub{found: false}}
 
-	_, err := LoadRunPhase(context.Background(), querier, 404)
+	_, _, err := LoadRunPhase(context.Background(), querier, 404)
 	if !errors.Is(err, model.ErrRunStoreFailed) {
 		t.Fatalf("轮次不存在应返回 ErrRunStoreFailed，实际 %v", err)
 	}
