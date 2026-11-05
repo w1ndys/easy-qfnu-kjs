@@ -100,6 +100,20 @@ tasks:
     cmds:
       - '{{.GO}} test ./...'
 
+  # 带 DSN 的全量测试必须 -p 1：e2e 与 store 的集成用例都会 DROP SCHEMA public，
+  # go test 默认按包并行，两个包同时重建同一个测试库会互踩（详见
+  # backend/internal/e2e/collect_pipeline_test.go 的包注释）。
+  test-integration:
+    desc: 带 KJS_TEST_DSN 的后端全量测试（固定 -p 1 串行）
+    dir: backend
+    preconditions:
+      - sh: test -n "$KJS_TEST_DSN"
+        msg: 需先 export KJS_TEST_DSN，且只能指向专用测试库（会重建 public schema）
+      - sh: case "$KJS_TEST_DSN" in *_test*) exit 0;; *) exit 1;; esac
+        msg: KJS_TEST_DSN 的库名必须以 _test 结尾，避免误清开发/生产库
+    cmds:
+      - '{{.GO}} test -p 1 -count=1 ./...'
+
   backend:vet:
     desc: 后端 go vet
     dir: backend
