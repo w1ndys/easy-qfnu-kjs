@@ -299,7 +299,7 @@ var (
 
 **密钥文件权限口径**：`Create` 写出的文件是 0600；`Load` 的判定宽一档，只要求「不得允许属主之外访问」（`perm&0o077 == 0`），所以 0400/0500/0600/0700 都合规，0644 这类开放群组或其他用户的权限一律拒绝（用户拍板：不接受属主之外的任何访问，过宽即硬失败）。`Load` 还要求打开的是普通文件（`Mode().IsRegular()`），目录、FIFO、字符设备、块设备、套接字同样按非法拒绝，避免对 FIFO 读取时阻塞。权限或文件类型不合规都返回 `ErrKeyUnavailable`，走下面的「启动期降级」。这条判定的边界要说清：`IsRegular` 挡的是「打开之后去读」这一半；`open(2)` 对没有写入端的 FIFO 本身就可能阻塞，彻底堵住要引入平台相关的 `O_NONBLOCK` 或预先 `stat`，与这里「检查与读取共用同一个 fd」的顺序冲突，而密钥路径由运维配置，不为它分平台。阻塞一旦真的发生，它就在 `Load` 的写锁内：同一 `Manager` 上的 `Present`/`Current` 拿不到读锁，会一并等待到 `open(2)` 返回；`Load` 只在装配期调用一次，最坏结果是启动卡住而不是读到错的数据——残余风险记在这里，不假装已经解决。非普通文件的错误文案按 `IsDir`/`ModeCharDevice`/`ModeDevice`/`ModeNamedPipe`/`ModeSocket` 映射成中文类型名（目录/字符设备/块设备/命名管道/套接字），不直接渲染 `Mode().Type()` 的单字母 `d`/`D`，让运维一眼看出是路径指错还是文件被换；映射表里另留着「符号链接」一条，但它在 `Load` 里不可达——`os.Open` 打开时已跟随符号链接，`f.Stat()` 看到的是目标文件的类型，保留它只为映射完备（将来若改用 `Lstat` 不至于静默漏判）。
 
-**密文信封格式**：`v1:` + `base64url(nonce(12) || ciphertext || tag(16))`，AAD 传业务键名（约定 `settings/<key>`，例如 `settings/jw_password`），把密文绑定到设置项，防止把 A 项的密文挪到 B 项还能解开。信封带版本前缀，将来换算法可以并存。
+**密文信封格式**：`v1:` + `base64url(nonce(12) || ciphertext || tag(16))`，AAD 传业务键名（约定 `settings/<key>`，例如 `settings/jw_password`），把密文绑定到设置项，防止把 A 项的密文挪到 B 项还能解开。信封带版本前缀，将来换算法可以并存，旧密文仍按 `v1` 解开。边界与分类：`Seal` 与 `Open` 都拒绝空 AAD——空 AAD 等于放弃「密文绑定到设置项」这层保护，只在解封侧拒绝会让 `Seal` 产出必然解不开的信封，所以两侧都在入口拦；零值 `Key`（32 个零字节本身是合法 AES 密钥，`aes.NewCipher` 不会报错）在构造 AEAD 时拒绝，否则等于用一把人尽皆知的密钥加密；`Open` 只接受不超过 64 KiB（`maxEnvelopeLen`）的信封，长度门排在 base64url 解码之前，超长信封一个字节都不解码，错误里只报字节数、不回显内容；base64url 解码走 `Strict`，非零尾比特、填充符与 `+/` 一律拒绝，保证同一载荷只有一种合法写法。失败分类：AAD 为空、超长、版本前缀缺失或不认识、base64url 非法、载荷短于 nonce(12)+tag(16)、AAD 不符或 GCM 校验失败，全部用 `%w` 包裹 `ErrEnvelopeInvalid`，上层 `errors.Is(err, ErrEnvelopeInvalid)` 即可判定「这份密文不可用」，不必匹配错误文案；零值密钥的错误同时包裹 `model.ErrKeyUnavailable` 与 `ErrEnvelopeInvalid`，`Seal` 与 `Open` 共用 `aead()` 入口因而 `errors.Is` 结果一致，让「密钥没装好」与「密文坏了」可区分。错误文案不出现信封内容与明文，避免调用方把密文或旧密钥材料抄进日志。
 
 ## Correctness Properties
 
@@ -314,7 +314,7 @@ var (
 - CP9 **限流只数失败**：窗口内第 6 次失败起返回 42901；成功登录把该来源计数清零；被限流的请求不触发密码哈希（`HashCallCount` 不增长）。
 - CP10 **来源口径一致**：限流与公开查询共用 `clientSource`；伪造 `X-Forwarded-For` 最左值既不改变桶也不放宽限制。
 - CP11 **响应白名单**：管理端响应的 `data` 只出现设计表列的键；每个管理端响应（含 4xx/5xx）都带 `Cache-Control: no-store`。
-- CP12 **信封完整**：`Seal` → `Open` 往返一致；同一明文两次 `Seal` 的 nonce 不同；篡改任意字节、AAD 不匹配、缺 `v1:` 前缀都让 `Open` 失败。
+- CP12 **信封完整**：`Seal` → `Open` 往返一致；同一明文两次 `Seal` 的 nonce 不同；篡改任意字节、AAD 不匹配、缺 `v1:` 前缀都让 `Open` 失败。边界与错误分类：空 AAD 在 `Seal`/`Open` 两侧都拒绝；零值 `Key` 拒绝，错误同时包裹 `ErrKeyUnavailable` 与 `ErrEnvelopeInvalid`，封与解两边的 `errors.Is` 结果一致；`Open` 只接受不超过 64 KiB 的信封，长度门在 base64url 解码之前；超长、非法 base64url、载荷过短、GCM 校验失败等一律包裹 `ErrEnvelopeInvalid`，供上层 `errors.Is` 判定。
 - CP13 **密钥文件属性**：创建用 `O_EXCL`、权限 0600；已存在时 `Create` 返回 `ErrKeyExists` 且不覆盖。
 - CP14 **密钥缺失可降级**：管理员已初始化但密钥文件缺失时，进程仍启动，公开查询、`GET /api/admin/state` 与登录照常；该响应的 `key_fingerprint` 为 `null`，管理端其余能力不受影响。
 - CP15 **写路由唯一**：公开 mux 除探针只注册 `GET`；全部写方法注册在 `/api/admin/` 前缀下（用路由表枚举断言）。
@@ -342,7 +342,7 @@ var (
 ## Test Strategy
 
 - **auth 纯函数**：密码规则边界（11/12/13 码点、两次不一致、超长）；PHC 串前缀与字段；`VerifyPassword` 对错误密码、损坏哈希、截断哈希分别返回失败而不 panic；`SessionExpiry` 恒为 `now+12h`；`SessionActive` 在 `expires_at` 前后 1 秒的边界。
-- **secret 纯函数**：`Seal/Open` 往返（含空明文、1 KiB 明文）；两次 `Seal` 的 nonce 不同；逐字节篡改（nonce、密文、tag）与错误 AAD 全部失败；信封前缀缺失/未知版本失败；`Fingerprint` 长度固定 16 且随密钥变化。
+- **secret 纯函数**：`Seal/Open` 往返（含空明文、1 KiB 明文）；两次 `Seal` 的 nonce 不同；逐字节篡改（nonce、密文、tag）与错误 AAD 全部失败；信封前缀缺失/未知版本失败；`Fingerprint` 长度固定 16 且随密钥变化。另含空 AAD 双侧拒绝、零值 Key 拒绝（同时命中 `model.ErrKeyUnavailable` 与 `ErrEnvelopeInvalid`，Seal/Open 一致）、64 KiB 长度门（超长在解码前拒、恰好 64 KiB 落到 `Strict` 解码）、非零尾比特与载荷下界。
 - **密钥文件**：`Create` 建出 0600 文件、第二次 `Create` 返回 `ErrKeyExists` 且内容不变；`Load` 对缺失文件返回 `(false, nil)`、对截断文件返回 `ErrKeyUnavailable`；权限判定走表驱动（0400/0500/0600/0700 可装载；0640/0604/0644 拒绝且文案带实际权限位；0070 属主自己不可读，非 root 下 `open(2)` 先返回 EACCES，只断言 `ErrKeyUnavailable`，不断言权限文案）；另有一条用例断言不可读文件的底层 cause 能被 `errors.Is(err, fs.ErrPermission)` 取出（0070 文件，root 下 skip）；路径指向目录与 `/dev/null` 字符设备分别返回 `ErrKeyUnavailable`，文案写中文类型名（目录/字符设备）；路径误指 8 MiB 稀疏大文件时在读取前被拒——错误带真实字节数，且不含「解析密钥文件」（出现它即意味着已把内容读进内存交给 `parseKey`）；同尺寸但权限 0644 的文件由权限分支先拒，错误带实际权限位而不带真实字节数；`Stat` 之后被追加（`readAll` seam 在读取前把文件追加到 60 字节）由读取后的长度门按 45 字节拒掉，错误不含「超过」，以此证明 Size 门当时确实只看到 44 字节；读取本身失败（`readAll` seam 返回错误）的文案是「读取密钥文件」而不是「解析密钥文件」；写入、落盘、关闭、清理失败与 `open` 非 EEXIST 失败各有用例，`Load` 与 `Create` 并发互斥有专门用例；临时目录下验证 `MkdirAll` 行为。
 - **限流器**：假时钟下第 6 次失败被拦、`Retry-After` 落在 `(0, 60s]`；窗口到期恢复；成功清零；来源表满时淘汰最旧且不影响其他来源；伪造最左 XFF 不换桶。
 - **管理端契约（httptest + 替身 `AdminStore` + 临时目录 `*secret.Manager` + 假时钟）**：五个端点的状态码、业务码、`data` 键集合、`Cache-Control`、Cookie 属性（HttpOnly/SameSite=Lax/Path/Secure 随配置）、401 的清除 Cookie；写请求缺 CSRF/缺会话时替身写方法调用次数为 0。
