@@ -295,7 +295,9 @@ var (
 )
 ```
 
-**密钥文件格式**：32 字节原始密钥，`base64url` 无填充文本 + 换行（44 字节文件），便于运维直接 `cat` 备份；`Load` 逐层校验长度与解码，任一不符返回 `ErrKeyUnavailable`。
+**密钥文件格式**：32 字节原始密钥，`base64url` 无填充文本 + 换行（有效文件恒为 44 字节），便于运维直接 `cat` 备份；`Load` 逐层校验长度与解码，任一不符返回 `ErrKeyUnavailable`。读取量同样封顶：`f.Stat()` 的 `Size()` 超过 44 字节就直接拒绝，随后再套 `io.LimitReader(f, encodedKeyLen+2)`（45 字节），兜住「Stat 之后文件被追加」这种尺寸与内容不一致的情形——无论文件后来多大，读取量最多 45 字节，多出的部分由长度门按「44 字节」拒掉。两道门的适用边界不同：Size 门在类型与权限都合规之后才执行，此时路径误指日志、镜像或库文件仍然一个字节都不读、错误里写出真实大小；权限过宽（如 0644）或类型不符的文件根本走不到 Size 门，先由前一步拒掉。
+
+**密钥文件权限口径**：`Create` 写出的文件是 0600；`Load` 的判定宽一档，只要求「不得允许属主之外访问」（`perm&0o077 == 0`），所以 0400/0500/0600/0700 都合规，0644 这类开放群组或其他用户的权限一律拒绝（用户拍板：不接受属主之外的任何访问，过宽即硬失败）。`Load` 还要求打开的是普通文件（`Mode().IsRegular()`），目录、FIFO、字符设备、块设备、套接字同样按非法拒绝，避免对 FIFO 读取时阻塞。权限或文件类型不合规都返回 `ErrKeyUnavailable`，走下面的「启动期降级」。这条判定的边界要说清：`IsRegular` 挡的是「打开之后去读」这一半；`open(2)` 对没有写入端的 FIFO 本身就可能阻塞，彻底堵住要引入平台相关的 `O_NONBLOCK` 或预先 `stat`，与这里「检查与读取共用同一个 fd」的顺序冲突，而密钥路径由运维配置，不为它分平台。阻塞一旦真的发生，它就在 `Load` 的写锁内：同一 `Manager` 上的 `Present`/`Current` 拿不到读锁，会一并等待到 `open(2)` 返回；`Load` 只在装配期调用一次，最坏结果是启动卡住而不是读到错的数据——残余风险记在这里，不假装已经解决。非普通文件的错误文案按 `IsDir`/`ModeCharDevice`/`ModeDevice`/`ModeNamedPipe`/`ModeSocket` 映射成中文类型名（目录/字符设备/块设备/命名管道/套接字），不直接渲染 `Mode().Type()` 的单字母 `d`/`D`，让运维一眼看出是路径指错还是文件被换；映射表里另留着「符号链接」一条，但它在 `Load` 里不可达——`os.Open` 打开时已跟随符号链接，`f.Stat()` 看到的是目标文件的类型，保留它只为映射完备（将来若改用 `Lstat` 不至于静默漏判）。
 
 **密文信封格式**：`v1:` + `base64url(nonce(12) || ciphertext || tag(16))`，AAD 传业务键名（约定 `settings/<key>`，例如 `settings/jw_password`），把密文绑定到设置项，防止把 A 项的密文挪到 B 项还能解开。信封带版本前缀，将来换算法可以并存。
 
@@ -335,13 +337,13 @@ var (
 
 初始化失败补偿：`CreateAdmin` 成功后 `Create()` 写密钥文件失败时，调用 `DeleteAdmin` 回滚，返回 50000；回滚本身失败则记 `init_compensation_failed` 并保留管理员记录，运维按「删管理员记录 + 删密钥文件」重置。
 
-启动期降级：`keys.Load()` 失败（不可读/内容非法）记 ERROR 但继续启动；`admin_user` 有行而密钥文件缺失记 WARN `secret_key_missing`。两种情况都只影响依赖密钥的能力（本 spec 只有指纹展示受影响），公开查询与登录照常。
+启动期降级：`keys.Load()` 失败记 ERROR 但继续启动。失败口径是「不可读 / 权限过宽（开放了属主之外访问）/ 路径不是普通文件 / 内容非法 / 文件尺寸超过 44 字节（读取量封顶 45；Stat 后被追加则按内容长度不符拒掉）」，一律返回 `ErrKeyUnavailable` 并保留已装载的旧密钥；`admin_user` 有行而密钥文件缺失记 WARN `secret_key_missing`。两种情况都只影响依赖密钥的能力（本 spec 只有指纹展示受影响），公开查询与登录照常。
 
 ## Test Strategy
 
 - **auth 纯函数**：密码规则边界（11/12/13 码点、两次不一致、超长）；PHC 串前缀与字段；`VerifyPassword` 对错误密码、损坏哈希、截断哈希分别返回失败而不 panic；`SessionExpiry` 恒为 `now+12h`；`SessionActive` 在 `expires_at` 前后 1 秒的边界。
 - **secret 纯函数**：`Seal/Open` 往返（含空明文、1 KiB 明文）；两次 `Seal` 的 nonce 不同；逐字节篡改（nonce、密文、tag）与错误 AAD 全部失败；信封前缀缺失/未知版本失败；`Fingerprint` 长度固定 16 且随密钥变化。
-- **密钥文件**：`Create` 建出 0600 文件、第二次 `Create` 返回 `ErrKeyExists` 且内容不变；`Load` 对缺失文件返回 `(false, nil)`、对截断文件返回 `ErrKeyUnavailable`；临时目录下验证 `MkdirAll` 行为。
+- **密钥文件**：`Create` 建出 0600 文件、第二次 `Create` 返回 `ErrKeyExists` 且内容不变；`Load` 对缺失文件返回 `(false, nil)`、对截断文件返回 `ErrKeyUnavailable`；权限判定走表驱动（0400/0500/0600/0700 可装载；0640/0604/0644 拒绝且文案带实际权限位；0070 属主自己不可读，非 root 下 `open(2)` 先返回 EACCES，只断言 `ErrKeyUnavailable`，不断言权限文案）；另有一条用例断言不可读文件的底层 cause 能被 `errors.Is(err, fs.ErrPermission)` 取出（0070 文件，root 下 skip）；路径指向目录与 `/dev/null` 字符设备分别返回 `ErrKeyUnavailable`，文案写中文类型名（目录/字符设备）；路径误指 8 MiB 稀疏大文件时在读取前被拒——错误带真实字节数，且不含「解析密钥文件」（出现它即意味着已把内容读进内存交给 `parseKey`）；同尺寸但权限 0644 的文件由权限分支先拒，错误带实际权限位而不带真实字节数；`Stat` 之后被追加（`readAll` seam 在读取前把文件追加到 60 字节）由读取后的长度门按 45 字节拒掉，错误不含「超过」，以此证明 Size 门当时确实只看到 44 字节；读取本身失败（`readAll` seam 返回错误）的文案是「读取密钥文件」而不是「解析密钥文件」；写入、落盘、关闭、清理失败与 `open` 非 EEXIST 失败各有用例，`Load` 与 `Create` 并发互斥有专门用例；临时目录下验证 `MkdirAll` 行为。
 - **限流器**：假时钟下第 6 次失败被拦、`Retry-After` 落在 `(0, 60s]`；窗口到期恢复；成功清零；来源表满时淘汰最旧且不影响其他来源；伪造最左 XFF 不换桶。
 - **管理端契约（httptest + 替身 `AdminStore` + 临时目录 `*secret.Manager` + 假时钟）**：五个端点的状态码、业务码、`data` 键集合、`Cache-Control`、Cookie 属性（HttpOnly/SameSite=Lax/Path/Secure 随配置）、401 的清除 Cookie；写请求缺 CSRF/缺会话时替身写方法调用次数为 0。
 - **并发初始化**：50 个 goroutine 同时 `POST /api/admin/init`，断言恰好 1 个 200、其余 40902，密钥文件只出现一次且内容等于成功响应的 `encryption_key`。

@@ -20,7 +20,10 @@
   - `NewManager`/`Load`：缺失返回 `(false, nil)`，不可读或内容非法返回 `ErrKeyUnavailable`
   - `Create`：父目录 `MkdirAll 0700`、`O_EXCL` 写入、文件 0600，已存在返回 `ErrKeyExists` 且不覆盖
   - 文件格式为 32 字节密钥的 base64url 文本 + 换行；`Export`/`Fingerprint` 与文件内容一致
-  - 单元测试覆盖 0600 权限、二次 Create、截断文件与指纹长度
+  - `Load` 的判定口径：必须指向普通文件，且 `perm&0o077 == 0`（0400/0500/0600/0700 合规）。两类失败都返回 `ErrKeyUnavailable` 并按启动期降级处理，但文案分开写：权限过宽是「不得允许属主之外访问」（带实际权限位，不是固定 0600）；类型不符是「不是普通文件（目录/字符设备/块设备/命名管道/套接字）」。0070 在非 root 下由 `open(2)` 的 EACCES 先拦，走不到权限分支、没有权限文案，只保证 `ErrKeyUnavailable`
+  - `Load` 读取封顶：有效文件恒为 44 字节，先按 `f.Stat()` 的 `Size()` 拒掉超过 44 字节的文件（路径误指大文件时不读内容、错误里写出真实大小；这一步在类型与权限判定之后），再以 `io.LimitReader(f, encodedKeyLen+2)`（45 字节）兜住 Stat 之后被追加的情形，读取量封顶
+  - `IsRegular` 挡的是「打开之后去读」那一半，`open(2)` 对没有写入端的 FIFO 仍可能阻塞（残余风险，不为密钥路径引入平台相关的 `O_NONBLOCK`）
+  - 单元测试覆盖创建 0600 权限、二次 Create、截断文件与指纹长度；权限判定表驱动（0400/0500/0600/0700 合规，0640/0604/0070/0644 拒绝）、非普通文件（目录、`/dev/null` 字符设备）、超大文件读取前拒绝、写入/落盘/关闭/清理失败（含 `open` 非 EEXIST 失败）、`Load` 与 `Create` 并发互斥
 
 - [ ] 5. secret 密文信封
   - `Seal` 生成 12 字节随机 nonce，输出 `v1:` + base64url(nonce||ciphertext)，AAD 传入业务键名
