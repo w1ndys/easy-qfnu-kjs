@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -64,8 +65,8 @@ func TestMigrateAgainstRealDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migration").Scan(&applied); err != nil {
 		t.Fatalf("迁移记录缺失: %v", err)
 	}
-	if applied != 3 {
-		t.Fatalf("schema_migration 期望 3 行（0001 基线 + 0002 每轮归属 + 0003 发布标记），实际 %d", applied)
+	if applied != 4 {
+		t.Fatalf("schema_migration 期望 4 行（0001 基线 + 0002 每轮归属 + 0003 发布标记 + 0004 管理会话），实际 %d", applied)
 	}
 
 	// 0003 只新增列、不改 0001/0002：发布标记必须存在且是可空 timestamptz，
@@ -225,5 +226,170 @@ RETURNING run_id`, publishedAt).Scan(&unlinkedRunID); err != nil {
 	}
 	if unlinked != nil {
 		t.Fatalf("未发布轮次不应被回填，实际 %s", unlinked)
+	}
+}
+
+// TestMigrateAdminSessionAgainstRealDB 覆盖 0004：管理会话表从干净库建出、
+// 重复迁移走「已应用则跳过」，且列、主键、CHECK 与索引真的生效——
+// 约束名对不等于规则对，只查名字会漏掉「写反了但名字还在」。
+func TestMigrateAdminSessionAgainstRealDB(t *testing.T) {
+	ctx, pool := openCollectRunTestDB(t)
+
+	// openCollectRunTestDB 已经迁移过一轮；再跑一次证明 0004 也只记一次账、
+	// 不会因重复建表/建索引报错。
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("重复迁移应为幂等，实际失败: %v", err)
+	}
+
+	var recorded int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM schema_migration WHERE version = '0004_admin_session'`).Scan(&recorded); err != nil {
+		t.Fatalf("读取 0004 记账失败: %v", err)
+	}
+	if recorded != 1 {
+		t.Fatalf("schema_migration 应恰有 1 条 0004_admin_session，实际 %d", recorded)
+	}
+
+	// 逐列断言形态：漏 NOT NULL、created_at 丢默认值都在这里暴露，
+	// 而不是等仓储写入时报一个离现场很远的错。
+	type column struct {
+		dataType   string
+		isNullable string
+		hasDefault bool
+	}
+	wantColumns := map[string]column{
+		"token_hash": {dataType: "text", isNullable: "NO", hasDefault: false},
+		"csrf_token": {dataType: "text", isNullable: "NO", hasDefault: false},
+		"created_at": {dataType: "timestamp with time zone", isNullable: "NO", hasDefault: true},
+		"expires_at": {dataType: "timestamp with time zone", isNullable: "NO", hasDefault: false},
+	}
+	rows, err := pool.Query(ctx, `
+SELECT column_name, data_type, is_nullable, column_default
+  FROM information_schema.columns
+ WHERE table_schema = 'public' AND table_name = 'admin_session'`)
+	if err != nil {
+		t.Fatalf("读取 admin_session 列失败: %v", err)
+	}
+	gotColumns := make(map[string]column, len(wantColumns))
+	for rows.Next() {
+		var name string
+		var col column
+		var def *string
+		if err := rows.Scan(&name, &col.dataType, &col.isNullable, &def); err != nil {
+			rows.Close()
+			t.Fatalf("扫描 admin_session 列失败: %v", err)
+		}
+		col.hasDefault = def != nil
+		gotColumns[name] = col
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 admin_session 列失败: %v", err)
+	}
+	if len(gotColumns) != len(wantColumns) {
+		t.Fatalf("admin_session 应有 %d 列，实际 %d（%v）", len(wantColumns), len(gotColumns), gotColumns)
+	}
+	for name, want := range wantColumns {
+		got, ok := gotColumns[name]
+		if !ok {
+			t.Fatalf("admin_session 缺少 %s 列", name)
+		}
+		if got != want {
+			t.Fatalf("%s 列形态不符: got %+v want %+v", name, got, want)
+		}
+	}
+
+	// 主键必须落在 token_hash：认证查询按它走，换了列就变成全表扫描。
+	var pkDef string
+	if err := pool.QueryRow(ctx, `
+SELECT pg_get_constraintdef(c.oid)
+  FROM pg_constraint c
+  JOIN pg_class t ON t.oid = c.conrelid
+ WHERE t.relname = 'admin_session' AND c.contype = 'p'`).Scan(&pkDef); err != nil {
+		t.Fatalf("admin_session 缺少主键: %v", err)
+	}
+	if !strings.Contains(pkDef, "token_hash") {
+		t.Fatalf("admin_session 主键应落在 token_hash 上，实际 %q", pkDef)
+	}
+
+	// 过期顺序约束必须存在，且规则文本就是 expires_at > created_at。
+	var checkDef string
+	if err := pool.QueryRow(ctx, `
+SELECT pg_get_constraintdef(c.oid)
+  FROM pg_constraint c
+  JOIN pg_class t ON t.oid = c.conrelid
+ WHERE t.relname = 'admin_session' AND c.contype = 'c'`).Scan(&checkDef); err != nil {
+		t.Fatalf("admin_session 缺少 expires_at > created_at 约束: %v", err)
+	}
+	if !strings.Contains(checkDef, "expires_at > created_at") {
+		t.Fatalf("CHECK 应约束 expires_at > created_at，实际 %q", checkDef)
+	}
+
+	// 清理过期会话要按过期时刻筛，索引必须真的建在 expires_at 上。
+	var indexDef string
+	if err := pool.QueryRow(ctx, `
+SELECT indexdef
+  FROM pg_indexes
+ WHERE schemaname = 'public' AND tablename = 'admin_session' AND indexname = 'admin_session_expires'`).Scan(&indexDef); err != nil {
+		t.Fatalf("admin_session 缺少 admin_session_expires 索引: %v", err)
+	}
+	if !strings.Contains(indexDef, "(expires_at)") {
+		t.Fatalf("admin_session_expires 应按 expires_at 建索引，实际 %q", indexDef)
+	}
+
+	var tableComment *string
+	if err := pool.QueryRow(ctx,
+		`SELECT obj_description('public.admin_session'::regclass, 'pg_class')`).Scan(&tableComment); err != nil {
+		t.Fatalf("读取 admin_session 表注释失败: %v", err)
+	}
+	if tableComment == nil || !strings.Contains(*tableComment, "token_hash") {
+		t.Fatalf("admin_session 应有说明 token_hash 口径的表注释，实际 %v", tableComment)
+	}
+
+	base := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+
+	// 合法行必须能落库：只测拒绝会漏掉「约束写反了、连合法行也拒绝」。
+	if _, err := pool.Exec(ctx, `
+INSERT INTO admin_session (token_hash, csrf_token, created_at, expires_at)
+VALUES ('hash-valid', 'csrf-valid', $1, $2)`, base, base.Add(12*time.Hour)); err != nil {
+		t.Fatalf("合法的管理会话行不应被约束拒绝: %v", err)
+	}
+
+	// 过期时刻不晚于创建时刻的行必须被 CHECK 拒绝，且断言 SQLSTATE 与约束名：
+	// 只判 err != nil 的话，表名拼错、列不存在这类错误也会让用例变绿。
+	rejected := []struct {
+		name      string
+		expiresAt time.Time
+	}{
+		{"过期时刻早于创建时刻", base.Add(-time.Second)},
+		{"过期时刻等于创建时刻", base},
+	}
+	for i, c := range rejected {
+		_, err := pool.Exec(ctx, `
+INSERT INTO admin_session (token_hash, csrf_token, created_at, expires_at)
+VALUES ($1, 'csrf-invalid', $2, $3)`, fmt.Sprintf("hash-rejected-%d", i), base, c.expiresAt)
+		if err == nil {
+			t.Fatalf("admin_session 应拒绝「%s」的行", c.name)
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			t.Fatalf("「%s」应以 *pgconn.PgError 报错，实际 %T: %v", c.name, err, err)
+		}
+		if pgErr.Code != "23514" {
+			t.Fatalf("「%s」应以 SQLSTATE 23514（check_violation）报错，实际 %s: %v",
+				c.name, pgErr.Code, err)
+		}
+		if pgErr.ConstraintName != "admin_session_expiry_after_created" {
+			t.Fatalf("「%s」应命中断言约束 admin_session_expiry_after_created，实际 %q",
+				c.name, pgErr.ConstraintName)
+		}
+	}
+
+	var rowCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM admin_session`).Scan(&rowCount); err != nil {
+		t.Fatalf("统计 admin_session 行数失败: %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("被约束拒绝的写入不应留下任何行，admin_session 期望 1 行，实际 %d", rowCount)
 	}
 }
