@@ -30,6 +30,16 @@ linters:
           allow:
             - $gostd
 
+        # 鉴权纯逻辑：只依赖实体、标准库与 argon2，不碰 HTTP、SQL 或配置。
+        # x/crypto/argon2 是本 spec 唯一新增的直接依赖（D4），只放行这一个子包。
+        auth:
+          files:
+            - "**/internal/auth/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - golang.org/x/crypto/argon2
+
         # 纯解析：只依赖实体与 HTML 解析库，不碰网络与数据库。
         # goquery 是 docs/pitfalls.md 第 10 节指定的唯一结构解析手段（v1.13.0）；
         # depguard 只检查直接 import，其依赖 cascadia 与 golang.org/x/net 不必列出。

@@ -17,7 +17,7 @@ Updated: 2026-11-06
 | D1 | **只做后端 API**：五个端点 + 迁移 + 仓储 + 三个新包；不建 `frontend/` 目录 | 本轮可独立验收，前端可并行后做；代价是初始化与登录暂时只能用 curl 验收 |
 | D2 | **密钥存文件（`SECRET_KEY_PATH`），不入库** | 数据库备份与密钥备份分开保管，导出的密钥才有灾备价值（PRD 5.1「密钥丢失则秘密无法解密」只有在密钥不在库里时才成立）；代价是多一份需备份的文件，容器要挂一个可写卷（由 deploy-ops 负责） |
 | D3 | **AES-256-GCM**（放弃 XChaCha20-Poly1305） | 标准库自带、无新依赖、amd64/arm64 有 AES 加速；12 字节随机 nonce 配 32 字节密钥，本系统加密次数以「管理员改设置」计，nonce 碰撞概率可忽略；XChaCha20 的 24 字节 nonce 优势要在高频随机加密场景才体现，这里不值得为它引入 `golang.org/x/crypto/chacha20poly1305` |
-| D4 | **argon2id m=19456 KiB, t=2, p=1, salt 16B, key 32B**（OWASP 2024 最低推荐档） | 单次约 19 MiB / 50 ms，单机 25 条连接的小部署可承受；并发哈希用容量 2 的信号量封顶，最坏多占 38 MiB，避免多个来源同时登录把内存打爆 |
+| D4 | **argon2id m=19456 KiB, t=2, p=1, salt 16B, key 32B**（OWASP 2024 最低推荐档） | 单次约 19 MiB / 50 ms，单机 25 条连接的小部署可承受；并发哈希用容量 2 的信号量封顶，正常 19 MiB×2 ≈38 MiB，按解析上限 64 MiB×2 最坏 128 MiB，避免多个来源同时登录把内存打爆 |
 | D5 | **会话服务端存储**：`admin_session` 只存会话令牌的 SHA-256 | 退出、改密可立即失效；库被看到也不含可用 Cookie；代价是每次管理请求多一次主键查询（可忽略） |
 | D6 | **12 小时绝对过期，不滑动续期** | 过期时刻可预测、实现与测试简单；代价是连续操作跨过 12 小时会被踢回登录，属可接受体验 |
 | D7 | **CSRF 用同步器令牌**：令牌随会话存服务端，客户端经 `X-CSRF-Token` 头回传 | 令牌不与 Cookie 同源，跨站读不到；比双提交 Cookie 少一个 Cookie 与一套校验；代价是前端要保存令牌，刷新后从 `GET /api/admin/state` 取回 |
@@ -348,7 +348,7 @@ var (
 - **仓储集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：迁移到 0004；`CreateAdmin` 冲突返回 created=false；`InsertSession` 主键冲突；`Session` 查得到/查不到；`DeleteAllSessions` 影响行数；`DeleteExpiredSessions` 只删过期行。
 - **端到端检查点**：干净库 → 迁移 → init（拿密钥与指纹）→ state 报 initialized → login（拿 CSRF 与 Cookie）→ 写操作带/不带 CSRF → 改密 → 旧 Cookie 401 → 登出 → 清管理员记录与密钥文件 → 重新 init 成功。
 - **日志脱敏**：用唯一哨兵字符串（如 `sentinel-pw-<随机>`）作为密码提交，捕获 `slog` 输出，断言整段日志不含哨兵、不含 Cookie 值、不含 `csrf_token` 与 `encryption_key`。
-- **门禁**：`go build ./...`、`go vet ./...`、`go test ./...`、`golangci-lint run`（含新增 depguard 规则）四条全绿；`go.mod` 只多 `golang.org/x/crypto`。
+- **门禁**：`go build ./...`、`go vet ./...`、`go test ./...`、`golangci-lint run`（含新增 depguard 规则）四条全绿；`go.mod` 只新增直接依赖 `golang.org/x/crypto`，`golang.org/x/sys` 作为 indirect 随同出现。
 
 ## 与既有文档的差异
 
