@@ -43,7 +43,7 @@ const (
 type Key [KeyLen]byte
 
 // Manager 持有密钥文件路径与当前已装载的密钥。
-// Present/Current/Path 走读锁，只有 Load/Create 会改动内存状态，因此装配期之后的
+// Present/Current/Path 走读锁，只有 Load/Create/Reload 会改动内存状态，因此装配期之后的
 // 并发读不需要调用方额外加锁。
 type Manager struct {
 	path string
@@ -74,9 +74,10 @@ func NewManager(path string) *Manager {
 
 // Load 读取并校验密钥文件，成功时把密钥装入内存并返回 (true, nil)。
 //
-// 文件不存在返回 (false, nil)：未初始化是正常状态，不是错误。
+// 文件不存在返回 (false, nil)：未初始化是正常状态，不是错误；文件不存在时也不清空
+// 已装载的密钥（要「文件没了就清空」的语义用 Reload，两者不合并）。
 // 文件不可读、不是普通文件、权限过宽、文件尺寸超过 44 字节或内容非法返回
-// (false, ErrKeyUnavailable)，此时不改动已装载的密钥：启动期降级只影响依赖密钥的能力，
+// (false, ErrKeyUnavailable)，此时同样不改动已装载的密钥：启动期降级只影响依赖密钥的能力，
 // 已经拿到手的密钥仍然可用（CP14）。
 // 打开、检查与读取共用同一个 *os.File 并且都在写锁内完成：与 Create 互斥，否则可能出现
 // 「Load 读到旧文件、Create 写入新密钥，最后 Load 把旧密钥装进内存」的错位；权限、文件类型
@@ -86,19 +87,36 @@ func (m *Manager) Load() (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	key, found, err := m.loadFile()
+	if err != nil || !found {
+		return false, err
+	}
+
+	m.key, m.loaded = key, true
+	return true, nil
+}
+
+// loadFile 是 Load 与 Reload 共用的读取阶段：打开、检查并解析密钥文件，返回读到的密钥，
+// 不接触内存状态。调用方必须持有 m.mu 写锁——它负责与 Create 互斥，也保证
+// 「读到的字节」与「替换内存」之间不会被另一次写入插进来。
+//
+// 文件不存在返回 (Key{}, false, nil)：未初始化是正常状态，由调用方决定怎么处理内存。
+// 其余失败（不可读、非普通文件、权限过宽、尺寸或内容非法）返回包裹
+// model.ErrKeyUnavailable 的错误，同样不动内存。
+func (m *Manager) loadFile() (Key, bool, error) {
 	f, err := os.Open(m.path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
+		return Key{}, false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("打开密钥文件 %s: %w: %w", m.path, model.ErrKeyUnavailable, err)
+		return Key{}, false, fmt.Errorf("打开密钥文件 %s: %w: %w", m.path, model.ErrKeyUnavailable, err)
 	}
 	// 只读句柄的关闭错误不改变结论（内容已经读完或没读成），显式丢弃。
 	defer func() { _ = f.Close() }()
 
 	info, err := f.Stat()
 	if err != nil {
-		return false, fmt.Errorf("检查密钥文件 %s: %w: %w", m.path, model.ErrKeyUnavailable, err)
+		return Key{}, false, fmt.Errorf("检查密钥文件 %s: %w: %w", m.path, model.ErrKeyUnavailable, err)
 	}
 
 	// 先断文件类型再断权限：目录、FIFO、字符/块设备、套接字一律拒掉——对 FIFO 做 io.ReadAll
@@ -107,11 +125,13 @@ func (m *Manager) Load() (bool, error) {
 	// 才不会与随后的读取看到两个不同文件。
 	// 残余风险记在这里：open(2) 对没有写入方的 FIFO 本身就可能阻塞，本步挡住的是「打开之后
 	// 去读」那一半；彻底堵住要引入平台相关的 O_NONBLOCK 或预先 stat，与这里的单句柄序列冲突，
-	// 而密钥路径由运维配置，不值得为它分平台。阻塞一旦真的发生，它就在 Load 的写锁内：同一
-	// Manager 上的 Present/Current 拿不到读锁，会一并等到 open(2) 返回；Load 在装配期只调用
-	// 一次，最坏结果是启动卡住，而不是读到错的数据。
+	// 而密钥路径由运维配置，不值得为它分平台。阻塞一旦真的发生，它就在 loadFile 调用方
+	// （Load/Reload）的写锁内：同一 Manager 上的 Present/Current 拿不到读锁，会一并等到
+	// open(2) 返回；Load 在装配期只调用一次，最坏结果是启动卡住；Reload 由未认证的
+	// init 触发，最坏结果是该请求与 state 的 Present/Current 一起等锁——这是已知接受项，
+	// 而不是读到错的数据。
 	if !info.Mode().IsRegular() {
-		return false, fmt.Errorf("密钥文件 %s 不是普通文件（%s）: %w",
+		return Key{}, false, fmt.Errorf("密钥文件 %s 不是普通文件（%s）: %w",
 			m.path, describeFileType(info.Mode()), model.ErrKeyUnavailable)
 	}
 
@@ -119,7 +139,7 @@ func (m *Manager) Load() (bool, error) {
 	// 0644 这类权限会让同机其他用户直接读走密钥明文，与 CP13 的 0600 约定不符，这里不静默
 	// 接受，而是把实际权限写进错误，让运维一眼看出该 chmod。
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return false, fmt.Errorf("密钥文件 %s 权限 %#o 不得允许属主之外访问: %w",
+		return Key{}, false, fmt.Errorf("密钥文件 %s 权限 %#o 不得允许属主之外访问: %w",
 			m.path, perm, model.ErrKeyUnavailable)
 	}
 
@@ -128,7 +148,7 @@ func (m *Manager) Load() (bool, error) {
 	// Size 拒掉超过 44 字节的文件——一个字节都不读，错误里也能写出真实大小，运维一眼看出指错了
 	// 路径。这道门排在类型与权限之后：文件类型或权限不合规时已经先返回，走不到这里。
 	if size := info.Size(); size > encodedKeyLen+1 {
-		return false, fmt.Errorf("密钥文件 %s 内容 %d 字节，超过 %d 字节: %w",
+		return Key{}, false, fmt.Errorf("密钥文件 %s 内容 %d 字节，超过 %d 字节: %w",
 			m.path, size, encodedKeyLen+1, model.ErrKeyUnavailable)
 	}
 
@@ -137,12 +157,51 @@ func (m *Manager) Load() (bool, error) {
 	// parseKey 按「长度不符」拒掉。
 	raw, err := readAll(io.LimitReader(f, encodedKeyLen+2))
 	if err != nil {
-		return false, fmt.Errorf("读取密钥文件 %s: %w: %w", m.path, model.ErrKeyUnavailable, err)
+		return Key{}, false, fmt.Errorf("读取密钥文件 %s: %w: %w", m.path, model.ErrKeyUnavailable, err)
 	}
 
 	key, err := parseKey(raw)
 	if err != nil {
-		return false, fmt.Errorf("解析密钥文件 %s: %w: %w", m.path, model.ErrKeyUnavailable, err)
+		return Key{}, false, fmt.Errorf("解析密钥文件 %s: %w: %w", m.path, model.ErrKeyUnavailable, err)
+	}
+
+	return key, true, nil
+}
+
+// Reload 按磁盘上的现状对账内存状态：先读到局部变量，读成功才替换；只有文件确实不存在时
+// 才清空内存。
+//
+// 它服务于两种场景：
+//   - 同进程重新初始化：运维删掉管理员记录与密钥文件后直接重新 init，若内存里那份旧密钥
+//     还在，Present 恒为真、Create 恒撞 ErrKeyExists，init 会被永久挡在 40903。文件已删时
+//     必须清空内存副本，流程才能继续往下走。
+//   - 内存为空、文件其实存在：进程刚重启还没 Load，或上次启动时装载失败。只信 Present 会让
+//     初始化一路走到 CreateAdmin，再由 Create 的 O_EXCL 挡下并触发补偿，白建又白删一条记录。
+//     这里按文件对账，文件可用时装回内存，让请求在 CreateAdmin 之前按 40903 被拒。
+//
+// 返回值与 Load 的区别只在「失败与缺失时怎么处理内存」：
+//   - 文件不存在：(false, nil)，清空内存——只有 fs.ErrNotExist 会走到这一支；
+//   - 文件存在但不可用（不可读、非普通文件、权限过宽、尺寸或内容非法）：(false, ErrKeyUnavailable)，
+//     保留内存里那把旧密钥。这与 Load 的启动期降级同一口径（CP14）：磁盘这份现在读不出来，
+//     不代表进程里已经拿到的那把失效，清掉它只会让本来还能解密的进程当场失能。调用方据此
+//     拒绝初始化（40903），而不是覆盖文件（CP4）；
+//   - 文件存在且可用：(true, nil)，替换内存。
+//
+// 读取、判定与替换都在同一把写锁内完成：与 Create/Load 互斥，不会出现
+// 「读到一半被 Create 换掉、最后把旧密钥写回内存」的错位。
+// 本方法不碰管理员记录：是否真的允许重新初始化，仍由调用方的 Admin() 判定。
+func (m *Manager) Reload() (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key, found, err := m.loadFile()
+	if err != nil {
+		// 损坏或不可读：保留旧键，只报告「磁盘上这份不可用」。
+		return false, err
+	}
+	if !found {
+		m.key, m.loaded = Key{}, false
+		return false, nil
 	}
 
 	m.key, m.loaded = key, true
@@ -176,8 +235,9 @@ func describeFileType(mode fs.FileMode) string {
 }
 
 // Present 报告内存里是否已有一把可用密钥。
-// 初始化流程用它判断「密钥已存在」；它不查文件系统，所以文件内容非法导致 Load 失败时
-// 仍返回 false，后续 Create 会被 O_EXCL 挡住并转成 ErrKeyExists。
+// 它不查文件系统，所以「内存为空、磁盘上已有文件」时仍返回 false；要按磁盘对账用 Reload。
+// 文件内容非法时 Load/Reload 都会返回 ErrKeyUnavailable（Reload 还保留旧键），由调用方
+// 据此拒绝初始化，而不是靠 Create 的 O_EXCL 兜底。
 func (m *Manager) Present() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

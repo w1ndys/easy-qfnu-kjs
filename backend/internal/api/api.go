@@ -6,9 +6,11 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/query"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/secret"
 )
 
 // Pinger 是就绪检查唯一需要的能力；声明在这里，避免 API 层直接依赖数据库驱动。
@@ -55,6 +57,9 @@ type Server struct {
 	trustProxy   bool                 // 是否信任前置反代给出的来源头
 	recorder     StatsRecorder        // 访问统计记账入口；nil 表示不记账
 	admin        adminStore           // 管理端数据来源；nil 表示未装配，管理端点按内部错误处理
+	keys         *secret.Manager      // 密钥文件管理器；nil 表示未装配，初始化按内部错误、指纹按 null 处理
+	// initLimiter 按来源统计初始化密码校验失败；与登录限流分开计数。
+	initLimiter *failureLimiter
 	// adminCookieSecure 决定管理会话 Cookie 是否带 Secure：默认 true，
 	// 只有本地 http 开发才关掉（浏览器不会在 http 上保存 Secure Cookie）。
 	// 下发票据与清除 Cookie 必须用同一个值，否则死 Cookie 删不掉。
@@ -93,6 +98,8 @@ func New(log *slog.Logger, health Pinger, ctxSvc ContextProvider, availability A
 		limiter:      newRateLimiter(rateLimitMaxPerWindow, rateLimitWindow),
 		// design D2 的部署拓扑是 web 反代 /api 到 server，默认按可信反代取来源。
 		trustProxy: true,
+		// 初始化失败限流与登录失败限流各一个实例：两者的失败来源与窗口互不影响。
+		initLimiter: newFailureLimiter(failureLimitMaxFails, failureLimitWindow),
 		// 安全默认：未显式配置时管理会话 Cookie 带 Secure（ADMIN_COOKIE_SECURE 默认 true）。
 		adminCookieSecure: true,
 	}
@@ -112,7 +119,34 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/meta", s.rateLimited(s.metaInfo))
 	mux.Handle("GET /api/query", s.rateLimited(s.query))
 	mux.Handle("GET /api/screen", s.rateLimited(s.screenInfo))
-	return mux
+
+	// 管理端引导：state 是公开读端点（未登录也 200），走公开限流；
+	// init 必须在登录之前可用，因此只复用写链路的体门（withJSONBody），不挂会话与 CSRF。
+	// 两者都包在可组合的 withNoStore 里，保证连 429/500 的错误响应也带 no-store（CP11）；
+	// 404/405 由 ServeMux 自己写出、不经过 handler，由返回前的 withAdminNoStore 按前缀兜住。
+	mux.Handle("GET /api/admin/state", withNoStore(s.adminStateLimited(s.adminState)))
+	mux.Handle("POST /api/admin/init", withNoStore(s.adminInitLimited(s.withJSONBody(s.adminInit))))
+	return withAdminNoStore(mux)
+}
+
+// adminRoutePrefix 是管理端路由前缀，与 Cookie 的 adminCookiePath（/api/admin）同一作用域。
+const adminRoutePrefix = "/api/admin"
+
+// withAdminNoStore 给管理端前缀下的所有响应加 Cache-Control: no-store。
+//
+// 内层 withNoStore 只罩住两个已注册的端点，而 ServeMux 自己写出的 404（未注册路径）与
+// 405（方法不匹配）根本不经过任何 handler，只在内层加头是覆盖不到的——管理端前缀下的
+// 错误响应同样不许被缓存（CP11），所以按前缀在最外层再兜一次。
+// 判定接受前缀本身与带斜杠的子树：/api/admin 自身也会 404，且与 Cookie 的 Path=/api/admin
+// 一致，避免出现「Cookie 会发到但缓存头不生效」的缺口。
+// 前缀之外（公开路径、/healthz）一个头都不加：no-store 只属于管理端。
+func withAdminNoStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == adminRoutePrefix || strings.HasPrefix(r.URL.Path, adminRoutePrefix+"/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // healthz 只表示进程活着，不查依赖：把库检查放这里会让库抖动连带重启进程。

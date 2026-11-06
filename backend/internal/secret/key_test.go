@@ -952,6 +952,129 @@ func TestLoadFailureKeepsLoadedKey(t *testing.T) {
 	}
 }
 
+// TestReloadDropsKeyAfterFileRemoved 覆盖同进程重新初始化的前置条件：Create 之后删掉密钥文件，
+// Reload 必须清掉内存副本并返回 (false, nil)，让 Present 与 Current 都回到未初始化状态。
+// Load 不具备这个能力：它读不到文件时只返回 (false, nil)，内存里的旧密钥仍然可用。
+func TestReloadDropsKeyAfterFileRemoved(t *testing.T) {
+	m, path := newManagerAt(t)
+	key, err := m.Create()
+	if err != nil {
+		t.Fatalf("Create 应成功，实际 err=%v", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("删除密钥文件失败: %v", err)
+	}
+
+	loaded, err := m.Reload()
+	if err != nil {
+		t.Fatalf("文件已删时 Reload 应返回 nil 错误，实际 err=%v", err)
+	}
+	if loaded {
+		t.Fatal("文件已删时 Reload 应返回 false")
+	}
+	if m.Present() {
+		t.Fatal("Reload 之后 Present() 应为 false，否则同进程无法重新初始化")
+	}
+	if _, err := m.Current(); !errors.Is(err, model.ErrKeyUnavailable) {
+		t.Fatalf("Reload 之后 Current() 应返回 ErrKeyUnavailable，实际 err=%v", err)
+	}
+
+	// 清空之后 Create 可以重新写文件并装载新密钥。
+	again, err := m.Create()
+	if err != nil {
+		t.Fatalf("Reload 之后 Create 应成功，实际 err=%v", err)
+	}
+	if again == key {
+		t.Fatal("重新 Create 应生成不同的密钥")
+	}
+}
+
+// TestReloadLoadsExistingFile 确认 Reload 也能把磁盘上的密钥装进一个内存为空的管理器：
+// 只有文件、没有内存副本时返回 (true, nil)，且 Current 与文件内容一致。
+func TestReloadLoadsExistingFile(t *testing.T) {
+	writer, path := newManagerAt(t)
+	key, err := writer.Create()
+	if err != nil {
+		t.Fatalf("Create 应成功，实际 err=%v", err)
+	}
+
+	m := NewManager(path)
+	loaded, err := m.Reload()
+	if err != nil || !loaded {
+		t.Fatalf("文件存在时 Reload 应返回 (true, nil)，实际 (%v, %v)", loaded, err)
+	}
+	current, err := m.Current()
+	if err != nil {
+		t.Fatalf("Reload 之后 Current() 应成功，实际 err=%v", err)
+	}
+	if current != key {
+		t.Fatalf("Reload 装回的密钥应与文件一致：%x != %x", current, key)
+	}
+	if got, want := current.Export(), key.Export(); got != want {
+		t.Fatalf("Reload 装回的密钥导出串 %q 应为 %q", got, want)
+	}
+}
+
+// TestReloadInvalidFileKeepsLoadedKey 钉住 Reload 的失败口径：文件被改坏时返回
+// (false, ErrKeyUnavailable)，但保留内存里那把旧密钥（与 Load 的启动期降级同一口径，CP14）。
+// 清空内存只发生在文件确实不存在时（见 TestReloadDropsKeyAfterFileRemoved）——磁盘这份
+// 读不出来不代表进程里已经拿到的那把失效，清掉它只会让还能解密的进程当场失能。
+func TestReloadInvalidFileKeepsLoadedKey(t *testing.T) {
+	m, path := newManagerAt(t)
+	key, err := m.Create()
+	if err != nil {
+		t.Fatalf("Create 应成功，实际 err=%v", err)
+	}
+
+	writeRaw(t, path, []byte("被改坏的内容"))
+
+	loaded, err := m.Reload()
+	if loaded || !errors.Is(err, model.ErrKeyUnavailable) {
+		t.Fatalf("Reload 应返回 (false, ErrKeyUnavailable)，实际 (%v, %v)", loaded, err)
+	}
+	if !m.Present() {
+		t.Fatal("Reload 失败后应保留旧密钥副本")
+	}
+	current, err := m.Current()
+	if err != nil {
+		t.Fatalf("Reload 失败后已装载的密钥应仍可读，实际 err=%v", err)
+	}
+	if current != key {
+		t.Fatalf("Reload 失败不应改动内存里的密钥：%x != %x", current, key)
+	}
+}
+
+// TestReloadUnreadableFileKeepsLoadedKey 覆盖「不可读」与「不存在」的分界：文件权限被收走后
+// Reload 返回 ErrKeyUnavailable 且保留旧键，不能当成「文件已删」把内存清掉。
+// 0000 权限对 root 无效，先探测一次、root 下跳过。
+func TestReloadUnreadableFileKeepsLoadedKey(t *testing.T) {
+	m, path := newManagerAt(t)
+	key, err := m.Create()
+	if err != nil {
+		t.Fatalf("Create 应成功，实际 err=%v", err)
+	}
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("改权限失败: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	if _, err := os.ReadFile(path); err == nil {
+		t.Skip("当前用户可无视 0000 权限（如 root），跳过不可读用例")
+	}
+
+	loaded, err := m.Reload()
+	if loaded || !errors.Is(err, model.ErrKeyUnavailable) {
+		t.Fatalf("不可读时 Reload 应返回 (false, ErrKeyUnavailable)，实际 (%v, %v)", loaded, err)
+	}
+	if !m.Present() {
+		t.Fatal("Reload 失败后应保留旧密钥副本")
+	}
+	if current, err := m.Current(); err != nil || current != key {
+		t.Fatalf("不可读时 Reload 不应改动内存密钥：key=%v err=%v", current, err)
+	}
+}
+
 // TestLoadCreateConcurrentKeepsKeyConsistent 覆盖 Load 与 Create 的互斥，且不靠时序碰运气：
 // 用 syncFile seam 让 Create 在持有写锁时停住（它已写好文件、正等落盘），此时启动 Load，
 // 断言 Load 在 Create 释放锁之前不返回；放行后 Load 必须返回 (true, nil)，且内存密钥、

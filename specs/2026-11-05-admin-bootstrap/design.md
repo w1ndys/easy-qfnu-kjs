@@ -39,7 +39,7 @@ sequenceDiagram
     FE->>API: POST /api/admin/init {password, password_confirm}
     API->>ST: Admin() 已存在 → 40902
     API->>API: ValidatePassword → 40001/42201
-    API->>SEC: Present() 密钥文件已存在 → 40903
+    API->>SEC: Reload() 密钥文件存在/不可用 → 40903
     API->>AUTH: HashPassword(argon2id)
     API->>ST: CreateAdmin(hash) ON CONFLICT DO NOTHING → 0 行则 40902
     API->>SEC: Create() O_EXCL 0600 写密钥文件（失败则 DeleteAdmin 补偿）
@@ -56,7 +56,7 @@ sequenceDiagram
 图渲染不出来时的同义结构：
 
 ```text
-init:   Admin()? → 40902 | ValidatePassword → 40001/42201 | Present()? → 40903 | hash → INSERT admin_user → CREATE key file (O_EXCL)
+init:   Admin()? → 40902 | ValidatePassword → 40001/42201 | Reload()? → 40903 | hash → INSERT admin_user → CREATE key file (O_EXCL)
 login:  Admin() → VerifyPassword → INSERT admin_session → Set-Cookie + csrf_token
 write:  Cookie → Session(token_hash) → 过期判定 → CSRF 头比对 → 业务写入
 ```
@@ -166,6 +166,7 @@ type Manager struct { /* path + 内存中的 Key + RWMutex */ }
 
 func NewManager(path string) *Manager
 func (m *Manager) Load() (bool, error)      // 启动时调用；文件不存在返回 (false, nil)
+func (m *Manager) Reload() (bool, error)    // 运行期对账：先读后换，仅文件不存在时清空内存
 func (m *Manager) Present() bool            // 是否已有可用密钥
 func (m *Manager) Create() (Key, error)     // O_EXCL + 0600 写文件并装入内存；已存在 → model.ErrKeyExists
 func (m *Manager) Current() (Key, error)    // 未装载 → model.ErrKeyUnavailable
@@ -231,7 +232,7 @@ func (l *failureLimiter) Reset(source string)
 
 约束：
 
-- **初始化顺序**固定：管理员存在 → 40902（不读密钥文件、不哈希）；密码不合法 → 40001/42201；密钥文件存在 → 40903；随后才哈希与插入记录。这样被拒请求的代价只有一次主键查询，CP3/CP4 也各自成立。
+- **初始化顺序**固定：管理员存在 → 40902（不读密钥文件、不哈希）；密码不合法 → 40001/42201；`Reload()` 对账后密钥文件存在或不可用 → 40903（不建管理员、不补偿）；随后才哈希与插入记录。这样 40902 的代价只有一次主键查询；40903 视文件是否可用为 1–2 次管理员查询 + 1 次文件读取；CP3/CP4 也各自成立。
 - 所有管理端响应（含错误）带 `Cache-Control: no-store`；初始化响应另带 `Pragma: no-cache`。
 - 写请求体解析前先 `http.MaxBytesReader` 限 8 KiB，再要求 `Content-Type: application/json`（缺一即 `40001`）。
 - 401 响应同时下发清除 Cookie 的 `Set-Cookie`（`Max-Age=0`），避免前端在死 Cookie 上反复重试；正常下发用 `Max-Age=43200`。
@@ -306,7 +307,7 @@ var (
 - CP1 **单账号**：`admin_user` 行数恒 ≤ 1（`CHECK (id = 1)`）；初始化只创建 `id = 1`。
 - CP2 **明文密码不落库不落日志**：库里只有 PHC 串；日志字段是白名单（`request_id`、方法、路径、状态码、业务码）。
 - CP3 **初始化一次性**：管理员记录存在时初始化恒返回 40902，且不触碰密钥文件；并发 N 个初始化恰好 1 个成功，其余 40902。
-- CP4 **密钥一次性**：密钥只在初始化成功路径生成；密钥文件存在时初始化恒返回 40903 且文件内容不变；除初始化响应外任何响应体不含明文密钥，只含指纹。
+- CP4 **密钥一次性**：密钥只在初始化成功路径生成；密钥文件存在（含存在但不可用）时初始化恒返回 40903 且文件内容不变；除初始化响应外任何响应体不含明文密钥，只含指纹。
 - CP5 **令牌不可从库还原**：`admin_session.token_hash` 是 SHA-256，库里没有可用于认证的原文；Cookie 原文不落库、不落日志。
 - CP6 **过期确定**：会话有效当且仅当 `now < expires_at`，且 `expires_at = created_at + 12h`；无滑动续期、无「最后一次访问」依赖。
 - CP7 **写操作双校验**：写端点在解析业务体之前完成「有效会话 → CSRF 一致」两步；任一步失败时 store 的写方法调用次数为 0（替身断言）。
@@ -327,7 +328,7 @@ var (
 | `Content-Type` 不是 `application/json` | 400 | 40001 | 同上（防表单型 CSRF 的兜底层） |
 | 两次密码不一致 / 少于 12 码点 / 超过 256 码点 | 422 | 42201 | 响应文案指出「两次不一致」或「长度不足」，不含提交值 |
 | 已存在管理员记录 | 409 | 40902 | 保持原记录；前端切到登录页 |
-| 密钥文件已存在 | 409 | 40903 | 保持原密钥；提示运维先移除密钥文件再重新初始化 |
+| 密钥文件已存在或不可用 | 409 | 40903 | 保持原密钥与管理员记录；提示运维先移除或修复密钥文件再重新初始化 |
 | 密码错误 / 未初始化时登录 / 无会话 / 会话过期 / 哈希串损坏 | 401 | 40101 | 统一文案「凭据无效或会话已过期」，并清 Cookie |
 | 当前密码错误 | 401 | 40101 | 保持哈希与会话不变 |
 | 写请求没有有效会话（缺失、过期、记录不存在） | 401 | 40101 | 不执行业务写入，并清 Cookie |

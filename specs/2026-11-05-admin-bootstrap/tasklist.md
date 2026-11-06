@@ -49,8 +49,8 @@
 
 - [ ] 9. GET /api/admin/state 与 POST /api/admin/init
   - `state` 返回 `{initialized, authenticated, expires_at, csrf_token, key_fingerprint}`，未登录时后三项为 null，并走公开 60 次/分钟限流
-  - `init` 固定顺序：`Admin()` 已存在 → 40902 → 校验密码（40001/42201）→ `Present()` 密钥已存在 → 40903 → 哈希 → `CreateAdmin` → `Create()` 写密钥；响应含一次性 `encryption_key`、`key_algorithm`、`key_fingerprint` 与 `Cache-Control: no-store`
-  - `Create()` 失败时 `DeleteAdmin` 补偿并返回 50000，补偿失败记 `init_compensation_failed`；被拒请求不计算哈希、不读写密钥文件
+  - `init` 固定顺序：`Admin()` 已存在 → 40902 → 校验密码（40001/42201）→ `Reload()` 对账，密钥存在或不可用 → 40903 → 哈希 → `CreateAdmin` → `Create()` 写密钥；响应含一次性 `encryption_key`、`key_algorithm`、`key_fingerprint` 与 `Cache-Control: no-store`
+  - `Create()` 失败时 `DeleteAdmin` 补偿并返回 50000，补偿失败记 `init_compensation_failed`；被拒请求不计算哈希、不写密钥文件（init 会 `Reload` 读一次）
   - 并发用例：50 个请求同时初始化，恰好 1 个 200、其余 40902，密钥文件只出现一次
 
 - [ ] 10. 登录与退出

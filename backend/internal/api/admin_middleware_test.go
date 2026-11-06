@@ -51,6 +51,23 @@ func (s *adminStoreStub) Session(_ context.Context, tokenHash string) (model.Adm
 	return s.session, s.found, s.sessionErr
 }
 
+// Admin 是接口补齐：中间件用例不走初始化与状态查询，按「没有管理员」返回。
+func (s *adminStoreStub) Admin(context.Context) (model.AdminUser, bool, error) {
+	return model.AdminUser{}, false, nil
+}
+
+// CreateAdmin 是接口补齐；写方法计数保持完整，供「被门拦下时写调用为 0」的断言使用。
+func (s *adminStoreStub) CreateAdmin(context.Context, string, time.Time) (model.AdminUser, bool, error) {
+	s.writeCalls++
+	return model.AdminUser{}, false, nil
+}
+
+// DeleteAdmin 是接口补齐；同样计入写方法调用次数。
+func (s *adminStoreStub) DeleteAdmin(context.Context) error {
+	s.writeCalls++
+	return nil
+}
+
 // UpdatePassword 记一次写调用；真实业务在改密时调用。
 func (s *adminStoreStub) UpdatePassword(context.Context, string, time.Time) error {
 	s.writeCalls++

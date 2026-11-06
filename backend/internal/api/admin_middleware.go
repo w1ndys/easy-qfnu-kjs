@@ -4,7 +4,7 @@ package api
 // 与日志字段白名单。
 // 管理端写端点的顺序固定为 no-store → 体门 → 会话 → CSRF → 业务：任何一步失败都不进入下一步，
 // 因此「缺会话 / 缺 CSRF 时业务写方法调用为 0」由链路结构保证，而不是靠每个 handler 自觉（CP7）。
-// 业务处理器（state/init/session/password）由后续任务注册，这里只提供可组合的中间件与解析入口。
+// state/init 已在 admin.go 注册；登录、退出、改密由后续任务注册。这里只提供可组合的中间件与解析入口。
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"time"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/auth"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
@@ -43,9 +44,12 @@ const (
 // adminStore 是管理端在 api 层声明的消费侧接口，口径与设计中的 auth.AdminStore 一致
 // （auth 包当前还没有落地 store.go）：
 // 接口由使用方定义，store.AdminRepo 靠同名方法结构匹配，store 不反向 import api。
-// 本任务（中间件）只需要读会话；后续任务用到写方法时直接往这里加方法，
+// 这里只列出已实现的端点用到的方法；登录、退出与改密（后续任务）再补 InsertSession 等方法，
 // Server.admin 的赋值点不用改，store.AdminRepo 继续匹配。
 type adminStore interface {
+	Admin(ctx context.Context) (model.AdminUser, bool, error)
+	CreateAdmin(ctx context.Context, passwordHash string, now time.Time) (model.AdminUser, bool, error)
+	DeleteAdmin(ctx context.Context) error
 	Session(ctx context.Context, tokenHash string) (model.AdminSession, bool, error)
 }
 
@@ -62,8 +66,8 @@ type adminSessionKey struct{}
 // 中间件拿不到，抄进日志的 id 就会和响应里那个对不上，排障时反而误导。本项不改 response.go 的 s.fail，
 // 所以由管理端链路自己生成一次 id，再用同一个 writeJSON 把信封写出去（形状与 s.fail 完全一致）。
 //
-// 只用在会话与装配这类需要留痕的失败上；请求体与 CSRF 令牌的客户端错误仍走 s.fail、不记日志，
-// 免得每个走错的请求都刷一行日志。
+// 只用在会话、装配与密钥文件不可用这类需要留痕的失败上；请求体与 CSRF 令牌的客户端错误
+// 仍走 s.fail、不记日志，免得每个走错的请求都刷一行日志。
 func (s *Server) adminFail(w http.ResponseWriter, r *http.Request, status, code int, logMsg, message string) {
 	id := newRequestID()
 	// 字段集中构造一次，两个级别共用：将来加字段只改一处，也不会让 4xx 与 5xx 的字段集合漂移。
