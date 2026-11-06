@@ -118,6 +118,7 @@ linters:
             - github.com/w1ndys/easy-qfnu-kjs/internal/store
 
         # HTTP 层：编排与查询都从这一层进，不直接访问上游。
+        # auth 只被管理端中间件用来判定会话有效性与比对 CSRF，属于纯函数调用，没有反向依赖。
         api:
           files:
             - "**/internal/api/**"
@@ -130,3 +131,4 @@ linters:
             - github.com/w1ndys/easy-qfnu-kjs/internal/stats
             - github.com/w1ndys/easy-qfnu-kjs/internal/store
             - github.com/w1ndys/easy-qfnu-kjs/internal/config
+            - github.com/w1ndys/easy-qfnu-kjs/internal/auth

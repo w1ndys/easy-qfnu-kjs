@@ -54,6 +54,11 @@ type Server struct {
 	limiter      *rateLimiter         // 公开查询的按来源限流器
 	trustProxy   bool                 // 是否信任前置反代给出的来源头
 	recorder     StatsRecorder        // 访问统计记账入口；nil 表示不记账
+	admin        adminStore           // 管理端数据来源；nil 表示未装配，管理端点按内部错误处理
+	// adminCookieSecure 决定管理会话 Cookie 是否带 Secure：默认 true，
+	// 只有本地 http 开发才关掉（浏览器不会在 http 上保存 Secure Cookie）。
+	// 下发票据与清除 Cookie 必须用同一个值，否则死 Cookie 删不掉。
+	adminCookieSecure bool
 }
 
 // Option 是 API 层的可选装配项；不传时按默认口径工作：60 次/分钟、信任前置反代。
@@ -88,6 +93,8 @@ func New(log *slog.Logger, health Pinger, ctxSvc ContextProvider, availability A
 		limiter:      newRateLimiter(rateLimitMaxPerWindow, rateLimitWindow),
 		// design D2 的部署拓扑是 web 反代 /api 到 server，默认按可信反代取来源。
 		trustProxy: true,
+		// 安全默认：未显式配置时管理会话 Cookie 带 Secure（ADMIN_COOKIE_SECURE 默认 true）。
+		adminCookieSecure: true,
 	}
 	for _, opt := range opts {
 		opt(s)
