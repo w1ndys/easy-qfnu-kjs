@@ -5,7 +5,7 @@ package api
 //   POST /api/admin/init   首次初始化：设密码并一次性生成加密密钥，走失败计数限流
 //
 // 两个端点都不要求会话：state 靠 Cookie 是否命中有效会话自行判定 authenticated，
-// init 必须在登录之前就能调用。登录、退出与改密的处理器属于后续任务，不在本文件。
+// init 必须在登录之前就能调用。登录、退出与改密的处理器在 admin_session.go。
 
 import (
 	"context"
@@ -298,20 +298,34 @@ func (s *Server) adminInit(w http.ResponseWriter, r *http.Request) {
 
 // rejectInitPassword 把 auth.ValidatePassword 的哨兵错误映射成 42201 文案，
 // 并把这次失败计入来源限流（这是唯一计入失败的初始化拒绝，理由见 adminInitLimited）。
-// 文案只描述规则、不回显提交值，避免密码片段进响应与日志。
+// 文案本身由 passwordRuleMessage 统一给出，与改密共用同一份，避免两处措辞漂移。
 func (s *Server) rejectInitPassword(w http.ResponseWriter, r *http.Request, err error) {
 	if s.initLimiter != nil {
 		s.initLimiter.Fail(clientSource(r, s.trustProxy), s.currentTime())
 	}
+	s.fail(w, http.StatusUnprocessableEntity, codePasswordInvalid, passwordRuleMessage(err))
+}
+
+// passwordRuleMessage 把 auth.ValidatePassword 的哨兵错误翻成 42201 的对外文案。
+// 初始化（rejectInitPassword）与改密（adminPassword）共用这一份：两条链路对「哪条规则没过」
+// 的措辞必须一致，前端只按文案提示用户改哪一栏。
+//
+// 这里只做纯映射，副作用留在两个调用点：init 要顺手计入 initLimiter，改密不计数
+// （请求已过会话与 CSRF 双校验，见 rejectAdminCurrentPassword 的注释）。为了去重把限流
+// 塞进公共函数，会让改密莫名其妙地往初始化限流器里记账。
+//
+// 文案只描述规则、不回显提交值（可能是密码本身），也不含解析器细节；
+// 未知哨兵退化成通用句，不把 err.Error() 透出去。
+func passwordRuleMessage(err error) string {
 	switch {
 	case errors.Is(err, auth.ErrPasswordMismatch):
-		s.fail(w, http.StatusUnprocessableEntity, codePasswordInvalid, "两次密码不一致")
+		return "两次密码不一致"
 	case errors.Is(err, auth.ErrPasswordTooShort):
-		s.fail(w, http.StatusUnprocessableEntity, codePasswordInvalid, "密码长度不足 12 个字符")
+		return "密码长度不足 12 个字符"
 	case errors.Is(err, auth.ErrPasswordTooLong):
-		s.fail(w, http.StatusUnprocessableEntity, codePasswordInvalid, "密码过长")
+		return "密码过长"
 	default:
-		s.fail(w, http.StatusUnprocessableEntity, codePasswordInvalid, "密码不符合要求")
+		return "密码不符合要求"
 	}
 }
 

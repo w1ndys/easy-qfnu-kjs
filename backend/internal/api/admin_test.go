@@ -708,25 +708,30 @@ func TestAdminInitContentTypeGatePrecedesAdminCheck(t *testing.T) {
 
 // TestAdminInitPasswordValidation 覆盖第二道门：密码规则不符 42201、请求体问题 40001；
 // 两类拒绝都不哈希、不写管理员、不碰密钥文件（Requirement 2.1、2.2、错误表）。
+//
+// 42201 的用例都带 wantMessage 并逐字比对：init 与改密共用同一份 passwordRuleMessage，
+// 文案本身就是契约（前端只按文案提示用户改哪一栏）。只断言业务码会放过「init 侧改成
+// 另一句话、改密侧没跟着改」这类漂移，所以这里把 init 侧的原文也钉死。
 func TestAdminInitPasswordValidation(t *testing.T) {
 	cases := []struct {
-		name       string
-		body       string
-		wantStatus int
-		wantCode   int
+		name        string
+		body        string
+		wantStatus  int
+		wantCode    int
+		wantMessage string
 	}{
 		{"两次不一致", initJSON(t, ptr(testAdminPassword), ptr(testAdminPassword+"x")),
-			http.StatusUnprocessableEntity, codePasswordInvalid},
+			http.StatusUnprocessableEntity, codePasswordInvalid, "两次密码不一致"},
 		{"少于 12 码点", initJSON(t, ptr("short"), ptr("short")),
-			http.StatusUnprocessableEntity, codePasswordInvalid},
+			http.StatusUnprocessableEntity, codePasswordInvalid, "密码长度不足 12 个字符"},
 		{"超过 256 码点", initJSON(t, ptr(strings.Repeat("a", 257)), ptr(strings.Repeat("a", 257))),
-			http.StatusUnprocessableEntity, codePasswordInvalid},
+			http.StatusUnprocessableEntity, codePasswordInvalid, "密码过长"},
 		{"缺少确认字段", initJSON(t, ptr(testAdminPassword), nil),
-			http.StatusBadRequest, codeBadRequest},
+			http.StatusBadRequest, codeBadRequest, ""},
 		{"缺少密码字段", initJSON(t, nil, ptr(testAdminPassword)),
-			http.StatusBadRequest, codeBadRequest},
+			http.StatusBadRequest, codeBadRequest, ""},
 		{"不是合法 JSON", `{"password":`,
-			http.StatusBadRequest, codeBadRequest},
+			http.StatusBadRequest, codeBadRequest, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -738,7 +743,16 @@ func TestAdminInitPasswordValidation(t *testing.T) {
 			rec := serveAdmin(srv, newInitRequest(tc.body))
 			hashAfter := auth.HashCallCount()
 
-			decodeAdminFailure(t, rec, tc.wantStatus, tc.wantCode)
+			failure := decodeAdminFailure(t, rec, tc.wantStatus, tc.wantCode)
+			// 42201 必须给出并逐字核对文案；40001 的文案不在这里锁（由 decodeAdminFailure 保证非空）。
+			if tc.wantCode == codePasswordInvalid {
+				if tc.wantMessage == "" {
+					t.Fatal("42201 用例必须给出 wantMessage")
+				}
+				if failure.Message != tc.wantMessage {
+					t.Fatalf("文案期望 %q，实际 %q", tc.wantMessage, failure.Message)
+				}
+			}
 			assertNoStore(t, rec)
 			if hashAfter != hashBefore {
 				t.Fatalf("密码校验失败不应哈希，实际增加 %d 次", hashAfter-hashBefore)

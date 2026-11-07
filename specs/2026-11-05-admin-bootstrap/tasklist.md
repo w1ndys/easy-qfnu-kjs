@@ -61,7 +61,7 @@
 
 - [ ] 11. 改密与全量会话失效
   - `POST /api/admin/password`：校验当前密码 → 新密码两次一致且 ≥12 码点 → `UpdatePassword` → `DeleteAllSessions`
-  - 当前密码错误返回 40101 且不改哈希；新旧密码同时过 `ValidatePassword` 规则，违反返回 42201
+  - 当前密码错误返回 40101 且不改哈希；当前密码只校验是否正确；新密码两次一致且 ≥12 码点（只验新密码，支持历史短密码），违反返回 42201
   - 成功后返回 `{relogin_required:true}` 并清 Cookie；改密前签发的任意 Cookie 后续请求返回 40101
   - 用例断言改密后 `admin_session` 行数为 0，且 `password_updated_at` 前移
 

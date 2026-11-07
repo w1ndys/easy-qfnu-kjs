@@ -127,13 +127,15 @@ func (s *Server) Handler() http.Handler {
 	// 管理端引导：state 是公开读端点（未登录也 200），走公开限流；
 	// init 必须在登录之前可用，因此只复用写链路的体门（withJSONBody），不挂会话与 CSRF。
 	// 登录（POST session）同样没有会话可校验，挂失败计数限流与体门；
-	// 退出（DELETE session）走 adminWrite：no-store → 体门 → 会话 → CSRF → 业务。
+	// 退出（DELETE session）与改密（POST password）走 adminWrite：
+	// no-store → 体门 → 会话 → CSRF → 业务。
 	// 这些响应都包在可组合的 withNoStore 里，保证连 429/500 的错误响应也带 no-store（CP11）；
 	// 404/405 由 ServeMux 自己写出、不经过 handler，由返回前的 withAdminNoStore 按前缀兜住。
 	mux.Handle("GET /api/admin/state", withNoStore(s.adminStateLimited(s.adminState)))
 	mux.Handle("POST /api/admin/init", withNoStore(s.adminInitLimited(s.withJSONBody(s.adminInit))))
 	mux.Handle("POST /api/admin/session", withNoStore(s.adminLoginLimited(s.withJSONBody(s.adminLogin))))
 	mux.Handle("DELETE /api/admin/session", s.adminWrite(s.adminLogout))
+	mux.Handle("POST /api/admin/password", s.adminWrite(s.adminPassword))
 	return withAdminNoStore(mux)
 }
 

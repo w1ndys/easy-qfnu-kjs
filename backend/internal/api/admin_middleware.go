@@ -4,7 +4,8 @@ package api
 // 与日志字段白名单。
 // 管理端写端点的顺序固定为 no-store → 体门 → 会话 → CSRF → 业务：任何一步失败都不进入下一步，
 // 因此「缺会话 / 缺 CSRF 时业务写方法调用为 0」由链路结构保证，而不是靠每个 handler 自觉（CP7）。
-// state/init 已在 admin.go 注册；登录与退出在 admin_session.go 注册，改密由后续任务注册。
+// state/init 的处理器在 admin.go、路由在 api.go 注册；登录、退出与改密的处理器在
+// admin_session.go，路由同样在 api.go 注册。五个端点都经由本文件提供的中间件，
 // 这里只提供可组合的中间件与解析入口。
 
 import (
@@ -46,15 +47,17 @@ const (
 // （auth 包当前还没有落地 store.go）：
 // 接口由使用方定义，store.AdminRepo 靠同名方法结构匹配，store 不反向 import api。
 // 这里只列出已实现的端点用到的方法：登录补 InsertSession 与 DeleteExpiredSessions，
-// 退出补 DeleteSession；改密（后续任务）再补 UpdatePassword 与 DeleteAllSessions。
+// 退出补 DeleteSession，改密补 UpdatePassword 与 DeleteAllSessions。
 // Server.admin 的赋值点不用改，store.AdminRepo 继续匹配。
 type adminStore interface {
 	Admin(ctx context.Context) (model.AdminUser, bool, error)
 	CreateAdmin(ctx context.Context, passwordHash string, now time.Time) (model.AdminUser, bool, error)
 	DeleteAdmin(ctx context.Context) error
+	UpdatePassword(ctx context.Context, passwordHash string, now time.Time) error
 	InsertSession(ctx context.Context, session model.AdminSession) error
 	Session(ctx context.Context, tokenHash string) (model.AdminSession, bool, error)
 	DeleteSession(ctx context.Context, tokenHash string) error
+	DeleteAllSessions(ctx context.Context) (int64, error)
 	DeleteExpiredSessions(ctx context.Context, now time.Time) (int64, error)
 }
 

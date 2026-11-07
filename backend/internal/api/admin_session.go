@@ -1,14 +1,15 @@
 package api
 
-// 本文件实现管理端登录与退出（tasklist 第 10 项）：
-//   POST   /api/admin/session  用固定账号 admin 的密码登录，建立 12 小时服务端会话并下发 Cookie
-//   DELETE /api/admin/session  退出登录：删除会话记录并清除 Cookie
+// 本文件实现管理端的会话管理（tasklist 第 10、11 项）：
+//   POST   /api/admin/session   用固定账号 admin 的密码登录，建立 12 小时服务端会话并下发 Cookie
+//   DELETE /api/admin/session   退出登录：删除会话记录并清除 Cookie
+//   POST   /api/admin/password  改密：校验当前密码 → 写新哈希 → 收回全部会话
 //
 // 登录不挂会话/CSRF 中间件（此时还没有会话），只挂失败计数限流与请求体门；
-// 退出走 adminWrite（no-store → 体门 → 会话 → CSRF），与后续的改密同一条写链路。
-// 改密（POST /api/admin/password）属于 task 11，不在本文件。
+// 退出与改密走 adminWrite（no-store → 体门 → 会话 → CSRF），是同一条写链路。
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"time"
@@ -42,6 +43,22 @@ type adminLoginResponse struct {
 // adminLogoutResponse 是退出成功响应；字段集合只有 logged_out（Requirement 9.2）。
 type adminLogoutResponse struct {
 	LoggedOut bool `json:"logged_out"`
+}
+
+// adminPasswordRequest 是 POST /api/admin/password 的请求体。
+// 三个字段都用指针：缺字段是 40001（错误表「字段缺失」），提交空串则照常往下走——
+// 当前密码空串是一次确定的错误密码（40101），新密码空串是长度不足（42201）。
+// 两者混成一种错误会让前端没法区分「没填」与「填错了」，所以按指针区分。
+type adminPasswordRequest struct {
+	CurrentPassword    *string `json:"current_password"`
+	NewPassword        *string `json:"new_password"`
+	NewPasswordConfirm *string `json:"new_password_confirm"`
+}
+
+// adminPasswordResponse 是改密成功响应。改密会删掉全部会话，所以客户端必须重新登录；
+// 字段集合只有 relogin_required（Requirement 8.4、9.2）。
+type adminPasswordResponse struct {
+	ReloginRequired bool `json:"relogin_required"`
 }
 
 // adminLoginLimited 是登录端点的失败计数门：同一来源 60 秒窗口内累计 5 次凭据失败后，
@@ -209,4 +226,131 @@ func (s *Server) adminLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, s.adminCookie("", -1))
 	s.ok(w, adminLogoutResponse{LoggedOut: true})
+}
+
+// adminPassword 处理改密与全量会话失效（tasklist 第 11 项、Requirement 8）。顺序固定：
+//
+//	解析体/缺字段 → 40001
+//	读管理员 → 校验当前密码 → 40101（不写哈希、不删会话、不清 Cookie）
+//	新密码两次一致且 ≥12 码点 → 42201（不写哈希、不删会话、不清 Cookie）
+//	哈希 → UpdatePassword → DeleteAllSessions → 清 Cookie + {relogin_required:true}
+//
+// 当前密码排在前面是有意的：它决定「这次请求有没有资格改密」。当前密码错了就只回 40101，
+// 不让「新密码格式不合规」的 42201 盖住真正的问题——否则前端会提示用户去改新密码，
+// 而实际要改的是当前密码那一栏。代价是当前密码正确、新密码不合规时要白算一次 argon2；
+// 请求已通过会话与 CSRF 双校验，这点开销换「错误原因不串味」是值得的。
+//
+// 失败口径逐条写清：
+//   - 当前密码错误：40101 统一文案，保持哈希与会话不变，也不清 Cookie——Requirement 8.2
+//     要求「保持密码哈希与会话不变」，而会话本身确实仍然有效，清 Cookie 等于因为一次
+//     手误就把人踢回登录页；这点与 rejectAdminLogin（登录失败清 Cookie）不同。
+//   - 哈希串损坏：没有可用的当前密码可比对，对外同样 40101，原因只进日志（Requirement 2.5）。
+//   - 新密码不合规：42201，文案只说规则、不回显提交值（错误表「不含提交值」）。
+//   - UpdatePassword 失败：50000，哈希没变、会话还在，客户端可以原样重试。
+//   - DeleteAllSessions 失败：50000 且不清 Cookie。密码此时已经改了、会话却没收回去，
+//     CP8 要求「改密成功后行数为 0」，所以不能假装成功；当前会话仍然有效，用户拿新密码
+//     重试一次即可。这里不回滚密码——旧哈希已经不可取回，回滚没有依据。
+//
+// 成功后旧 Cookie 为什么立即失效：DeleteAllSessions 把 admin_session 清空，任何改密前
+// 签发的 Cookie 在下一次 withSession 里都查不到记录，直接 40101（CP8）。
+func (s *Server) adminPassword(w http.ResponseWriter, r *http.Request) {
+	if s.admin == nil {
+		// 链内不可达（withSession 先拦），留分支让直接调用时显式暴露成 50000。
+		s.adminFail(w, r, http.StatusInternalServerError, codeInternal, "管理端数据来源未装配", "内部错误")
+		return
+	}
+
+	var body adminPasswordRequest
+	if !s.decodeAdminBody(w, r, &body) {
+		return
+	}
+	if body.CurrentPassword == nil || body.NewPassword == nil || body.NewPasswordConfirm == nil {
+		s.fail(w, http.StatusBadRequest, codeBadRequest,
+			"缺少 current_password、new_password 或 new_password_confirm")
+		return
+	}
+
+	ctx := r.Context()
+	user, found, err := s.admin.Admin(ctx)
+	if err != nil {
+		s.adminFail(w, r, http.StatusInternalServerError, codeInternal, "读取管理员失败", "内部错误")
+		return
+	}
+	if !found {
+		// 有效会话却查不到管理员记录（记录被删、初始化被绕过）：没有哈希可校验，按凭据失败处理。
+		// 与登录的「尚未初始化」是同一业务码与文案、不同出口：登录走 rejectAdminLogin，会
+		// loginLimiter.Fail 并清 Cookie；改密走 rejectAdminCurrentPassword，两者都不做。
+		// 文案一致才让外部无法区分这两种情况（Requirement 4.4、8.2）。
+		s.rejectAdminCurrentPassword(w, r, "尚未初始化")
+		return
+	}
+
+	ok, err := auth.VerifyPassword(user.PasswordHash, *body.CurrentPassword)
+	if err != nil {
+		// 解析失败发生在 argon2 之前；响应与普通密码错误完全相同，原因只进日志。
+		s.rejectAdminCurrentPassword(w, r, "密码哈希损坏")
+		return
+	}
+	if !ok {
+		s.rejectAdminCurrentPassword(w, r, "当前密码错误")
+		return
+	}
+
+	// 当前密码通过之后才校验新密码：不会对新密码调用 HashPassword；
+	// 因当前密码先校验，仍会消耗一次 VerifyPassword。
+	// 规则与初始化完全同一份 auth.ValidatePassword，文案也同一份 passwordRuleMessage，
+	// 改密不允许出现更宽的密码，也不允许两处对同一条规则给出不同措辞。
+	if err := auth.ValidatePassword(*body.NewPassword, *body.NewPasswordConfirm); err != nil {
+		s.fail(w, http.StatusUnprocessableEntity, codePasswordInvalid, passwordRuleMessage(err))
+		return
+	}
+
+	hash, err := auth.HashPassword(*body.NewPassword)
+	if err != nil {
+		s.adminFail(w, r, http.StatusInternalServerError, codeInternal, "生成密码哈希失败", "内部错误")
+		return
+	}
+
+	// 时间取注入时钟，与登录/会话同一来源：password_updated_at 必须前移到这次改密的时刻。
+	now := s.currentTime()
+	if err := s.admin.UpdatePassword(ctx, hash, now); err != nil {
+		s.adminFail(w, r, http.StatusInternalServerError, codeInternal, "更新管理员密码失败", "内部错误")
+		return
+	}
+
+	// 新哈希落库之后才收回全部会话：顺序反过来会在「密码没写成、会话却没了」时
+	// 把用户锁在门外（还得靠运维重置）。删全部而不是删当前这条，是因为改密后
+	// 其它设备上的旧登录同样不该继续有效（Requirement 8.3、CP8）。
+	//
+	// 这一步不跟客户端的 ctx 走：密码此刻已经写进库，若客户端在响应前断开、r.Context()
+	// 被取消，清理就会失败，会话永远收不回去，旧 Cookie 继续可用（CP8 要求改密成功后
+	// 行数为 0）。所以和 admin.go 的补偿同一做法——context.WithoutCancel 摘掉取消与
+	// 截止时间、保留 ctx 里的值，再配 adminCompensateTimeout 兜住真正卡死的库。
+	// 上面几步（读管理员、写新哈希）仍用请求 ctx：它们没做成时本就该随客户端一起放弃。
+	revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), adminCompensateTimeout)
+	defer cancel()
+	if _, err := s.admin.DeleteAllSessions(revokeCtx); err != nil {
+		s.adminFail(w, r, http.StatusInternalServerError, codeInternal, "清理全部管理会话失败", "内部错误")
+		return
+	}
+
+	// 全部会话已删，客户端手里的 Cookie 已经是一张死票；这里主动清掉，
+	// 免得前端拿它反复重试（design「401 响应同时下发清除 Cookie」同一思路）。
+	http.SetCookie(w, s.adminCookie("", -1))
+	s.ok(w, adminPasswordResponse{ReloginRequired: true})
+}
+
+// rejectAdminCurrentPassword 是「当前密码校验失败」的出口：40101 统一文案，且不清 Cookie。
+// 与 rejectAdminLogin 的两处差异都是有意的：
+//   - 不计入 loginLimiter：这个请求已经通过会话与 CSRF 双校验，不是登录端点；
+//     登录限流的口径只覆盖「猜登录密码」，在这里计数只会让合法用户在几次手误后
+//     连改密都做不了（Requirement 7 只约束登录与初始化）。
+//   - 不清 Cookie：Requirement 8.2 要求「保持密码哈希与会话不变」，会话仍然有效，
+//     清掉客户端 Cookie 会因为一次输错就把用户踢回登录页。
+//
+// 文案复用 adminCredentialsInvalidMessage，不新增第二份字面量；原因类别只进日志文案，
+// 且都是本文件写死的短句，不含密码与令牌（CP2）。
+func (s *Server) rejectAdminCurrentPassword(w http.ResponseWriter, r *http.Request, reason string) {
+	s.adminFail(w, r, http.StatusUnauthorized, codeSessionInvalid, "改密失败："+reason,
+		adminCredentialsInvalidMessage)
 }
