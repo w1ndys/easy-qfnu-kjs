@@ -27,6 +27,10 @@ const (
 	defaultListenAddr = ":18080"
 	// defaultOCRTimeout 是未显式配置 OCR 超时时的默认值。
 	defaultOCRTimeout = 10 * time.Second
+	// defaultSecretKeyPath 是加密密钥文件的默认位置（design D2）。
+	// 目录不存在时由 secret.Manager.Create 在初始化写入前按 0700 补建，
+	// 所以这里只给路径，不在启动期创建任何东西。
+	defaultSecretKeyPath = "/var/lib/easy-qfnu-kjs/secret.key"
 )
 
 // Config 是启动所需的非秘密配置。
@@ -36,14 +40,18 @@ type Config struct {
 	LogLevel          LogLevel      // 日志级别
 	OCRTimeout        time.Duration // OCR 请求超时，必须为正
 	TrustProxyHeaders bool          // 是否信任前置反代给出的来源头（X-Forwarded-For / X-Real-IP）
+	SecretKeyPath     string        // 加密密钥文件路径；只给路径，文件由管理端初始化写出
+	AdminCookieSecure bool          // 管理会话 Cookie 是否带 Secure；默认 true，本地 http 开发需显式关闭
 }
 
 // Load 读取并校验环境变量，任一项不合法即返回错误，供入口拒绝启动。
 func Load() (Config, error) {
 	cfg := Config{
-		ListenAddr: defaultListenAddr,
-		LogLevel:   LogInfo,
-		OCRTimeout: defaultOCRTimeout,
+		ListenAddr:        defaultListenAddr,
+		LogLevel:          LogInfo,
+		OCRTimeout:        defaultOCRTimeout,
+		SecretKeyPath:     defaultSecretKeyPath,
+		AdminCookieSecure: true,
 		// design D2 的部署拓扑里 server 只被 web 反代访问，默认信任反代来源头；
 		// server 若被直接暴露给客户端，必须设 TRUST_PROXY_HEADERS=false，否则来源可被伪造。
 		TrustProxyHeaders: true,
@@ -89,6 +97,22 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("%w: TRUST_PROXY_HEADERS 只接受 true/false/1/0，收到 %q", model.ErrConfigInvalid, raw)
 		}
 		cfg.TrustProxyHeaders = enabled
+	}
+
+	// 密钥路径只要求最终非空：空串与未设置同义，都落到设计默认路径；绝对/相对路径、
+	// 父目录存不存在都留给 secret.Manager，启动期不碰文件系统（design「配置项」）。
+	if raw := os.Getenv("SECRET_KEY_PATH"); raw != "" {
+		cfg.SecretKeyPath = raw
+	}
+
+	if raw := os.Getenv("ADMIN_COOKIE_SECURE"); raw != "" {
+		enabled, err := strconv.ParseBool(raw)
+		// 与管理 Cookie 的 Secure 属性直接相关：拼错时静默默认 true 会让本地 http 开发
+		// 的浏览器直接丢弃 Cookie，且很难从现象反推配置写错，所以照 TRUST_PROXY_HEADERS 当场失败。
+		if err != nil {
+			return Config{}, fmt.Errorf("%w: ADMIN_COOKIE_SECURE 只接受 true/false/1/0，收到 %q", model.ErrConfigInvalid, raw)
+		}
+		cfg.AdminCookieSecure = enabled
 	}
 
 	return cfg, nil

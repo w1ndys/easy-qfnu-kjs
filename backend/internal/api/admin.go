@@ -38,13 +38,22 @@ const adminCompensateTimeout = 5 * time.Second
 // WithAdmin 装配管理端的数据来源与密钥管理器；不传时两个管理端点仍注册，
 // 按 50000 返回（与 WithMeta 未装配即内部错误的既有做法一致），让 main.go 漏装配立刻暴露。
 //
-// 设计里的签名是 WithAdmin(auth.AdminStore, *secret.Manager)，但 auth 包目前没有落地
-// store.go；api 侧沿用 admin_middleware.go 的自有消费侧接口，store.AdminRepo 结构匹配。
-func WithAdmin(store adminStore, keys *secret.Manager) Option {
+// 数据来源的类型是 auth.AdminStore（消费侧接口，定义在 internal/auth/store.go）：
+// store.AdminRepo 靠同名方法结构匹配它，store 不 import auth。两边方法集是否一致由装配层的
+// 编译期断言 `var _ auth.AdminStore = store.AdminRepo{}` 兜住，漂移时在 build 阶段就失败。
+func WithAdmin(store auth.AdminStore, keys *secret.Manager) Option {
 	return func(s *Server) {
 		s.admin = store
 		s.keys = keys
 	}
+}
+
+// WithAdminCookieSecure 声明管理会话 Cookie 是否带 Secure 属性（配置项 ADMIN_COOKIE_SECURE，
+// 默认 true）。部署在 https 之后时保持默认；本地 http 开发必须显式关掉，否则浏览器直接丢弃
+// 这个 Cookie，而登录响应仍然是 200，现象会表现成「登录成功但立刻掉登录」。
+// 下发与清除共用 adminCookie，因此这里配置一次就同时管住两条出口，不会出现死 Cookie 删不掉。
+func WithAdminCookieSecure(enabled bool) Option {
+	return func(s *Server) { s.adminCookieSecure = enabled }
 }
 
 // adminStateResponse 是 GET /api/admin/state 的 data。
@@ -287,8 +296,8 @@ func (s *Server) adminInit(w http.ResponseWriter, r *http.Request) {
 	if s.initLimiter != nil {
 		s.initLimiter.Reset(clientSource(r, s.trustProxy))
 	}
-	// 明文密钥只在这个响应里出现一次：除 no-store 外再加 Pragma，兜住不看 Cache-Control 的老代理。
-	w.Header().Set("Pragma", "no-cache")
+	// 明文密钥只在这个响应里出现一次。Pragma: no-cache 由路由最外层的 withPragmaNoCache
+	// 统一给出（成功与错误响应都带），这里不再单独设置，避免只有成功路径带头。
 	s.ok(w, adminInitResponse{
 		EncryptionKey:  key.Export(),
 		KeyAlgorithm:   keyAlgorithm,

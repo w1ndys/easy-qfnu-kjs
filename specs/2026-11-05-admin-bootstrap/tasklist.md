@@ -66,7 +66,9 @@
   - 用例断言改密后 `admin_session` 行数为 0，且 `password_updated_at` 前移
 
 - [ ] 12. 检查点：装配、脱敏与端到端
-  - `main.go` 装配 `secret.NewManager(cfg.SecretKeyPath)`、`keys.Load()`、`store.NewAdminRepo(pool)`、`api.WithAdmin`；config 增加 `SECRET_KEY_PATH` 与 `ADMIN_COOKIE_SECURE`
+  - `main.go` 装配 `secret.NewManager(cfg.SecretKeyPath)`、`keys.Load()`、`store.NewAdminRepo(pool)`、`api.WithAdmin`、`api.WithAdminCookieSecure(cfg.AdminCookieSecure)`；config 增加 `SECRET_KEY_PATH`（空串=未设置=默认路径）与 `ADMIN_COOKIE_SECURE`（默认 true）；装配层加编译期断言 `var _ auth.AdminStore = store.AdminRepo{}`
+  - 启动期密钥缺失检查：`adminRepo.Admin` 包 5s 超时，失败按 `admin_query_failed` / `secret_key_missing` 两条 WARN 继续启动，只带 `path` 不记底层错误
   - depguard 补 `auth`（`$gostd`、`model`、`x/crypto/argon2`）与 `secret`（`$gostd`、`model`）规则；`api` allow 补两个新包
   - 日志脱敏用例：用哨兵密码走完 init/login/改密，断言日志不含哨兵、Cookie 值、`csrf_token` 与 `encryption_key`
+  - init 响应（经 handler 产生的 4xx/5xx 含 42901/40001/40902/40903/42201/50000）统一带 `Pragma: no-cache`；ServeMux 直接写出的 405 例外
   - 端到端：干净库迁移 → init → state → login → 带/不带 CSRF 写 → 改密 → 旧 Cookie 401 → 登出 → 清记录与密钥 → 重新 init；四条门禁全绿；有疑问询问用户

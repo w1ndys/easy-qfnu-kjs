@@ -65,6 +65,75 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+// TestLoadSecretKeyPath 覆盖密钥文件路径：未设置（或显式空串）时落到设计默认值，
+// 显式给出时原样采用。路径是否可用留给 secret.Manager，启动期不做文件检查。
+func TestLoadSecretKeyPath(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "未设置时用设计默认路径", raw: "", want: "/var/lib/easy-qfnu-kjs/secret.key"},
+		{name: "显式路径原样采用", raw: "/srv/keys/eqk.key", want: "/srv/keys/eqk.key"},
+		{name: "相对路径也照收", raw: "secret.key", want: "secret.key"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://u:p@127.0.0.1:5432/db")
+			t.Setenv("SECRET_KEY_PATH", c.raw)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("期望成功，实际 err=%v", err)
+			}
+			if cfg.SecretKeyPath != c.want {
+				t.Fatalf("SecretKeyPath 期望 %q，实际 %q", c.want, cfg.SecretKeyPath)
+			}
+		})
+	}
+}
+
+// TestLoadAdminCookieSecure 覆盖管理会话 Cookie 的 Secure 开关：默认开启（生产口径），
+// 可显式关闭（本地 http 开发），非法值拒绝启动。
+func TestLoadAdminCookieSecure(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    bool
+		wantErr bool
+	}{
+		{name: "未设置时默认开启", raw: "", want: true},
+		{name: "显式开启", raw: "true", want: true},
+		{name: "显式关闭供本地 http 开发", raw: "false", want: false},
+		{name: "用 0 关闭", raw: "0", want: false},
+		{name: "用 1 开启", raw: "1", want: true},
+		{name: "非法值拒绝启动", raw: "yes", wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://u:p@127.0.0.1:5432/db")
+			t.Setenv("ADMIN_COOKIE_SECURE", c.raw)
+
+			cfg, err := Load()
+			// 期望失败的分支一律校验错误可被 ErrConfigInvalid 识别。
+			if c.wantErr {
+				if !errors.Is(err, model.ErrConfigInvalid) {
+					t.Fatalf("期望 ErrConfigInvalid，实际 err=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("期望成功，实际 err=%v", err)
+			}
+			if cfg.AdminCookieSecure != c.want {
+				t.Fatalf("AdminCookieSecure 期望 %v，实际 %v", c.want, cfg.AdminCookieSecure)
+			}
+		})
+	}
+}
+
 // TestLoadTrustProxyHeaders 覆盖来源信任开关：默认信任前置反代，可显式关闭，非法值拒绝启动。
 func TestLoadTrustProxyHeaders(t *testing.T) {
 	cases := []struct {

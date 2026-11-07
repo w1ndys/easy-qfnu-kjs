@@ -647,6 +647,125 @@ func TestAdminInitSuccess(t *testing.T) {
 	}
 }
 
+// TestAdminInitPragmaOnFailureResponses 钉住「初始化端点的错误响应也带 Pragma: no-cache」
+// 这条统一口径：成功响应的断言在 TestAdminInitSuccess，这里补 40902/40903/42201/40001/50000
+// 与失败限流 42901。体门 40001 与 42901 发生在 handler 之外，所以这条头只能挂在路由最外层
+// （withPragmaNoCache），只写在成功路径里就会漏掉一半响应。
+// 末尾反向断言 state 带不上这条头：它属于初始化端点，不能顺手变成整个管理前缀的行为。
+func TestAdminInitPragmaOnFailureResponses(t *testing.T) {
+	validBody := initJSON(t, ptr(testAdminPassword), ptr(testAdminPassword))
+
+	cases := []struct {
+		name       string
+		setup      func(t *testing.T, store *adminRuntimeStore, keys *secret.Manager)
+		request    func(t *testing.T) *http.Request
+		wantStatus int
+		wantCode   int
+	}{
+		{
+			name:       "管理员已存在",
+			setup:      func(_ *testing.T, store *adminRuntimeStore, _ *secret.Manager) { store.userFound = true },
+			request:    func(*testing.T) *http.Request { return newInitRequest(validBody) },
+			wantStatus: http.StatusConflict,
+			wantCode:   codeAdminExists,
+		},
+		{
+			name: "密钥文件已存在",
+			setup: func(t *testing.T, _ *adminRuntimeStore, keys *secret.Manager) {
+				if _, err := keys.Create(); err != nil {
+					t.Fatalf("准备密钥失败: %v", err)
+				}
+			},
+			request:    func(*testing.T) *http.Request { return newInitRequest(validBody) },
+			wantStatus: http.StatusConflict,
+			wantCode:   codeKeyExists,
+		},
+		{
+			name: "密码规则不符",
+			request: func(t *testing.T) *http.Request {
+				return newInitRequest(initJSON(t, ptr(testAdminPassword), ptr(testAdminPassword+"x")))
+			},
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   codePasswordInvalid,
+		},
+		{
+			name:       "请求体不是合法 JSON",
+			request:    func(*testing.T) *http.Request { return newInitRequest(`{"password":`) },
+			wantStatus: http.StatusBadRequest,
+			wantCode:   codeBadRequest,
+		},
+		{
+			name: "Content-Type 体门",
+			request: func(*testing.T) *http.Request {
+				req := newInitRequest(validBody)
+				req.Header.Set("Content-Type", "text/plain")
+				return req
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   codeBadRequest,
+		},
+		{
+			name: "仓储失败",
+			setup: func(_ *testing.T, store *adminRuntimeStore, _ *secret.Manager) {
+				store.userErr = errors.New("db down")
+			},
+			request:    func(*testing.T) *http.Request { return newInitRequest(validBody) },
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   codeInternal,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newAdminRuntimeStore()
+			keys := newTestKeyManager(t)
+			if tc.setup != nil {
+				tc.setup(t, store, keys)
+			}
+			srv := newAdminTestServer(t, store, keys)
+
+			rec := serveAdmin(srv, tc.request(t))
+
+			decodeAdminFailure(t, rec, tc.wantStatus, tc.wantCode)
+			assertNoStore(t, rec)
+			if got := rec.Header().Get("Pragma"); got != "no-cache" {
+				t.Fatalf("初始化错误响应应带 Pragma: no-cache，实际 %q", got)
+			}
+		})
+	}
+
+	t.Run("失败限流", func(t *testing.T) {
+		store := newAdminRuntimeStore()
+		srv := newAdminTestServer(t, store, newTestKeyManager(t))
+
+		// 先打满阈值：只有 42201 计入 init 失败计数（见 adminInitLimited）。
+		for i := 0; i < failureLimitMaxFails; i++ {
+			rec := serveAdmin(srv, newInitRequest(
+				initJSON(t, ptr(testAdminPassword), ptr(testAdminPassword+"-wrong"))))
+			decodeAdminFailure(t, rec, http.StatusUnprocessableEntity, codePasswordInvalid)
+		}
+
+		rec := serveAdmin(srv, newInitRequest(validBody))
+
+		decodeAdminFailure(t, rec, http.StatusTooManyRequests, codeRateLimited)
+		assertNoStore(t, rec)
+		if got := rec.Header().Get("Pragma"); got != "no-cache" {
+			t.Fatalf("被限流的初始化响应应带 Pragma: no-cache，实际 %q", got)
+		}
+	})
+
+	t.Run("其它管理端点不带 Pragma", func(t *testing.T) {
+		srv := newAdminTestServer(t, newAdminRuntimeStore(), newTestKeyManager(t))
+
+		rec := serveAdmin(srv, newStateRequest(nil))
+
+		contractSuccessData(t, rec)
+		if got := rec.Header().Get("Pragma"); got != "" {
+			t.Fatalf("state 响应不该带 Pragma，实际 %q", got)
+		}
+	})
+}
+
 // TestAdminInitRejectsExistingAdmin 覆盖固定顺序的第一道门：管理员已存在时立即 40902，
 // 不校验密码、不计算哈希、不读写密钥文件（CP3）。第二个子用例用非法 JSON 证明
 // 「管理员存在」的判定排在请求体解析之前——这里的请求体解析指 handler 里的 decode，

@@ -15,7 +15,6 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"time"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/auth"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
@@ -43,23 +42,13 @@ const (
 	codeInternal       = 50000 // 仓储失败、密钥写入失败、装配缺失
 )
 
-// adminStore 是管理端在 api 层声明的消费侧接口，口径与设计中的 auth.AdminStore 一致
-// （auth 包当前还没有落地 store.go）：
-// 接口由使用方定义，store.AdminRepo 靠同名方法结构匹配，store 不反向 import api。
-// 这里只列出已实现的端点用到的方法：登录补 InsertSession 与 DeleteExpiredSessions，
-// 退出补 DeleteSession，改密补 UpdatePassword 与 DeleteAllSessions。
-// Server.admin 的赋值点不用改，store.AdminRepo 继续匹配。
-type adminStore interface {
-	Admin(ctx context.Context) (model.AdminUser, bool, error)
-	CreateAdmin(ctx context.Context, passwordHash string, now time.Time) (model.AdminUser, bool, error)
-	DeleteAdmin(ctx context.Context) error
-	UpdatePassword(ctx context.Context, passwordHash string, now time.Time) error
-	InsertSession(ctx context.Context, session model.AdminSession) error
-	Session(ctx context.Context, tokenHash string) (model.AdminSession, bool, error)
-	DeleteSession(ctx context.Context, tokenHash string) error
-	DeleteAllSessions(ctx context.Context) (int64, error)
-	DeleteExpiredSessions(ctx context.Context, now time.Time) (int64, error)
-}
+// adminStore 是 auth.AdminStore 在本包的别名，不是第二份接口定义。
+// 消费侧接口的唯一定义在 internal/auth（design「依赖方向」）：auth 不 import store，
+// store.AdminRepo 靠同名方法结构匹配，store 也不反向 import api/auth。
+// 保留这个包内别名而不是把签名全改成 auth.AdminStore，是为了让 Server.admin 字段、
+// 中间件与测试替身的函数签名保持一致的读法；WithAdmin 的对外签名仍写 auth.AdminStore，
+// 两者是同一个类型，不会出现「接口加一个方法、别名没跟上」的漂移。
+type adminStore = auth.AdminStore
 
 // adminSessionKey 是请求上下文的键类型；空结构体保证不会与任何其它包的键相撞。
 type adminSessionKey struct{}
@@ -105,6 +94,18 @@ func (s *Server) adminFail(w http.ResponseWriter, r *http.Request, status, code 
 func withNoStore(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
+		next(w, r)
+	}
+}
+
+// withPragmaNoCache 给初始化端点的全部响应加 Pragma: no-cache。
+// 初始化是唯一可能回一次性明文密钥的端点（Requirement 3.6），只靠 Cache-Control: no-store
+// 挡不住不认它的老代理与 HTTP/1.0 缓存。这条头挂在路由最外层的包装上，而不是只写在成功路径里：
+// 失败限流的 42901、Content-Type 体门的 40001 与 handler 内的 40902/40903/42201/50000
+// 都发生在成功响应之前，写进 handler 就会漏掉。其它管理端点不带它：它们的响应里没有密钥。
+func withPragmaNoCache(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Pragma", "no-cache")
 		next(w, r)
 	}
 }

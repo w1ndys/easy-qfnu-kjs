@@ -71,7 +71,7 @@ store  → model, pgx（既有）
 model  → 标准库
 ```
 
-`auth` 不 import `store`：`auth.AdminStore` 是消费侧接口，`store.AdminRepo` 用同名方法结构匹配，和 `pipeline.RunStore` 与 `store.CollectRunRepo` 的既有做法一致。SQL 只出现在 `store`。
+`auth` 不 import `store`：`auth.AdminStore` 是消费侧接口，`store.AdminRepo` 用同名方法结构匹配，和 `pipeline.RunStore` 与 `store.CollectRunRepo` 的既有做法一致。SQL 只出现在 `store`。装配层用 `var _ auth.AdminStore = store.AdminRepo{}` 把这份结构匹配钉在编译期；断言放在 `cmd/server`，不放进 `store`，免得实现方反向引用 `auth`。
 
 `backend/.golangci.yml` 的 depguard 需要补两条规则（否则 lint 直接失败）：
 
@@ -106,7 +106,7 @@ backend/internal/api/admin_test.go          管理端契约测试
 backend/internal/api/failurelimit_test.go
 ```
 
-`cmd/server/main.go` 追加装配：`secret.NewManager(cfg.SecretKeyPath)` → `keys.Load()` → `store.NewAdminRepo(pool)` → `api.WithAdmin(...)`。
+`cmd/server/main.go` 追加装配：`secret.NewManager(cfg.SecretKeyPath)` → `keys.Load()` → `store.NewAdminRepo(pool)` → `api.WithAdmin(adminRepo, keys)` → `api.WithAdminCookieSecure(cfg.AdminCookieSecure)`（Cookie 的 `Secure` 随 `ADMIN_COOKIE_SECURE`，默认 true；下发与清除共用同一个值）。启动期另用 `store.AdminRepo` 做一次密钥缺失检查，限时 5 秒、失败按 WARN 继续；编译期断言 `var _ auth.AdminStore = store.AdminRepo{}` 也放在这里。
 
 ### 接口签名
 
@@ -191,8 +191,13 @@ func NewAdminRepo(q adminQuerier) AdminRepo
 // internal/api —— 装配与管理端处理器（unexported，路由在 Handler 里注册）
 func WithAdmin(store auth.AdminStore, keys *secret.Manager) Option
 
+// WithAdminCookieSecure 声明管理会话 Cookie 是否带 Secure（配置项 ADMIN_COOKIE_SECURE，默认 true）。
+// 下发票据与清除 Cookie 共用 adminCookie，所以配置一次就同时管住两条出口；
+// 本地 http 开发必须显式设 false，否则浏览器拒收 Cookie，表现为「登录成功但立刻掉登录」。
+func WithAdminCookieSecure(enabled bool) Option
+
 // Server 新增字段：admin auth.AdminStore、keys *secret.Manager、
-// loginLimiter *failureLimiter、initLimiter *failureLimiter
+// loginLimiter *failureLimiter、initLimiter *failureLimiter、adminCookieSecure bool（默认 true）
 
 type failureLimiter struct { /* 来源 → {windowStart, fails}，上限 4096 个来源 */ }
 func newFailureLimiter(limit int, window time.Duration) *failureLimiter
@@ -233,7 +238,7 @@ func (l *failureLimiter) Reset(source string)
 约束：
 
 - **初始化顺序**固定：管理员存在 → 40902（不读密钥文件、不哈希）；密码不合法 → 40001/42201；`Reload()` 对账后密钥文件存在或不可用 → 40903（不建管理员、不补偿）；随后才哈希与插入记录。这样 40902 的代价只有一次主键查询；40903 视文件是否可用为 1–2 次管理员查询 + 1 次文件读取；CP3/CP4 也各自成立。
-- 所有管理端响应（含错误）带 `Cache-Control: no-store`；初始化响应另带 `Pragma: no-cache`。
+- 所有管理端响应（含错误）带 `Cache-Control: no-store`；初始化端点的响应另带 `Pragma: no-cache`，且成功与错误（42901/40001/40902/40903/42201/50000）一视同仁——这条头由路由最外层的包装统一给出，不只在成功路径上写，否则发生在 handler 之前的限流与体门响应会漏掉。
 - 写请求体解析前先 `http.MaxBytesReader` 限 8 KiB，再要求 `Content-Type: application/json`（缺一即 `40001`）。
 - 401 响应同时下发清除 Cookie 的 `Set-Cookie`（`Max-Age=0`），避免前端在死 Cookie 上反复重试；正常下发用 `Max-Age=43200`。
 - `GET /api/admin/state` 未登录时返回 200 + `authenticated=false`，不返回 401：前端靠它决定进初始化页、登录页还是面板。
@@ -245,7 +250,7 @@ func (l *failureLimiter) Reset(source string)
 
 | 环境变量 | 默认 | 校验 |
 |---|---|---|
-| `SECRET_KEY_PATH` | `/var/lib/easy-qfnu-kjs/secret.key` | 非空；目录不存在时在初始化写入前 `MkdirAll 0700` |
+| `SECRET_KEY_PATH` | `/var/lib/easy-qfnu-kjs/secret.key` | 空串与未设置同义，都回落到默认路径；目录不存在时在初始化写入前 `MkdirAll 0700` |
 | `ADMIN_COOKIE_SECURE` | `true` | 只接受 true/false/1/0，拼错即拒绝启动（照 `TRUST_PROXY_HEADERS` 的写法）；本地 http 开发需显式设 `false`，否则浏览器拒收 Cookie |
 
 `go.mod` 只新增一个直接依赖 `golang.org/x/crypto`（仅用 `argon2`），`go 1.26.10` 与「不写 toolchain 行」保持不变。
@@ -314,7 +319,7 @@ var (
 - CP8 **改密全量失效**：改密成功后 `admin_session` 行数为 0；改密前签发的任一 Cookie 在后续请求返回 40101。
 - CP9 **限流只数失败**：窗口内第 6 次失败起返回 42901；成功登录把该来源计数清零；被限流的请求不触发密码哈希（`HashCallCount` 不增长）。
 - CP10 **来源口径一致**：限流与公开查询共用 `clientSource`；伪造 `X-Forwarded-For` 最左值既不改变桶也不放宽限制。
-- CP11 **响应白名单**：管理端响应的 `data` 只出现设计表列的键；每个管理端响应（含 4xx/5xx）都带 `Cache-Control: no-store`。
+- CP11 **响应白名单**：管理端响应的 `data` 只出现设计表列的键；每个管理端响应（含 4xx/5xx）都带 `Cache-Control: no-store`；经 init handler 产生的响应（含 4xx/5xx）另带 `Pragma: no-cache`（`GET /api/admin/init` 这类由 ServeMux 直接写出的 405 只有 `no-store`，不含密钥、按例外处理）。
 - CP12 **信封完整**：`Seal` → `Open` 往返一致；同一明文两次 `Seal` 的 nonce 不同；篡改任意字节、AAD 不匹配、缺 `v1:` 前缀都让 `Open` 失败。边界与错误分类：空 AAD 在 `Seal`/`Open` 两侧都拒绝；零值 `Key` 拒绝，错误同时包裹 `ErrKeyUnavailable` 与 `ErrEnvelopeInvalid`，封与解两边的 `errors.Is` 结果一致；`Open` 只接受不超过 64 KiB 的信封，长度门在 base64url 解码之前；超长、非法 base64url、载荷过短、GCM 校验失败等一律包裹 `ErrEnvelopeInvalid`，供上层 `errors.Is` 判定。
 - CP13 **密钥文件属性**：创建用 `O_EXCL`、权限 0600；已存在时 `Create` 返回 `ErrKeyExists` 且不覆盖。
 - CP14 **密钥缺失可降级**：管理员已初始化但密钥文件缺失时，进程仍启动，公开查询、`GET /api/admin/state` 与登录照常；该响应的 `key_fingerprint` 为 `null`，管理端其余能力不受影响。
@@ -339,6 +344,8 @@ var (
 初始化失败补偿：`CreateAdmin` 成功后 `Create()` 写密钥文件失败时，调用 `DeleteAdmin` 回滚，返回 50000；回滚本身失败则记 `init_compensation_failed` 并保留管理员记录，运维按「删管理员记录 + 删密钥文件」重置。
 
 启动期降级：`keys.Load()` 失败记 ERROR 但继续启动。失败口径是「不可读 / 权限过宽（开放了属主之外访问）/ 路径不是普通文件 / 内容非法 / 文件尺寸超过 44 字节（读取量封顶 45；Stat 后被追加则按内容长度不符拒掉）」，一律返回 `ErrKeyUnavailable` 并保留已装载的旧密钥；`admin_user` 有行而密钥文件缺失记 WARN `secret_key_missing`。两种情况都只影响依赖密钥的能力（本 spec 只有指纹展示受影响），公开查询与登录照常。
+
+启动日志字段单列，与 Requirement 9.1 的边界要说清：该条只约束**管理端请求**日志（`adminFail` 的白名单五字段：`request_id`、HTTP 方法、路径、状态码、业务码），启动期日志不受它约束，字段单独列出——`listen`、`log_level`、`ocr_timeout`、`db_host`、`db_name`、`trust_proxy_headers`、`secret_key_path`、`admin_cookie_secure`、`version`；连接串只拆主机与库名，凭据与查询参数一律不出现，密钥只出现路径、不出现内容与指纹。为判断「管理员已初始化但密钥文件缺失」，启动期对 `admin_user` 做一次查询，与收敛过期轮次同一口径：`context.WithTimeout` 限 5 秒，超时或失败只记 WARN 并继续启动。这条路径的 WARN 用固定类别而不是底层错误原文——查询失败记 `admin_query_failed`、密钥缺失记 `secret_key_missing`，两者都只带 `path`，SQL 与连接串片段不进日志。
 
 ## Test Strategy
 

@@ -18,13 +18,20 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/api"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/auth"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/config"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/pipeline"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/query"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/secret"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/stats"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
 )
+
+// 管理端数据来源必须满足 auth.AdminStore：消费侧接口定义在 internal/auth，
+// 实现留在 internal/store（store 不反向 import auth）。断言放在装配层，
+// 两边方法集一旦漂移就在编译期失败，而不是等到某个端点运行期才发现取不到数据。
+var _ auth.AdminStore = store.AdminRepo{}
 
 // main 只把 run 的返回值转成退出码：0 正常，1 非正常终止。
 func main() {
@@ -64,6 +71,34 @@ func run() int {
 		return 1
 	}
 
+	// 管理端装配的前两步（design「依赖方向」的装配顺序）：先装载密钥，再建仓储。
+	// 密钥只有一把，放在文件里让数据库备份与密钥备份分开保管（D2）；Load 只读文件，
+	// 不做任何创建，文件缺失是首次部署的正常状态，真正的生成发生在 POST /api/admin/init。
+	// Load 失败按启动期降级处理：记 ERROR 但继续启动，公开查询、state 与登录都不依赖这把密钥（CP14）。
+	keys := secret.NewManager(cfg.SecretKeyPath)
+	keyLoaded, keyErr := keys.Load()
+	if keyErr != nil {
+		log.Error("加密密钥不可用，管理端密钥相关能力降级", "path", keys.Path(), "err", keyErr)
+	}
+	adminRepo := store.NewAdminRepo(pool)
+	// 管理员已初始化、密钥文件却缺失，是「备份没恢复」的部署事故：进程照常启动，但必须留一条
+	// 可检索的 WARN（design Error Handling 的 secret_key_missing），否则 init 的 40902 会让运维
+	// 以为系统一切正常。只有文件确实不存在时才会走到这里；文件存在但不可用已在上面记过 ERROR。
+	// 这次查询与下面的收敛过期轮次同一口径：限时 5 秒，库卡住时不能让启动无限等，超时同样按 WARN 继续。
+	// 失败只记固定类别、不记底层错误原文：启动日志没有理由把 SQL 或连接串片段带出去
+	// （Requirement 9.1 只约束管理端请求日志，启动日志的字段单列在 design Error Handling）。
+	if keyErr == nil && !keyLoaded {
+		adminCtx, cancelAdmin := context.WithTimeout(ctx, 5*time.Second)
+		_, adminFound, adminErr := adminRepo.Admin(adminCtx)
+		cancelAdmin()
+		if adminErr != nil {
+			// msg 是固定类别而不是 err 原文：字段只有路径，排障靠类别 + 日志级别即可定位。
+			log.Warn("admin_query_failed", "path", keys.Path())
+		} else if adminFound {
+			log.Warn("secret_key_missing", "path", keys.Path())
+		}
+	}
+
 	// 启动时先收敛进程崩溃留下的过期轮次（Requirement 8.3）：它们占着
 	// collect_run_single_running 唯一索引，不收拾掉，之后每轮都只能复用这条死轮次。
 	// 失败只记日志、不阻止启动：收敛是维护动作，查询服务仍应能对外提供已有数据。
@@ -77,7 +112,8 @@ func run() int {
 		log.Info("已收敛过期轮次", "run_ids", staleRunIDs)
 	}
 
-	// 启动日志只打非敏感项：连接串拆成主机与库名，密码与查询参数不出现。
+	// 启动日志只打非敏感项：连接串拆成主机与库名，密码与查询参数不出现；
+	// 密钥只打路径（运维要确认挂载点），密钥内容与指纹都不进启动日志。
 	dsn, _ := url.Parse(cfg.DatabaseURL)
 	version := "devel"
 	// 编译期版本来自构建信息；开发态没有 tag 时保留 devel。
@@ -91,6 +127,8 @@ func run() int {
 		"db_host", dsn.Host,
 		"db_name", strings.TrimPrefix(dsn.Path, "/"),
 		"trust_proxy_headers", cfg.TrustProxyHeaders,
+		"secret_key_path", keys.Path(),
+		"admin_cookie_secure", cfg.AdminCookieSecure,
 		"version", version,
 	)
 
@@ -302,6 +340,8 @@ func run() int {
 	// HTTP 服务在独立 goroutine 里跑，主流程只负责等待终止信号。
 	// 限流的来源判定与查询缓存都在装配层决定：来源是否可信取决于部署拓扑（design D2），
 	// 缓存窗口见 Requirement 32.2。
+	// 管理端两项：数据来源用 store.AdminRepo（结构匹配 api 的消费侧接口，store 不 import api），
+	// 密钥用上面已装载的 Manager；Cookie 的 Secure 随 ADMIN_COOKIE_SECURE，默认 true。
 	server := &http.Server{
 		Addr: cfg.ListenAddr,
 		Handler: api.New(log, pool, queries, queries, queries,
@@ -309,6 +349,8 @@ func run() int {
 			api.WithMeta(metaService),
 			api.WithScreen(screenService),
 			api.WithStats(statsRecorder),
+			api.WithAdmin(adminRepo, keys),
+			api.WithAdminCookieSecure(cfg.AdminCookieSecure),
 		).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
