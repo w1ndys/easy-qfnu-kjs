@@ -92,6 +92,12 @@ func (s *adminStoreStub) DeleteAllSessions(context.Context) (int64, error) {
 	return 0, nil
 }
 
+// DeleteExpiredSessions 记一次写调用；真实业务在登录成功后顺手清理过期会话。
+func (s *adminStoreStub) DeleteExpiredSessions(context.Context, time.Time) (int64, error) {
+	s.writeCalls++
+	return 0, nil
+}
+
 // adminBusinessStub 模拟管理端写端点的业务逻辑：先按真实 handler 的写法解析请求体，
 // 解析通过后才走替身的写方法。两个计数分开记：
 //   - entered 表示请求进到了业务处理器（会话与 CSRF 中间件已放行）；

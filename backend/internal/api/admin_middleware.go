@@ -4,7 +4,8 @@ package api
 // 与日志字段白名单。
 // 管理端写端点的顺序固定为 no-store → 体门 → 会话 → CSRF → 业务：任何一步失败都不进入下一步，
 // 因此「缺会话 / 缺 CSRF 时业务写方法调用为 0」由链路结构保证，而不是靠每个 handler 自觉（CP7）。
-// state/init 已在 admin.go 注册；登录、退出、改密由后续任务注册。这里只提供可组合的中间件与解析入口。
+// state/init 已在 admin.go 注册；登录与退出在 admin_session.go 注册，改密由后续任务注册。
+// 这里只提供可组合的中间件与解析入口。
 
 import (
 	"context"
@@ -44,13 +45,17 @@ const (
 // adminStore 是管理端在 api 层声明的消费侧接口，口径与设计中的 auth.AdminStore 一致
 // （auth 包当前还没有落地 store.go）：
 // 接口由使用方定义，store.AdminRepo 靠同名方法结构匹配，store 不反向 import api。
-// 这里只列出已实现的端点用到的方法；登录、退出与改密（后续任务）再补 InsertSession 等方法，
+// 这里只列出已实现的端点用到的方法：登录补 InsertSession 与 DeleteExpiredSessions，
+// 退出补 DeleteSession；改密（后续任务）再补 UpdatePassword 与 DeleteAllSessions。
 // Server.admin 的赋值点不用改，store.AdminRepo 继续匹配。
 type adminStore interface {
 	Admin(ctx context.Context) (model.AdminUser, bool, error)
 	CreateAdmin(ctx context.Context, passwordHash string, now time.Time) (model.AdminUser, bool, error)
 	DeleteAdmin(ctx context.Context) error
+	InsertSession(ctx context.Context, session model.AdminSession) error
 	Session(ctx context.Context, tokenHash string) (model.AdminSession, bool, error)
+	DeleteSession(ctx context.Context, tokenHash string) error
+	DeleteExpiredSessions(ctx context.Context, now time.Time) (int64, error)
 }
 
 // adminSessionKey 是请求上下文的键类型；空结构体保证不会与任何其它包的键相撞。
@@ -188,13 +193,15 @@ func adminSessionCookie(r *http.Request) (string, bool) {
 }
 
 // rejectAdminSession 是 40101 的统一出口：清 Cookie（Max-Age=0）再写固定文案。
+// 文案复用 admin_session.go 的 adminCredentialsInvalidMessage，不在这里写第二份字面量：
+// 登录失败与会话失效两条出口只要有一处漂移，探测者就能从文案分辨是哪种情况。
 // 文案对所有失败原因一致（Requirement 4.3、5.3），不区分「没登录」与「过期」，
 // 以免把会话状态当成可探测的信号。
 // 原因类别（reason）只进日志文案，且都是本文件写死的短句：不含 Cookie 值，
 // 日志里出现令牌等于把它备份到日志系统（CP2）。
 func (s *Server) rejectAdminSession(w http.ResponseWriter, r *http.Request, reason string) {
 	http.SetCookie(w, s.adminCookie("", -1))
-	s.adminFail(w, r, http.StatusUnauthorized, codeSessionInvalid, "管理会话不可用："+reason, "凭据无效或会话已过期")
+	s.adminFail(w, r, http.StatusUnauthorized, codeSessionInvalid, "管理会话不可用："+reason, adminCredentialsInvalidMessage)
 }
 
 // adminCookie 构造管理会话 Cookie；下发与清除共用同一组属性。

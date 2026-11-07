@@ -57,6 +57,18 @@ type adminRuntimeStore struct {
 
 	sessions   map[string]model.AdminSession
 	sessionErr error
+
+	// 以下字段服务于 task 10 的登录/退出用例：会话写方法的错误注入与入参记录。
+	// task 9 的用例不触碰它们，零值即「照常写入、不报错」。
+	insertErr          error
+	deleteSessionErr   error
+	expireErr          error
+	insertCalls        int
+	deleteSessionCalls int
+	expireCalls        int
+	gotInsert          model.AdminSession
+	gotDeleteHash      string
+	gotExpireNow       time.Time
 }
 
 // newAdminRuntimeStore 返回空库替身：没有管理员、没有会话。
@@ -125,6 +137,88 @@ func (s *adminRuntimeStore) Session(_ context.Context, tokenHash string) (model.
 	}
 	session, ok := s.sessions[tokenHash]
 	return session, ok, nil
+}
+
+// InsertSession 落一条会话，并记下入参供登录用例断言。
+func (s *adminRuntimeStore) InsertSession(_ context.Context, session model.AdminSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.insertCalls++
+	if s.insertErr != nil {
+		return s.insertErr
+	}
+	s.gotInsert = session
+	s.sessions[session.TokenHash] = session
+	return nil
+}
+
+// DeleteSession 按摘要删一条会话（退出登录），并记下目标摘要。
+func (s *adminRuntimeStore) DeleteSession(_ context.Context, tokenHash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteSessionCalls++
+	s.gotDeleteHash = tokenHash
+	if s.deleteSessionErr != nil {
+		return s.deleteSessionErr
+	}
+	delete(s.sessions, tokenHash)
+	return nil
+}
+
+// DeleteExpiredSessions 删除过期时刻不晚于 now 的会话，边界与真实仓储一致
+// （now < expires_at 才有效，所以 expires_at = now 算过期）。
+func (s *adminRuntimeStore) DeleteExpiredSessions(_ context.Context, now time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.expireCalls++
+	s.gotExpireNow = now
+	if s.expireErr != nil {
+		return 0, s.expireErr
+	}
+	var removed int64
+	for hash, session := range s.sessions {
+		if !now.Before(session.ExpiresAt) {
+			delete(s.sessions, hash)
+			removed++
+		}
+	}
+	return removed, nil
+}
+
+// snapshotInsert 在锁内取 InsertSession 的调用次数与最后一次入参。
+func (s *adminRuntimeStore) snapshotInsert() (calls int, session model.AdminSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.insertCalls, s.gotInsert
+}
+
+// snapshotDeleteSession 在锁内取 DeleteSession 的调用次数与最后一次目标摘要。
+func (s *adminRuntimeStore) snapshotDeleteSession() (calls int, tokenHash string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteSessionCalls, s.gotDeleteHash
+}
+
+// snapshotExpire 在锁内取 DeleteExpiredSessions 的调用次数与最后一次入参时钟。
+func (s *adminRuntimeStore) snapshotExpire() (calls int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.expireCalls, s.gotExpireNow
+}
+
+// sessionCount 在锁内取当前会话行数。
+func (s *adminRuntimeStore) sessionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sessions)
+}
+
+// hasSession 在锁内判定某个摘要是否有会话行。
+func (s *adminRuntimeStore) hasSession(tokenHash string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.sessions[tokenHash]
+	return ok
 }
 
 // snapshotUser 在锁内取一份管理员记录，供断言使用。
@@ -448,7 +542,8 @@ func TestAdminRouteNoStoreOnUnmatched(t *testing.T) {
 	}{
 		{"state 用了写方法", http.MethodPost, "/api/admin/state", http.StatusMethodNotAllowed},
 		{"init 用了读方法", http.MethodGet, "/api/admin/init", http.StatusMethodNotAllowed},
-		{"未注册的管理端路径", http.MethodGet, "/api/admin/session", http.StatusNotFound},
+		{"session 用了读方法", http.MethodGet, "/api/admin/session", http.StatusMethodNotAllowed},
+		{"未注册的管理端路径", http.MethodGet, "/api/admin/unknown", http.StatusNotFound},
 		{"管理前缀本身", http.MethodGet, "/api/admin", http.StatusNotFound},
 		{"管理端路径多一个斜杠", http.MethodGet, "/api/admin/state/", http.StatusNotFound},
 	}

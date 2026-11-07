@@ -60,6 +60,9 @@ type Server struct {
 	keys         *secret.Manager      // 密钥文件管理器；nil 表示未装配，初始化按内部错误、指纹按 null 处理
 	// initLimiter 按来源统计初始化密码校验失败；与登录限流分开计数。
 	initLimiter *failureLimiter
+	// loginLimiter 按来源统计登录凭据失败；与初始化限流分开计数，
+	// 一个端点的爆破不会把另一个端点锁住（Requirement 7.1、7.6）。
+	loginLimiter *failureLimiter
 	// adminCookieSecure 决定管理会话 Cookie 是否带 Secure：默认 true，
 	// 只有本地 http 开发才关掉（浏览器不会在 http 上保存 Secure Cookie）。
 	// 下发票据与清除 Cookie 必须用同一个值，否则死 Cookie 删不掉。
@@ -99,7 +102,8 @@ func New(log *slog.Logger, health Pinger, ctxSvc ContextProvider, availability A
 		// design D2 的部署拓扑是 web 反代 /api 到 server，默认按可信反代取来源。
 		trustProxy: true,
 		// 初始化失败限流与登录失败限流各一个实例：两者的失败来源与窗口互不影响。
-		initLimiter: newFailureLimiter(failureLimitMaxFails, failureLimitWindow),
+		initLimiter:  newFailureLimiter(failureLimitMaxFails, failureLimitWindow),
+		loginLimiter: newFailureLimiter(failureLimitMaxFails, failureLimitWindow),
 		// 安全默认：未显式配置时管理会话 Cookie 带 Secure（ADMIN_COOKIE_SECURE 默认 true）。
 		adminCookieSecure: true,
 	}
@@ -122,10 +126,14 @@ func (s *Server) Handler() http.Handler {
 
 	// 管理端引导：state 是公开读端点（未登录也 200），走公开限流；
 	// init 必须在登录之前可用，因此只复用写链路的体门（withJSONBody），不挂会话与 CSRF。
-	// 两者都包在可组合的 withNoStore 里，保证连 429/500 的错误响应也带 no-store（CP11）；
+	// 登录（POST session）同样没有会话可校验，挂失败计数限流与体门；
+	// 退出（DELETE session）走 adminWrite：no-store → 体门 → 会话 → CSRF → 业务。
+	// 这些响应都包在可组合的 withNoStore 里，保证连 429/500 的错误响应也带 no-store（CP11）；
 	// 404/405 由 ServeMux 自己写出、不经过 handler，由返回前的 withAdminNoStore 按前缀兜住。
 	mux.Handle("GET /api/admin/state", withNoStore(s.adminStateLimited(s.adminState)))
 	mux.Handle("POST /api/admin/init", withNoStore(s.adminInitLimited(s.withJSONBody(s.adminInit))))
+	mux.Handle("POST /api/admin/session", withNoStore(s.adminLoginLimited(s.withJSONBody(s.adminLogin))))
+	mux.Handle("DELETE /api/admin/session", s.adminWrite(s.adminLogout))
 	return withAdminNoStore(mux)
 }
 
@@ -134,7 +142,7 @@ const adminRoutePrefix = "/api/admin"
 
 // withAdminNoStore 给管理端前缀下的所有响应加 Cache-Control: no-store。
 //
-// 内层 withNoStore 只罩住两个已注册的端点，而 ServeMux 自己写出的 404（未注册路径）与
+// 内层 withNoStore 只罩住已注册的管理端点，而 ServeMux 自己写出的 404（未注册路径）与
 // 405（方法不匹配）根本不经过任何 handler，只在内层加头是覆盖不到的——管理端前缀下的
 // 错误响应同样不许被缓存（CP11），所以按前缀在最外层再兜一次。
 // 判定接受前缀本身与带斜杠的子树：/api/admin 自身也会 404，且与 Cookie 的 Path=/api/admin
