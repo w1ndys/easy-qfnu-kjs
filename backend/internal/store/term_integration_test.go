@@ -5,8 +5,6 @@ import (
 	"os"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestTermWeekAtAgainstRealDB 只在提供 KJS_TEST_DSN 时运行，验证半开区间的边界。
@@ -80,12 +78,4 @@ func mustDate(t *testing.T, s string) time.Time {
 		t.Fatalf("解析日期 %s 失败: %v", s, err)
 	}
 	return d
-}
-
-// mustExec 执行种子语句，失败直接终止用例。
-func mustExec(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
-	t.Helper()
-	if _, err := pool.Exec(ctx, sql, args...); err != nil {
-		t.Fatalf("执行 %q 失败: %v", sql, err)
-	}
 }

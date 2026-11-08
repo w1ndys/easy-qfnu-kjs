@@ -23,9 +23,10 @@
 
 - [ ] 4. store.SettingsRepo
   - `LoadSettings`：`SELECT ... WHERE key = ANY($1)`，只返回七个键，`updated_at` 原样返回
-  - `ApplySettings`：单事务内逐条 `ON CONFLICT (key) DO UPDATE` 或 `DELETE`；任一条失败整体回滚；同一批用同一个 `now`
+  - `ApplySettings`：单事务内逐条 `ON CONFLICT (key) DO UPDATE` 或 `DELETE`；任一条失败整体回滚；同一批用同一个 `now`；键外变更整批拒绝
   - 结构匹配 `settings.Store`（store 不 import settings，类型用 `model.SettingRow`/`model.SettingChange`）
-  - 集成测试：upsert、删除、`updated_at` 前进、事务回滚（第二条注入超长值）、键外行不被 `LoadSettings` 返回、`ErrSettingStoreFailed` 经 `%w` 可 `errors.Is`
+  - 仓储单测（替身）：SQL 片段（`WHERE key = ANY($1)`、`ORDER BY key`、三处 `EXCLUDED.*`）与四列扫描顺序/类型、空批次不开事务、单事务同一个 `now`、键外变更零写入、失败即停并回滚、错误只带键名
+  - 集成测试：upsert、删除、`updated_at` 前进、事务回滚（第二条注入 NUL 等必然失败的值）、键外行不被 `LoadSettings` 返回、`ErrSettingStoreFailed` 经 `%w` 可 `errors.Is`
 
 - [ ] 5. settings.Service 读写与加解密
   - `Load`：读行 → `Snapshot`（`*_set` 只由行存在性决定；`cron_expr` 缺行回落默认值；白名单缺行回空数组）

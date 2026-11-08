@@ -605,7 +605,7 @@ ON CONFLICT (key) DO UPDATE
 DELETE FROM settings WHERE key = $1;
 ```
 
-`ApplySettings` 在单个事务里逐条执行，任一条失败整体回滚（Requirement 6.4）。`updated_at` 由服务层传入同一时刻，同一批变更的时间戳一致。
+`ApplySettings` 在单个事务里逐条执行，任一条失败整体回滚（Requirement 6.4）。`updated_at` 由服务层传入同一时刻，同一批变更的时间戳一致。变更的键必须属于 `model.SettingKeys()`：键外变更在开事务之前整批拒绝、一条不写并返回 `ErrSettingStoreFailed`，否则库里会留下一行 `LoadSettings` 永远读不到、清除路径也永远删不掉的设置。
 
 ### 轮次只读视图
 
@@ -693,7 +693,7 @@ RETURNING run_id, started_at;
 
 - `model.ErrRunBusy` 由 `runner.BusyError{Run store.RunSummary}` 包装，`Unwrap` 恒返回它。错误值里就带着冲突轮次的 `RunID` 与 `Phase`，API 层 `errors.As` 取到 `*runner.BusyError` 后直接拼 409 / `40901` 文案，不再查一次库；需要只判类别时 `errors.Is(err, model.ErrRunBusy)` 即可。`runner.Start` 只在两种情况下返回它：读到进行中轮次，或 `Collector.Start` 返回包装了 `model.ErrRunConflict` 的错误且重读 `Running` 命中。
 - `model.ErrSettingInvalid` 由 `settings.FieldError{Field, Message}` 包装：`FieldError.Unwrap` 恒返回它，`Error()` 的文案点名字段与原因。API 层既用 `errors.As` 取 `*settings.FieldError` 拿字段名拼 `42201`，也用 `errors.Is(err, model.ErrSettingInvalid)` 只判类别；`Validate` 只返回包装后的 `*FieldError`，不直接返回裸哨兵，否则错误文案里就少了具体是哪个字段。
-- `model.ErrSettingStoreFailed` 由 `store.SettingsRepo` 在 SQL 或事务失败（含回滚）时用 `%w` 映射；`settings.Service` 不吞不换，原样上抛；API 层据此映射 `50000` 并固定文案。
+- `model.ErrSettingStoreFailed` 由 `store.SettingsRepo` 在 SQL 或事务失败（含回滚）时用 `%w` 映射，另含开事务前的键白名单拒绝；`settings.Service` 不吞不换，原样上抛；API 层据此映射 `50000` 并固定文案。
 - `model.ErrRunNotFound` 保留（reserved），当前没有调用点：`store.RunStatusRepo.ByID` 的 `(RunSummary, bool, error)` 用 `bool` 承载「没有这一轮」，`false` 就是「未找到」，由 handler 映射 404 / `40401`，`error` 只承载真正的读库失败；`ByID` 自己不返回这个哨兵，也不把「未找到」写进 `error`。将来只回单个 `error`、没有 `bool` 通道的读取路径再用它。
 - `model.ErrCollectorUnavailable` 不包装：`runner.Start` 在白名单非空而 `Deps.Collect == nil` 时直接返回它，没有错误类型承载额外字段；API 层 `errors.Is` 命中即 `50000`。不要为它再造一层包装，那只会让判定多一跳，换不来任何上下文。
 
@@ -704,7 +704,8 @@ RETURNING run_id, started_at;
 - **cronexpr 时间边界**：23:59→次日 00:00、月末→次月 1 日、12 月 31 日→次年 1 月 1 日、闰年 2 月 29 日、`0 0 30 2 *` 返回 `false`、日/周同时受限的 OR 语义（例如 `0 0 1 * 1` 在「每月 1 日」与「每周一」都触发）、`*/2` 在日字段视为受限。
 - **settings 纯校验**：白名单空编号 / trim 后重复 / 空展示名 / 201 条；cron 非法（另测 `cron_expr` 前后空白 trim 后通过、全空白按空串拒绝）；URL 非 http(s)；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文各测「恰好 4096 字节通过、4097 字节拒绝」（`jw_username` 按 `TrimSpace` 后计；`ocr_base_url` 另测带前后空白的口径：trim 后恰好 4096 字节通过、trim 后 4097 字节拒绝，前后空白不计入这 4096）；反向用例钉住上界的作用范围：≤200 条白名单序列化后超过 4096 字节仍然合法，`cron_expr` 只按 5 字段语法判定、不量字节，而 4097 字节的合法 URL 形状 `feishu_webhook` 仍被拒——说明拒绝来自字节上界而不是 URL 形状；`Whitelist: &[]` 合法。`Patch` 指针的三种状态（省略、空串、值）各有用例。
 - **settings 服务（替身 Store + 临时密钥）**：合法保存把所有变更放进**一次** `ApplySettings` 调用；校验失败与「非空秘密 + 密钥不可用」时 `ApplySettings` 调用次数为 0；只把秘密设为空串时不碰 `Current()` 且照常删除；秘密 `Seal` 用的 AAD 是 `settings/<key>`（替身记录参数）；`Reveal` 能取回明文、换键名与篡改密文都失败；`Load` 的 `*_set` 只由库中键存在性决定。
-- **settings 仓储集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：迁移到 0005 后 `ApplySettings` 的 upsert/delete、`updated_at`、事务回滚（注入一条超长值或让第二条失败）；`LoadSettings` 只返回七个键。
+- **settings 仓储单测（替身）**：`LoadSettings` 的查询参数就是 `model.SettingKeys()` 的七项；SQL 片段钉住 `WHERE key = ANY($1)`、`ORDER BY key` 与 upsert 的三处 `EXCLUDED.*`（`value`/`is_secret`/`updated_at`）；`pgx.Rows` 替身按位置真赋值并校验列数与类型，锁住四列 `key, value, is_secret, updated_at` 的扫描顺序；空批次不开事务；一批只开一个事务、每条 upsert 都用同一个 `now`、最后提交一次；键外变更在开事务前整批拒绝且零语句；`Delete` 分支只传键；第二条失败立即停止并回滚；Query/Scan/`rows.Err`/Begin/Commit 各自包 `ErrSettingStoreFailed`，错误消息只带键名不带值。
+- **settings 仓储集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：迁移到 0005 后 `ApplySettings` 的 upsert/delete、`updated_at`、事务回滚（第二条注入 NUL 等必然失败的值）；`LoadSettings` 只返回七个键，且键外行仍在库里（直查 `count(*)` 为 1）——证明「存在但读不到」，而不是「压根没插进去」。
 - **迁移集成**：`schema_migration` 记满 0001–0005 五行；0005 的三条路径各一条断言——全新迁移后 `cron_expr='10 4 * * 6'`、旧库（还原旧值并抹掉 0005 记账）重跑后被改写且 `updated_at` 前进、值已就位时重跑不再命中（值与 `updated_at` 都不变），管理员自定义的表达式不被覆盖。
 - **runner（替身）**：白名单为空 → 不调用 `Collector`、`StartBlockedRun` 调用一次、结果 `blocked`；有 running → `BusyError` 且 `Collector` 调用 0 次；`Converge` 先于 `Running` 调用（记录顺序）；`Converge` 报错时不继续；`Collector` 返回 `model.ErrRunConflict` 映射成 `BusyError`；`Collector` 为 nil 且白名单非空 → `ErrCollectorUnavailable` 且零建轮；10 个并发 `Start` 中 `Collector.Start` 至多被调 1 次（互斥锁 + 假 Collector 的冲突响应）。
 - **scheduler（假时钟 + 注入 `wait`）**：到点触发一次；`Reload` 后按新表达式；触发返回错误只记日志并在下一时刻继续；`ctx` 取消后 `Run` 返回；存量表达式非法时回落默认值；`Next` 与 cronexpr 结果一致。
