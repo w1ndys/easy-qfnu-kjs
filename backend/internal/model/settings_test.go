@@ -132,11 +132,12 @@ func TestSettingKeysReturnsOrderedCopy(t *testing.T) {
 	}
 }
 
-// TestSettingLimits 钉住三个常量：默认 cron 与 0001 的种子行逐字一致（Requirement 9.5），
+// TestSettingLimits 钉住三个常量：默认 cron 是 5 字段（与 cronexpr 的语法一致，
+// 0005 把 0001 的 6 段旧种子改写成同一串，见 Requirement 9.5），
 // 条数与字节上限的校验口径见 design.md「Data Models → 设置项」与 tasklist 任务 3。
 func TestSettingLimits(t *testing.T) {
-	if DefaultCronExpr != "0 10 4 * * 6" {
-		t.Fatalf("DefaultCronExpr 应为 0001 种子行的 \"0 10 4 * * 6\"，实际 %q", DefaultCronExpr)
+	if DefaultCronExpr != "10 4 * * 6" {
+		t.Fatalf("DefaultCronExpr 应为 5 字段的 \"10 4 * * 6\"，实际 %q", DefaultCronExpr)
 	}
 	if MaxWhitelistEntries != 200 {
 		t.Fatalf("MaxWhitelistEntries 应为 200，实际 %d", MaxWhitelistEntries)

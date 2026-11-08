@@ -17,12 +17,12 @@ Updated: 2026-11-08
 | 编号 | 决策 | 取舍 |
 |---|---|---|
 | D1 | **只做后端 API**：五个端点 + 四个新包（`cronexpr`/`settings`/`scheduler`/`runner`）+ 两个仓储 + 调度循环；不建 `frontend/` 目录 | 与本轮已谈定的边界一致；前端可后做，验收用 curl 与契约测试；代价是设置页暂时不可视 |
-| D2 | **不新增迁移**：复用 0001 的 `settings(key, value, is_secret, updated_at)`，默认行已由 0001 种下（`cron_expr='0 10 4 * * 6'`、`building_whitelist='[]'`） | 秘密密文与白名单 JSON 都能塞进 `value`，`is_secret` 列已存在；不加 0005 就少一版不可回退的结构变更。代价是秘密与明文共表，靠键名约定区分（CP1/CP4 用类型与键名双重兜底） |
+| D2 | **不新增结构迁移，只补一版数据迁移**：复用 0001 的 `settings(key, value, is_secret, updated_at)`，默认行已由 0001 种下（`building_whitelist='[]'`；`cron_expr` 的旧值是 6 段 `0 10 4 * * 6`，由 0005 就地改写成 5 字段 `10 4 * * 6`） | 秘密密文与白名单 JSON 都能塞进 `value`，`is_secret` 列已存在；不加结构迁移就少一版不可回退的 schema 变更。0005 只改数据、WHERE 钉住旧值，重复执行与管理员自定义值都不受影响。代价是秘密与明文共表，靠键名约定区分（CP1/CP4 用类型与键名双重兜底） |
 | D3 | **cron 自己写 5 字段解析器**（`internal/cronexpr`，约 200 行 + 位图匹配），不引 `robfig/cron/v3` | 只要一条「周末 04:10」式表达式：不需要秒级、`@every`、描述符、任务队列与 Entry 管理；而**校验与调度必须共用同一套语法**，用 robfig 还得先把它多接受的写法挡在 API 外，等于在它上面再包一层。自写换来：零新依赖（`go.mod` 不动）、确定性 `Next`（注入时刻即可断言）、错误消息能精确到「第 3 个字段（日）超出 1–31」。代价是区间/列表/步进的边界要自己测（表驱动 + 属性测试，见 Test Strategy） |
 | D4 | **秘密复用 `secret.Manager`**：`AES-256-GCM` 信封，AAD 固定 `settings/<key>`；设置快照类型**没有**秘密明文字段 | 信封已有 `v1:` 版本前缀与逐字节篡改测试；AAD 把密文绑到具体键，防止把 A 项密文挪到 B 项还能解开。快照不带明文字段是编译期保证：handler 拿不到可回显的秘密（CP1） |
 | D5 | **`blocked` 轮次直接以终态插入**（不借用 `StartCollectRun`） | 建轮需要学期，空白名单时通常还没有学期（一次成功采集前 `term` 表可能为空），`StartCollectRun` 会因空学期报 `ErrRunStoreFailed`；而 `collect_run.term` 本身可空、`status`/`phase` 的 CHECK 都允许 `blocked`/`finished`。直接插入既满足「白名单为空立刻阻止」，又不占 `collect_run_single_running` 唯一索引（CP12），代价是这条路径不写学期（面板显示 `term: null`，符合「还没跑到学期阶段」） |
 | D6 | **采集启动器是端口，不是本 spec 的实现**：`runner.Collector` 由 `collect-runner` 注入；未装配时白名单非空的手动同步与定时触发返回 `50000` 且**不建轮次** | 编排层需要先定三件本 spec 无权决定的事：窗口由谁写（`collect_run.window_start` 目前没有写入口）、明细任务的「不可用格」列表从哪来、断点续跑时内存候选如何重建。硬塞进本 spec 会让一个 spec 覆盖两条交付线，也违反「一次一个最小功能」。过渡态是可观察的：启动日志一条 WARN，接口返回 `50000`，库中不留假轮次（CP16） |
-| D7 | **触发来源只进日志，不落库** | 没有验收条目要求按来源筛选；加一列就要一版迁移。日志字段 `trigger=manual\|cron` 足以排障；将来要按来源统计再加 0005 |
+| D7 | **触发来源只进日志，不落库** | 没有验收条目要求按来源筛选；加一列就要一版迁移。日志字段 `trigger=manual\|cron` 足以排障；将来要按来源统计再加下一版迁移 |
 | D8 | **启动前先收敛过期轮次**：复用 `pipeline.ConvergeStaleRuns`（装配层注入为 `runner.Converge`），口径「超过 2 小时的 running 置 failed + `stale_run`」只有一份 | 否则进程在长跑期间崩溃留下的 running 会永久占住唯一索引，之后每次手动同步都只能 409（Requirement 8.3）。把函数注入而不是在 runner 里重算 cutoff，是为了让「2 小时」与 `started_at <` 的边界不会出现第二份实现 |
 | D9 | **手动同步不复用进行中轮次**：先判冲突（409），冲突时不调用采集启动器 | `pipeline.StartRun` 撞唯一索引时会把已有轮次返回给调用方（`Reused=true`），那是「进程重启后续跑」的语义，不是「管理员点了第二次」。两者混用会让手动同步静默接上别人的轮次，面板看到的状态与管理员的操作对不上（CP13） |
 | D10 | **设置写入严格且原子**：`DisallowUnknownFields` + 64 KiB 体上限 + 单事务 | 拼错键名（如 `cron_express`）静默不生效最难排；严格解码直接 `40001`。白名单 200 条时大约几 KiB，`adminWrite` 的 8 KiB 是给密码留的，不够，所以设置用 64 KiB 的独立上限。原子性按 PRD 5.2「校验失败时整次不保存」 |
@@ -155,7 +155,7 @@ const (
     SettingCronExpr          = "cron_expr"
     SettingBuildingWhitelist = "building_whitelist"
 
-    DefaultCronExpr      = "0 10 4 * * 6" // 与 0001 种子一致；行缺失时回落
+    DefaultCronExpr      = "10 4 * * 6" // 5 字段；0005 已把 0001 的旧种子改写成同值
     MaxWhitelistEntries  = 200             // 4 周窗口 × 200 楼 = 800 条周结果，详情响应仍可控
     MaxSettingValueBytes = 4096            // 五项文本项的明文上界（含两个 URL 项）；白名单看条数、cron 看语法
 )
@@ -444,7 +444,7 @@ func (s *Server) withJSONBodyLimit(limit int64, next http.HandlerFunc) http.Hand
     "ocr_base_url": "http://ocr:8000",
     "feishu_webhook_set": false,
     "feishu_sign_secret_set": false,
-    "cron_expr": "0 10 4 * * 6",
+    "cron_expr": "10 4 * * 6",
     "cron_next_at": "2026-11-13T20:10:00Z",
     "building_whitelist": [{ "jxlbh": "Q10", "name": "综合教学楼" }]
   },
@@ -463,7 +463,7 @@ func (s *Server) withJSONBodyLimit(limit int64, next http.HandlerFunc) http.Hand
   "ocr_base_url": "http://ocr:8000",
   "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxx",
   "feishu_sign_secret": "******",
-  "cron_expr": "0 10 4 * * 6",
+  "cron_expr": "10 4 * * 6",
   "building_whitelist": [
     { "jxlbh": "Q10", "name": "综合教学楼" },
     { "jxlbh": "Q03", "name": "老文史楼" }
@@ -555,7 +555,17 @@ func (s *Server) withJSONBodyLimit(limit int64, next http.HandlerFunc) http.Hand
 
 ## Data Models
 
-**本 spec 不新增迁移**。`migrations/0001_baseline.sql` 已有 `settings`（L77）与种子行（L304–306：`cron_expr='0 10 4 * * 6'`、`building_whitelist='[]'`）；`collect_run` / `collect_run_week` 的列足够表达运行状态；`blocked` 与 `finished` 都在 CHECK 允许的取值内，`term` 可空。0001–0004 已应用，一个字节都不改。
+**本 spec 只新增一版数据迁移，不动 schema**。`migrations/0001_baseline.sql` 已有 `settings`（L77）与种子行（L304–306：`cron_expr='0 10 4 * * 6'`、`building_whitelist='[]'`）；`collect_run` / `collect_run_week` 的列足够表达运行状态；`blocked` 与 `finished` 都在 CHECK 允许的取值内，`term` 可空。
+
+0001 的种子把 cron 写成 6 段（多一个秒字段），而 `cronexpr` 只认 5 字段，库里这条默认值会被启动流程判非法并回落——设置页显示的表达式与实际调度会对不上。修正落在 `migrations/0005_default_cron_5_fields.sql`：
+
+```sql
+UPDATE settings
+   SET value = '10 4 * * 6', updated_at = now()
+ WHERE key = 'cron_expr' AND value = '0 10 4 * * 6';
+```
+
+只改数据，且 WHERE 钉住旧值：重复执行时不再命中，管理员自定义的表达式也不会被覆盖。0001–0004 已应用，一个字节都不改。
 
 ### 设置项
 
@@ -689,12 +699,13 @@ RETURNING run_id, started_at;
 
 ## Test Strategy
 
-- **cronexpr 表驱动**：合法（`* * * * *`、`*/5 * * * *`、`0 10 4 * * 6`、`30 8-18/2 * * 1-5`、`0,30 * * * *`、周 `7` 归一为周日）与非法（字段数 4/6、`*/0`、`5-1`、`1,,2`、`60 * * * *`、`0 24 * * *`、`0 0 32 * *`、`0 0 * 13 *`、`0 0 * * 8`、`@every 1h`、`MON`、空串、前后多余空格）。错误文案断言含字段位置。
+- **cronexpr 表驱动**：合法（`* * * * *`、`*/5 * * * *`、`10 4 * * 6`、`30 8-18/2 * * 1-5`、`0,30 * * * *`、`1,* * * * *`、周 `7` 归一为周日）与非法（字段数 4/6、`*/0`、`*/+5`、`1-2/+1`、`5-1`、`1,,2`、`60 * * * *`、`0 24 * * *`、`0 0 32 * *`、`0 0 * 13 *`、`0 0 * * 8`、`@every 1h`、`MON`、空串、前后多余空格）。错误文案断言含字段位置。另有一条用例直接解析 `model.DefaultCronExpr`：字段数必须是 5，`Next` 必须落在周六 04:10——默认值退回 6 段时它先红。
 - **cronexpr 属性测试**：对随机 `after` 与随机合法表达式，断言 `Matches(Next(after))` 为真且 `(after, Next(after))` 区间内无命中；`Next` 严格晚于 `after`（同一分钟不重复触发）。
 - **cronexpr 时间边界**：23:59→次日 00:00、月末→次月 1 日、12 月 31 日→次年 1 月 1 日、闰年 2 月 29 日、`0 0 30 2 *` 返回 `false`、日/周同时受限的 OR 语义（例如 `0 0 1 * 1` 在「每月 1 日」与「每周一」都触发）、`*/2` 在日字段视为受限。
 - **settings 纯校验**：白名单空编号 / trim 后重复 / 空展示名 / 201 条；cron 非法；URL 非 http(s)；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文各测「恰好 4096 字节通过、4097 字节拒绝」（`jw_username` 按 `TrimSpace` 后计；`ocr_base_url` 另测带前后空白的口径：trim 后恰好 4096 字节通过、trim 后 4097 字节拒绝，前后空白不计入这 4096）；反向用例钉住上界的作用范围：≤200 条白名单序列化后超过 4096 字节仍然合法，`cron_expr` 只按 5 字段语法判定、不量字节，而 4097 字节的合法 URL 形状 `feishu_webhook` 仍被拒——说明拒绝来自字节上界而不是 URL 形状；`Whitelist: &[]` 合法。`Patch` 指针的三种状态（省略、空串、值）各有用例。
 - **settings 服务（替身 Store + 临时密钥）**：合法保存把所有变更放进**一次** `ApplySettings` 调用；校验失败与「非空秘密 + 密钥不可用」时 `ApplySettings` 调用次数为 0；只把秘密设为空串时不碰 `Current()` 且照常删除；秘密 `Seal` 用的 AAD 是 `settings/<key>`（替身记录参数）；`Reveal` 能取回明文、换键名与篡改密文都失败；`Load` 的 `*_set` 只由库中键存在性决定。
-- **settings 仓储集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：迁移到 0004 后 `ApplySettings` 的 upsert/delete、`updated_at`、事务回滚（注入一条超长值或让第二条失败）；`LoadSettings` 只返回七个键。
+- **settings 仓储集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：迁移到 0005 后 `ApplySettings` 的 upsert/delete、`updated_at`、事务回滚（注入一条超长值或让第二条失败）；`LoadSettings` 只返回七个键。
+- **迁移集成**：`schema_migration` 记满 0001–0005 五行；0005 的三条路径各一条断言——全新迁移后 `cron_expr='10 4 * * 6'`、旧库（还原旧值并抹掉 0005 记账）重跑后被改写且 `updated_at` 前进、值已就位时重跑不再命中（值与 `updated_at` 都不变），管理员自定义的表达式不被覆盖。
 - **runner（替身）**：白名单为空 → 不调用 `Collector`、`StartBlockedRun` 调用一次、结果 `blocked`；有 running → `BusyError` 且 `Collector` 调用 0 次；`Converge` 先于 `Running` 调用（记录顺序）；`Converge` 报错时不继续；`Collector` 返回 `model.ErrRunConflict` 映射成 `BusyError`；`Collector` 为 nil 且白名单非空 → `ErrCollectorUnavailable` 且零建轮；10 个并发 `Start` 中 `Collector.Start` 至多被调 1 次（互斥锁 + 假 Collector 的冲突响应）。
 - **scheduler（假时钟 + 注入 `wait`）**：到点触发一次；`Reload` 后按新表达式；触发返回错误只记日志并在下一时刻继续；`ctx` 取消后 `Run` 返回；存量表达式非法时回落默认值；`Next` 与 cronexpr 结果一致。
 - **api 契约（httptest + 替身 Reader/Service）**：五个端点的状态码、业务码、`data` 键集合、`Cache-Control: no-store`；GET 响应不含秘密哨兵；PUT 非法字段整次不变；PUT 未知字段 40001；64 KiB 边界（恰好通过、+1 拒绝）；`limit`/`offset`/`run_id` 越界；409 消息含 `run_id`；未装配三件依赖时 50000。

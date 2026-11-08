@@ -1,7 +1,7 @@
 # admin-settings-sync 实施计划
 
 - [ ] 1. 设置模型与业务时区
-  - 新增 `internal/model/settings.go`：七个键常量（`jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret`/`cron_expr`/`building_whitelist`）、`DefaultCronExpr='0 10 4 * * 6'`、`MaxWhitelistEntries=200`、`MaxSettingValueBytes=4096`
+  - 新增 `internal/model/settings.go`：七个键常量（`jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret`/`cron_expr`/`building_whitelist`）、`DefaultCronExpr='10 4 * * 6'`（5 字段，每周六 04:10）、`MaxWhitelistEntries=200`、`MaxSettingValueBytes=4096`
   - `Building{ID jxlbh, Name name}`、`SettingRow`、`SettingChange{Delete}`、`TriggerSource{manual,cron}`、`SettingKeys()`（返回七个键的副本）、`SecretSetting(key)`、`BusinessLocation()`（+08:00 固定偏移）
   - `internal/model/errors.go` 追加 `ErrSettingInvalid`/`ErrSettingStoreFailed`/`ErrRunBusy`/`ErrRunNotFound`/`ErrCollectorUnavailable`
   - 测试锁住 `SecretSetting` 的三真四假、`Building` 的 JSON 键名与 `meta` 的存储形状一致
@@ -11,6 +11,7 @@
   - 位图匹配 + `Matches`；`Next` 按「月 → 日 → 时 → 分」跳进，严格晚于入参，5 年无命中返回 `false`
   - 日/周同时受限时按 OR 触发，`*` 之外的 `*/n` 记为受限（Vixie 语义）
   - 表驱动 + 属性测试（`Matches(Next(t))` 恒真、区间内无更早命中）+ 边界（跨日、月末、跨年、闰年 2/29、2/30 不可达）
+  - 新增 `migrations/0005_default_cron_5_fields.sql`（只改数据）：把 0001 种下的 6 段 `0 10 4 * * 6` 就地改成 5 字段 `10 4 * * 6`，`WHERE` 钉住旧值所以重复执行不再命中、管理员自定义值不被覆盖；0001–0004 一字不改，迁移集成测试补 0005 的记账与幂等断言
 
 - [ ] 3. settings.Validate 纯校验
   - 白名单：trim 后编号非空且唯一、展示名非空、≤200 条；`[]` 合法；`Whitelist` 为 nil 时不校验

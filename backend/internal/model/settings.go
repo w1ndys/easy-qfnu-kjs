@@ -16,9 +16,14 @@ const (
 )
 
 const (
-	// DefaultCronExpr 是 cron_expr 缺行时的回落值，与 0001 的种子行逐字一致：
-	// 业务时区（+08:00）每周六 04:10（Requirement 9.5）。
-	DefaultCronExpr = "0 10 4 * * 6"
+	// DefaultCronExpr 是 cron_expr 缺行时的回落值：业务时区（+08:00）每周六
+	// 04:10（Requirement 9.5）。
+	//
+	// 必须是 5 字段（分 时 日 月 周），与 cronexpr.Parse 的语法一致：多一段秒
+	// 会让这个默认值自己过不了校验，回落值就成了「又一条非法表达式」。
+	// 0001 的种子行早先写的是 6 段 `0 10 4 * * 6`，由 0005 迁移就地改写成这串；
+	// 0001 本身已应用，一个字节都不改。
+	DefaultCronExpr = "10 4 * * 6"
 
 	// MaxWhitelistEntries 是一条白名单的条数上限。按 4 周窗口 × 200 楼 = 800 条周结果
 	// 估算，详情响应仍然可控（Requirement 4.4）。

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestMigrateAgainstRealDB 只在提供 KJS_TEST_DSN 时运行；会先清空 public schema，只指向测试库。
@@ -65,8 +66,8 @@ func TestMigrateAgainstRealDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migration").Scan(&applied); err != nil {
 		t.Fatalf("迁移记录缺失: %v", err)
 	}
-	if applied != 4 {
-		t.Fatalf("schema_migration 期望 4 行（0001 基线 + 0002 每轮归属 + 0003 发布标记 + 0004 管理会话），实际 %d", applied)
+	if applied != 5 {
+		t.Fatalf("schema_migration 期望 5 行（0001 基线 + 0002 每轮归属 + 0003 发布标记 + 0004 管理会话 + 0005 默认 cron 改 5 字段），实际 %d", applied)
 	}
 
 	// 0003 只新增列、不改 0001/0002：发布标记必须存在且是可空 timestamptz，
@@ -392,4 +393,84 @@ VALUES ($1, 'csrf-invalid', $2, $3)`, fmt.Sprintf("hash-rejected-%d", i), base, 
 	if rowCount != 1 {
 		t.Fatalf("被约束拒绝的写入不应留下任何行，admin_session 期望 1 行，实际 %d", rowCount)
 	}
+}
+
+// TestMigrateDefaultCronFiveFieldsAgainstRealDB 覆盖 0005：0001 的种子把 cron_expr
+// 写成 6 段的 `0 10 4 * * 6`，而 cronexpr 只认 5 字段，0005 在升级时把它就地改成
+// `10 4 * * 6`。三条断言分别对应新库的最终值、旧库的升级改写、以及重复执行不改
+// 已更新的值——幂等只靠 WHERE 的旧值条件，不依赖 schema_migration 的跳过。
+func TestMigrateDefaultCronFiveFieldsAgainstRealDB(t *testing.T) {
+	ctx, pool := openCollectRunTestDB(t)
+
+	// 新库：0001 种下旧值，0005 在同一次迁移里改写。
+	if got := readCronExpr(ctx, t, pool); got != "10 4 * * 6" {
+		t.Fatalf("全新迁移后 cron_expr 应为 \"10 4 * * 6\"，实际 %q", got)
+	}
+
+	// 升级路径：还原成 0001 的原值并抹掉 0005 记账，重跑迁移应就地改写。
+	legacyUpdatedAt := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	mustExec(ctx, t, pool, `
+UPDATE settings SET value = '0 10 4 * * 6', updated_at = $1 WHERE key = 'cron_expr'`, legacyUpdatedAt)
+	mustExec(ctx, t, pool, `DELETE FROM schema_migration WHERE version = '0005_default_cron_5_fields'`)
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("从旧种子升级到 0005 失败: %v", err)
+	}
+	if got := readCronExpr(ctx, t, pool); got != "10 4 * * 6" {
+		t.Fatalf("升级后 cron_expr 应为 \"10 4 * * 6\"，实际 %q", got)
+	}
+
+	updatedAt := readCronUpdatedAt(ctx, t, pool)
+	if !updatedAt.After(legacyUpdatedAt) {
+		t.Fatalf("改写应刷新 updated_at，实际 %s 未晚于 %s", updatedAt, legacyUpdatedAt)
+	}
+
+	// 幂等：新值已就位时再执行一次 0005，值与时标都不应变化。
+	mustExec(ctx, t, pool, `DELETE FROM schema_migration WHERE version = '0005_default_cron_5_fields'`)
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("重复执行 0005 应为幂等，实际失败: %v", err)
+	}
+	if got := readCronExpr(ctx, t, pool); got != "10 4 * * 6" {
+		t.Fatalf("重复执行后 cron_expr 应保持 \"10 4 * * 6\"，实际 %q", got)
+	}
+	if repeatedAt := readCronUpdatedAt(ctx, t, pool); !repeatedAt.Equal(updatedAt) {
+		t.Fatalf("重复执行不应改动 updated_at：之前 %s，之后 %s", updatedAt, repeatedAt)
+	}
+
+	// 管理员改成别的表达式后，0005 的定位条件不再命中，重跑也不能覆盖。
+	mustExec(ctx, t, pool, `UPDATE settings SET value = '30 6 * * 1' WHERE key = 'cron_expr'`)
+	mustExec(ctx, t, pool, `DELETE FROM schema_migration WHERE version = '0005_default_cron_5_fields'`)
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("管理员自定义 cron 后重跑 0005 失败: %v", err)
+	}
+	if got := readCronExpr(ctx, t, pool); got != "30 6 * * 1" {
+		t.Fatalf("0005 不应覆盖管理员自定义的 cron_expr，实际 %q", got)
+	}
+}
+
+// readCronExpr 读 settings 里 cron_expr 的当前值；行缺失时直接判失败，
+// 免得「读不到」被当成空串蒙过断言。
+func readCronExpr(ctx context.Context, t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+
+	var value string
+	if err := pool.QueryRow(ctx,
+		`SELECT value FROM settings WHERE key = 'cron_expr'`).Scan(&value); err != nil {
+		t.Fatalf("读取 cron_expr 失败: %v", err)
+	}
+
+	return value
+}
+
+// readCronUpdatedAt 读 cron_expr 行的 updated_at，用来断言「改了」与「没改」。
+func readCronUpdatedAt(ctx context.Context, t *testing.T, pool *pgxpool.Pool) time.Time {
+	t.Helper()
+
+	var updatedAt time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT updated_at FROM settings WHERE key = 'cron_expr'`).Scan(&updatedAt); err != nil {
+		t.Fatalf("读取 cron_expr 的 updated_at 失败: %v", err)
+	}
+
+	return updatedAt
 }
