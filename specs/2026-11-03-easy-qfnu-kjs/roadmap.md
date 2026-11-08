@@ -12,6 +12,7 @@
 ## 待做（按交付顺序）
 
 - [ ] admin-settings-sync — 设置、手动同步与运行状态：2.3 + 10.3 + 10.4 + 14.4 + 14.5 — depends: admin-bootstrap
-- [ ] admin-release — 版本对比/回退与异常数据视图：10.5 + 10.6 + 14.6 + 14.7 — depends: admin-settings-sync
+- [ ] collect-runner — 采集执行器：window / Plan / Run / publish 接线与未决项收口 — depends: admin-settings-sync + collect-pipeline
+- [ ] admin-release — 版本对比/回退与异常数据视图：10.5 + 10.6 + 14.6 + 14.7 — depends: collect-runner
 - [ ] public-web — 公开查询页与数据大屏：12 + 13 — depends: public-api（已完成）
 - [ ] deploy-ops — 容器编排、备份、清理调度、全量门禁：1.2 + 15 + 16 — depends: 全部
