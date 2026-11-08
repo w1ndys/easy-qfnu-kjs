@@ -54,3 +54,31 @@ var ErrRunStoreFailed = errors.New("采集轮次读写失败")
 // 学期与本轮不一致（含旧轮次没写学期）。此时既不能复用旧轮次、也不能新建，更不改写
 // 旧轮次的学期；按约定这里不重试，由调用方在下一轮重新尝试。
 var ErrRunConflict = errors.New("采集轮次冲突")
+
+// ErrSettingInvalid 表示设置值未通过纯校验：白名单空编号/重复/空展示名/超条数、
+// cron 语法或取值非法、URL 不是 http(s) 绝对地址、文本项明文超过 4096 字节。
+// settings.FieldError 包它（FieldError.Unwrap 恒返回本哨兵），API 层据此映射 42201；
+// 校验不碰密钥与数据库，命中它的请求一行设置都不写（Requirement 6.3、CP5）。
+var ErrSettingInvalid = errors.New("设置值非法")
+
+// ErrSettingStoreFailed 表示 settings 表的读取或事务写入失败（含事务回滚）。
+// 这是基础设施失败，与 ErrSettingInvalid 分开：上层据此映射 50000，
+// 响应文案固定，不把 SQL 细节透给客户端。
+var ErrSettingStoreFailed = errors.New("设置读写失败")
+
+// ErrRunBusy 表示已有一轮采集进行中（开始时刻距今不超过 2 小时），本次启动被拒。
+// 上层据此返回 409 + 40901，并在消息里点名冲突轮次的 run_id 与 phase；
+// 它不是冲突轮次本身的错误，调用方不该把已有轮次当成自己启动的那一轮（D9、CP13）。
+var ErrRunBusy = errors.New("已有进行中采集轮次")
+
+// ErrRunNotFound 是「指定 run_id 不存在」的哨兵，当前保留（reserved），没有调用点：
+// 读取路径 store.RunStatusRepo.ByID 用 (RunSummary, bool, error) 的 bool 承载
+// 「没有这一轮」，不返回它；当前 40401 由 handler 在 ByID 返回 false 时映射，而不是由
+// 本哨兵触发。将来只回单个 error 值、没有 bool 通道的调用方再用它映射 404 + 40401，
+// 而不是空摘要或读库失败。
+var ErrRunNotFound = errors.New("采集轮次不存在")
+
+// ErrCollectorUnavailable 表示采集启动器未装配（runner.Deps.Collect 为 nil）。
+// 未装配等于能力缺失，不是「没有数据」：白名单非空的手动同步据此返回 50000
+// 且不建轮次，不以 404 掩盖（Requirement 10.5、CP16）。
+var ErrCollectorUnavailable = errors.New("采集启动器未装配")

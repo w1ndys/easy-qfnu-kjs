@@ -2,7 +2,7 @@
 
 - [ ] 1. 设置模型与业务时区
   - 新增 `internal/model/settings.go`：七个键常量（`jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret`/`cron_expr`/`building_whitelist`）、`DefaultCronExpr='0 10 4 * * 6'`、`MaxWhitelistEntries=200`、`MaxSettingValueBytes=4096`
-  - `Building{ID jxlbh, Name name}`、`SettingRow`、`SettingChange{Delete}`、`TriggerSource{manual,cron}`、`SecretSetting(key)`、`BusinessLocation()`（+08:00 固定偏移）
+  - `Building{ID jxlbh, Name name}`、`SettingRow`、`SettingChange{Delete}`、`TriggerSource{manual,cron}`、`SettingKeys()`（返回七个键的副本）、`SecretSetting(key)`、`BusinessLocation()`（+08:00 固定偏移）
   - `internal/model/errors.go` 追加 `ErrSettingInvalid`/`ErrSettingStoreFailed`/`ErrRunBusy`/`ErrRunNotFound`/`ErrCollectorUnavailable`
   - 测试锁住 `SecretSetting` 的三真四假、`Building` 的 JSON 键名与 `meta` 的存储形状一致
 
@@ -14,7 +14,9 @@
 
 - [ ] 3. settings.Validate 纯校验
   - 白名单：trim 后编号非空且唯一、展示名非空、≤200 条；`[]` 合法；`Whitelist` 为 nil 时不校验
-  - `cron_expr` 交给 `cronexpr.Parse`；`ocr_base_url` 与解封后的 `feishu_webhook` 非空时必须是 http/https 绝对地址；单值 ≤4096 字节
+  - `cron_expr` 交给 `cronexpr.Parse`；`ocr_base_url` 与 `feishu_webhook` 非空时必须是 http/https 绝对地址（`feishu_webhook` 在加封之前按明文校验）；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文 ≤4096 字节（`jw_username` 按 `TrimSpace` 后计；白名单走条数与字段规则、cron 走语法，不套这个上界）
+  - 反向用例钉住上界的作用范围：≤200 条白名单序列化后超过 4096 字节仍合法；4097 字节的合法 URL 形状 `feishu_webhook` 仍被拒（拒绝来自字节上界而非 URL 形状）
+  - `ocr_base_url` 带前后空白的口径：trim 后恰好 4096 字节通过、trim 后 4097 字节拒绝（前后空白不计入这 4096，形状校验也判 trim 后的值）
   - `FieldError{Field,Message}` 用 `%w` 包裹 `model.ErrSettingInvalid`，消息点名字段（handler 直接透出成 `42201`）
   - 表驱动覆盖 `Patch` 指针三态（省略 / 空串 / 值），每条拒绝用例断言 `FieldError.Field` 是期望字段名（「整次不写库」由任务 5 的服务层用例断言）
 
@@ -22,12 +24,12 @@
   - `LoadSettings`：`SELECT ... WHERE key = ANY($1)`，只返回七个键，`updated_at` 原样返回
   - `ApplySettings`：单事务内逐条 `ON CONFLICT (key) DO UPDATE` 或 `DELETE`；任一条失败整体回滚；同一批用同一个 `now`
   - 结构匹配 `settings.Store`（store 不 import settings，类型用 `model.SettingRow`/`model.SettingChange`）
-  - 集成测试：upsert、删除、`updated_at` 前进、事务回滚（第二条注入超长值）、键外行不被 `LoadSettings` 返回
+  - 集成测试：upsert、删除、`updated_at` 前进、事务回滚（第二条注入超长值）、键外行不被 `LoadSettings` 返回、`ErrSettingStoreFailed` 经 `%w` 可 `errors.Is`
 
 - [ ] 5. settings.Service 读写与加解密
   - `Load`：读行 → `Snapshot`（`*_set` 只由行存在性决定；`cron_expr` 缺行回落默认值；白名单缺行回空数组）
   - `Patch`：`Validate` → 含**非空**秘密字段时 `keys.Current()` → `Seal("settings/<key>", 明文)` → 构造 `[]model.SettingChange` → 一次 `ApplySettings` → 回读；只把秘密设为空串（清除）时不取密钥
-  - 秘密明文不 trim；非秘密文本 trim 后存；空串转 `Delete`；白名单 `json.Marshal` 后存、保持提交顺序
+  - 秘密明文不 trim；非秘密文本 trim 后存，空串或 TrimSpace 后为空 → `Delete`；白名单 `json.Marshal` 后存、保持提交顺序
   - `Reveal`（唯一明文出口，供 collect-runner 与测试）、`Whitelist`、`CronExpr`；替身测试断言 AAD、`ApplySettings` 调用次数、密钥不可用时零写入
 
 - [ ] 6. store.RunStatusRepo 与 blocked 建轮

@@ -1,8 +1,11 @@
 package store
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 )
 
 // TestParseBuildingWhitelist 覆盖白名单 JSON 的解析口径：
@@ -42,5 +45,29 @@ func TestParseBuildingWhitelist(t *testing.T) {
 				t.Fatalf("解析 %q 期望 %+v，实际 %+v", c.raw, c.want, got)
 			}
 		})
+	}
+}
+
+// TestParseBuildingWhitelistRoundTripsModelBuilding 锁住「写入形状 = 读取形状」（CP7、D11）：
+// 管理端落库的是 model.Building 的 json.Marshal 结果，store 侧用 parseBuildingWhitelist
+// 读回；这里把真实写入路径产出的字节直接喂给解析器，任一侧改 JSON 键名（jxlbh/name）
+// 都会让本用例失败，而不是等到线上白名单变空。
+func TestParseBuildingWhitelistRoundTripsModelBuilding(t *testing.T) {
+	written := []model.Building{
+		{ID: "Q10", Name: "综合教学楼"},
+		{ID: "Q03", Name: "老文史楼"},
+	}
+
+	raw, err := json.Marshal(written)
+	if err != nil {
+		t.Fatalf("序列化白名单失败: %v", err)
+	}
+
+	want := []MetaBuilding{
+		{ID: "Q10", Name: "综合教学楼"},
+		{ID: "Q03", Name: "老文史楼"},
+	}
+	if got := parseBuildingWhitelist(string(raw)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("解析写入形状 %s 期望 %+v，实际 %+v（写入形状必须等于读取形状）", raw, want, got)
 	}
 }

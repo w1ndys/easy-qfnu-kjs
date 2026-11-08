@@ -53,7 +53,7 @@ sequenceDiagram
     Note over AD,ST: 写设置（严格解码 → 校验 → 加封 → 单事务）
     AD->>API: PUT /api/admin/settings（会话 + CSRF）
     API->>SET: Patch(patch)
-    SET->>SET: Validate（白名单/cron/URL/单值长度；未知字段在 handler 的严格解码已挡）
+    SET->>SET: Validate（白名单/cron/URL/文本项明文长度；未知字段在 handler 的严格解码已挡）
     SET->>SET: Seal(settings/<key>, 明文)  ← 非空秘密字段取不到密钥则 50000，一个键都不写
     SET->>ST: ApplySettings(tx: upsert / delete) → Load()
     API->>SCH: Reload(cron_expr)
@@ -157,7 +157,7 @@ const (
 
     DefaultCronExpr      = "0 10 4 * * 6" // 与 0001 种子一致；行缺失时回落
     MaxWhitelistEntries  = 200             // 4 周窗口 × 200 楼 = 800 条周结果，详情响应仍可控
-    MaxSettingValueBytes = 4096            // 单个值上限；密码 256 码点远小于它
+    MaxSettingValueBytes = 4096            // 五项文本项的明文上界（含两个 URL 项）；白名单看条数、cron 看语法
 )
 
 // Building 是白名单条目；JSON 键名沿用上游 jxlbh 与展示名 name（与 meta 的存储形状一致）。
@@ -186,6 +186,9 @@ const (
     TriggerManual TriggerSource = "manual"
     TriggerCron   TriggerSource = "cron"
 )
+
+// SettingKeys 返回七个业务设置键的副本；两个计划调用点（任务 4/5）——LoadSettings 的 IN 取键与快照组装——都从这里取集合。漏掉一项会读不出。
+func SettingKeys() []string
 
 // SecretSetting 报告某键是否为秘密设置项；GET 的回显判定只认它（Requirement 3.4）。
 func SecretSetting(key string) bool
@@ -256,7 +259,7 @@ type FieldError struct { Field, Message string }
 func (e *FieldError) Error() string
 func (e *FieldError) Unwrap() error   // 恒为 model.ErrSettingInvalid，供 errors.Is 判定 → 42201
 
-// Validate 是纯校验：白名单、cron、URL、单值长度。不碰密钥与数据库。
+// Validate 是纯校验：白名单、cron、URL、五项文本项明文 ≤ 4096 字节。不碰密钥与数据库。
 func Validate(p Patch) error
 
 type Service struct { /* store + sealer + clock */ }
@@ -361,6 +364,7 @@ type StartResult struct {
 
 type BusyError struct { Run store.RunSummary }
 func (e *BusyError) Error() string
+func (e *BusyError) Unwrap() error // 恒为 model.ErrRunBusy，供 errors.Is 判定；errors.As 取 Run 拼 409 文案
 
 type Converge func(ctx context.Context, now time.Time) ([]int64, error) // 装配层用 pipeline.ConvergeStaleRuns 实现
 
@@ -557,15 +561,19 @@ func (s *Server) withJSONBodyLimit(limit int64, next http.HandlerFunc) http.Hand
 
 | 键 | 秘密 | 值形状 | 校验 |
 |---|---|---|---|
-| `jw_username` | 否 | 文本，trim 后存 | ≤ 4096 字节；空串 = 清除 |
-| `jw_password` | **是** | `v1:` 信封密文 | ≤ 4096 字节；空串 = 清除；不加封不落库 |
-| `ocr_base_url` | 否 | `http(s)://` URL | 非空时必须是 http/https 绝对地址 |
-| `feishu_webhook` | **是** | `v1:` 信封密文 | 解密后必须是 http/https URL；空串 = 清除 |
-| `feishu_sign_secret` | **是** | `v1:` 信封密文 | ≤ 4096 字节；空串 = 清除 |
+| `jw_username` | 否 | 文本，trim 后存 | TrimSpace 后计 ≤ 4096 字节；空串或 TrimSpace 后为空 = 清除 |
+| `jw_password` | **是** | `v1:` 信封密文 | 明文 ≤ 4096 字节；空串 = 清除；不加封不落库 |
+| `ocr_base_url` | 否 | `http(s)://` URL | 非空时必须是 http/https 绝对地址；明文 ≤ 4096 字节（TrimSpace 后计）；空串或 TrimSpace 后为空 = 清除 |
+| `feishu_webhook` | **是** | `v1:` 信封密文 | 加封之前按明文校验：http/https 绝对地址且 ≤ 4096 字节；空串 = 清除 |
+| `feishu_sign_secret` | **是** | `v1:` 信封密文 | 明文 ≤ 4096 字节；空串 = 清除 |
 | `cron_expr` | 否 | 5 字段表达式 | 空串非法；`cronexpr.Parse` 通过才保存 |
 | `building_whitelist` | 否 | JSON 数组 `[{"jxlbh","name"}]` | 楼编号非空且唯一、展示名非空、≤ 200 条；`[]` 合法 |
 
-秘密项的明文**不 trim**（密码可能以空格结尾，trim 会改掉凭据）；非秘密文本项 trim 后保存。`feishu_webhook` 的 URL 形状在加封之前按明文校验，不需要为了校验先存后读。
+`MaxSettingValueBytes`（4096）作用于五项文本项的**明文**字节数：`jw_username`、`jw_password`、`ocr_base_url`、`feishu_webhook`、`feishu_sign_secret`（非秘密文本项 `jw_username`、`ocr_base_url` 按 `TrimSpace` 后计，口径见下一段）。`building_whitelist` 按条数（≤ `MaxWhitelistEntries`）与每条字段规则、`cron_expr` 按 5 字段语法校验，都不套这个字节上界。
+
+`feishu_webhook` 虽按 URL 形状校验，也必须受这个上界：它是秘密项，落库是 `v1:` 信封，明文字节数与信封长度线性相关。信封长度 ≤ `3 + 4·ceil((p+28)/3)`：`v1:` 前缀在 base64 之外（单独 3 字节），`p+28` 是 nonce 12 + 密文 + GCM tag 16 的载荷长度；无填充 base64url 每 3 字节编成 4 字符、末组不足 3 字节也按整组 4 字符计，因此这个式子是上界、取等只在 `(p+28) % 3 == 0` 时成立（`p=4096` 时该式给 5503，实际 5502）。`secret.Open` 的 64 KiB 长度门要求 `3 + 4·ceil((p+28)/3) ≤ 65536`，即 `p_max = 49121`；明文超过 49121 字节就成了「加封存得进、`Reveal` 读不出」。对 `ocr_base_url` 这类非秘密文本项，上界只是统一口径、挡住误贴的整段网页，不是凭据的强度规则。
+
+秘密项的明文**不 trim**（密码可能以空格结尾，trim 会改掉凭据）；非秘密文本项 trim 后保存，处理顺序固定为**先 TrimSpace → 再做 URL 形状校验与字节计数 → 存储 trim 后的值**：顺序反过来，前后空白既会撑大 4096 的计数，也会让形状校验去判带空白的原文。`feishu_webhook` 的 URL 形状在加封之前按明文校验，不需要为了校验先存后读。
 
 `settings` 的读写 SQL（参数化，不拼串）：
 
@@ -669,12 +677,22 @@ RETURNING run_id, started_at;
 
 `40902`、`40903`、`42901` 三种既有业务码不由本 spec 产生：没有第二个初始化入口、没有第二把密钥、管理端读不套公开限流（D13）。`50000` 的响应一律固定文案，不把 SQL 或密钥路径细节透给客户端。
 
+### 哨兵的包装关系
+
+五个哨兵都在 `model`，其中三个有包装关系必须写死被谁包装、哪一层认哪个；`ErrCollectorUnavailable` 由 `runner.Start` 直接返回（不包装）；`ErrRunNotFound` 当前保留、不返回。不写清的话，上层会把「未找到」当读库失败，或者用哨兵顶替 `bool`，同一件事出现两种判定。
+
+- `model.ErrRunBusy` 由 `runner.BusyError{Run store.RunSummary}` 包装，`Unwrap` 恒返回它。错误值里就带着冲突轮次的 `RunID` 与 `Phase`，API 层 `errors.As` 取到 `*runner.BusyError` 后直接拼 409 / `40901` 文案，不再查一次库；需要只判类别时 `errors.Is(err, model.ErrRunBusy)` 即可。`runner.Start` 只在两种情况下返回它：读到进行中轮次，或 `Collector.Start` 返回包装了 `model.ErrRunConflict` 的错误且重读 `Running` 命中。
+- `model.ErrSettingInvalid` 由 `settings.FieldError{Field, Message}` 包装：`FieldError.Unwrap` 恒返回它，`Error()` 的文案点名字段与原因。API 层既用 `errors.As` 取 `*settings.FieldError` 拿字段名拼 `42201`，也用 `errors.Is(err, model.ErrSettingInvalid)` 只判类别；`Validate` 只返回包装后的 `*FieldError`，不直接返回裸哨兵，否则错误文案里就少了具体是哪个字段。
+- `model.ErrSettingStoreFailed` 由 `store.SettingsRepo` 在 SQL 或事务失败（含回滚）时用 `%w` 映射；`settings.Service` 不吞不换，原样上抛；API 层据此映射 `50000` 并固定文案。
+- `model.ErrRunNotFound` 保留（reserved），当前没有调用点：`store.RunStatusRepo.ByID` 的 `(RunSummary, bool, error)` 用 `bool` 承载「没有这一轮」，`false` 就是「未找到」，由 handler 映射 404 / `40401`，`error` 只承载真正的读库失败；`ByID` 自己不返回这个哨兵，也不把「未找到」写进 `error`。将来只回单个 `error`、没有 `bool` 通道的读取路径再用它。
+- `model.ErrCollectorUnavailable` 不包装：`runner.Start` 在白名单非空而 `Deps.Collect == nil` 时直接返回它，没有错误类型承载额外字段；API 层 `errors.Is` 命中即 `50000`。不要为它再造一层包装，那只会让判定多一跳，换不来任何上下文。
+
 ## Test Strategy
 
 - **cronexpr 表驱动**：合法（`* * * * *`、`*/5 * * * *`、`0 10 4 * * 6`、`30 8-18/2 * * 1-5`、`0,30 * * * *`、周 `7` 归一为周日）与非法（字段数 4/6、`*/0`、`5-1`、`1,,2`、`60 * * * *`、`0 24 * * *`、`0 0 32 * *`、`0 0 * 13 *`、`0 0 * * 8`、`@every 1h`、`MON`、空串、前后多余空格）。错误文案断言含字段位置。
 - **cronexpr 属性测试**：对随机 `after` 与随机合法表达式，断言 `Matches(Next(after))` 为真且 `(after, Next(after))` 区间内无命中；`Next` 严格晚于 `after`（同一分钟不重复触发）。
 - **cronexpr 时间边界**：23:59→次日 00:00、月末→次月 1 日、12 月 31 日→次年 1 月 1 日、闰年 2 月 29 日、`0 0 30 2 *` 返回 `false`、日/周同时受限的 OR 语义（例如 `0 0 1 * 1` 在「每月 1 日」与「每周一」都触发）、`*/2` 在日字段视为受限。
-- **settings 纯校验**：白名单空编号 / trim 后重复 / 空展示名 / 201 条；cron 非法；URL 非 http(s)；单值超 4096 字节；`Whitelist: &[]` 合法。`Patch` 指针的三种状态（省略、空串、值）各有用例。
+- **settings 纯校验**：白名单空编号 / trim 后重复 / 空展示名 / 201 条；cron 非法；URL 非 http(s)；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文各测「恰好 4096 字节通过、4097 字节拒绝」（`jw_username` 按 `TrimSpace` 后计；`ocr_base_url` 另测带前后空白的口径：trim 后恰好 4096 字节通过、trim 后 4097 字节拒绝，前后空白不计入这 4096）；反向用例钉住上界的作用范围：≤200 条白名单序列化后超过 4096 字节仍然合法，`cron_expr` 只按 5 字段语法判定、不量字节，而 4097 字节的合法 URL 形状 `feishu_webhook` 仍被拒——说明拒绝来自字节上界而不是 URL 形状；`Whitelist: &[]` 合法。`Patch` 指针的三种状态（省略、空串、值）各有用例。
 - **settings 服务（替身 Store + 临时密钥）**：合法保存把所有变更放进**一次** `ApplySettings` 调用；校验失败与「非空秘密 + 密钥不可用」时 `ApplySettings` 调用次数为 0；只把秘密设为空串时不碰 `Current()` 且照常删除；秘密 `Seal` 用的 AAD 是 `settings/<key>`（替身记录参数）；`Reveal` 能取回明文、换键名与篡改密文都失败；`Load` 的 `*_set` 只由库中键存在性决定。
 - **settings 仓储集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：迁移到 0004 后 `ApplySettings` 的 upsert/delete、`updated_at`、事务回滚（注入一条超长值或让第二条失败）；`LoadSettings` 只返回七个键。
 - **runner（替身）**：白名单为空 → 不调用 `Collector`、`StartBlockedRun` 调用一次、结果 `blocked`；有 running → `BusyError` 且 `Collector` 调用 0 次；`Converge` 先于 `Running` 调用（记录顺序）；`Converge` 报错时不继续；`Collector` 返回 `model.ErrRunConflict` 映射成 `BusyError`；`Collector` 为 nil 且白名单非空 → `ErrCollectorUnavailable` 且零建轮；10 个并发 `Start` 中 `Collector.Start` 至多被调 1 次（互斥锁 + 假 Collector 的冲突响应）。
