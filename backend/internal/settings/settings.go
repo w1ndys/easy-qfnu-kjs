@@ -1,8 +1,8 @@
 // Package settings 管理业务设置的请求结构、局部更新语义与纯校验。
 //
 // 依赖方向见 specs/2026-11-08-admin-settings-sync/design.md：本包只 import 标准库、
-// model 与 cronexpr，不碰 store、api 与 secret。校验因此可以脱离数据库与密钥单独运行，
-// 秘密的加封与落库由持有窄接口的 Service 完成。
+// model、cronexpr 与 secret，不碰 store 与 api。本文件的校验因此可以脱离数据库与密钥
+// 单独运行；秘密的加封与落库由 service.go 的 Service 通过注入的窄接口完成。
 package settings
 
 import (
