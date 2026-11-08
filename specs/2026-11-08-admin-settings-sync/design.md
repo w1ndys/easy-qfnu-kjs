@@ -576,14 +576,14 @@ UPDATE settings
 | `ocr_base_url` | 否 | `http(s)://` URL | 非空时必须是 http/https 绝对地址；明文 ≤ 4096 字节（TrimSpace 后计）；空串或 TrimSpace 后为空 = 清除 |
 | `feishu_webhook` | **是** | `v1:` 信封密文 | 加封之前按明文校验：http/https 绝对地址且 ≤ 4096 字节；空串 = 清除 |
 | `feishu_sign_secret` | **是** | `v1:` 信封密文 | 明文 ≤ 4096 字节；空串 = 清除 |
-| `cron_expr` | 否 | 5 字段表达式 | 空串非法；`cronexpr.Parse` 通过才保存 |
+| `cron_expr` | 否 | 5 字段表达式，trim 后存 | 先 `TrimSpace` 再 `cronexpr.Parse`；空串或 TrimSpace 后为空非法，Parse 通过才保存 |
 | `building_whitelist` | 否 | JSON 数组 `[{"jxlbh","name"}]` | 楼编号非空且唯一、展示名非空、≤ 200 条；`[]` 合法 |
 
 `MaxSettingValueBytes`（4096）作用于五项文本项的**明文**字节数：`jw_username`、`jw_password`、`ocr_base_url`、`feishu_webhook`、`feishu_sign_secret`（非秘密文本项 `jw_username`、`ocr_base_url` 按 `TrimSpace` 后计，口径见下一段）。`building_whitelist` 按条数（≤ `MaxWhitelistEntries`）与每条字段规则、`cron_expr` 按 5 字段语法校验，都不套这个字节上界。
 
 `feishu_webhook` 虽按 URL 形状校验，也必须受这个上界：它是秘密项，落库是 `v1:` 信封，明文字节数与信封长度线性相关。信封长度 ≤ `3 + 4·ceil((p+28)/3)`：`v1:` 前缀在 base64 之外（单独 3 字节），`p+28` 是 nonce 12 + 密文 + GCM tag 16 的载荷长度；无填充 base64url 每 3 字节编成 4 字符、末组不足 3 字节也按整组 4 字符计，因此这个式子是上界、取等只在 `(p+28) % 3 == 0` 时成立（`p=4096` 时该式给 5503，实际 5502）。`secret.Open` 的 64 KiB 长度门要求 `3 + 4·ceil((p+28)/3) ≤ 65536`，即 `p_max = 49121`；明文超过 49121 字节就成了「加封存得进、`Reveal` 读不出」。对 `ocr_base_url` 这类非秘密文本项，上界只是统一口径、挡住误贴的整段网页，不是凭据的强度规则。
 
-秘密项的明文**不 trim**（密码可能以空格结尾，trim 会改掉凭据）；非秘密文本项 trim 后保存，处理顺序固定为**先 TrimSpace → 再做 URL 形状校验与字节计数 → 存储 trim 后的值**：顺序反过来，前后空白既会撑大 4096 的计数，也会让形状校验去判带空白的原文。`feishu_webhook` 的 URL 形状在加封之前按明文校验，不需要为了校验先存后读。
+秘密项的明文**不 trim**（密码可能以空格结尾，trim 会改掉凭据）；非秘密文本项（`jw_username`、`ocr_base_url`、`cron_expr`）trim 后保存，处理顺序固定为**先 TrimSpace → 再做 URL 形状/语法校验与字节计数 → 存储 trim 后的值**：顺序反过来，前后空白既会撑大 4096 的计数，也会让形状校验去判带空白的原文。`cron_expr` 不套字节上界，trim 后交给 `cronexpr.Parse`，全空白 trim 后为空按「表达式为空」拒绝；字段之间的重复空格不 trim，由 Parse 的字段切分报错。`feishu_webhook` 的 URL 形状在加封之前按明文校验，不需要为了校验先存后读。
 
 `settings` 的读写 SQL（参数化，不拼串）：
 
@@ -702,7 +702,7 @@ RETURNING run_id, started_at;
 - **cronexpr 表驱动**：合法（`* * * * *`、`*/5 * * * *`、`10 4 * * 6`、`30 8-18/2 * * 1-5`、`0,30 * * * *`、`1,* * * * *`、周 `7` 归一为周日）与非法（字段数 4/6、`*/0`、`*/+5`、`1-2/+1`、`5-1`、`1,,2`、`60 * * * *`、`0 24 * * *`、`0 0 32 * *`、`0 0 * 13 *`、`0 0 * * 8`、`@every 1h`、`MON`、空串、前后多余空格）。错误文案断言含字段位置。另有一条用例直接解析 `model.DefaultCronExpr`：字段数必须是 5，`Next` 必须落在周六 04:10——默认值退回 6 段时它先红。
 - **cronexpr 属性测试**：对随机 `after` 与随机合法表达式，断言 `Matches(Next(after))` 为真且 `(after, Next(after))` 区间内无命中；`Next` 严格晚于 `after`（同一分钟不重复触发）。
 - **cronexpr 时间边界**：23:59→次日 00:00、月末→次月 1 日、12 月 31 日→次年 1 月 1 日、闰年 2 月 29 日、`0 0 30 2 *` 返回 `false`、日/周同时受限的 OR 语义（例如 `0 0 1 * 1` 在「每月 1 日」与「每周一」都触发）、`*/2` 在日字段视为受限。
-- **settings 纯校验**：白名单空编号 / trim 后重复 / 空展示名 / 201 条；cron 非法；URL 非 http(s)；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文各测「恰好 4096 字节通过、4097 字节拒绝」（`jw_username` 按 `TrimSpace` 后计；`ocr_base_url` 另测带前后空白的口径：trim 后恰好 4096 字节通过、trim 后 4097 字节拒绝，前后空白不计入这 4096）；反向用例钉住上界的作用范围：≤200 条白名单序列化后超过 4096 字节仍然合法，`cron_expr` 只按 5 字段语法判定、不量字节，而 4097 字节的合法 URL 形状 `feishu_webhook` 仍被拒——说明拒绝来自字节上界而不是 URL 形状；`Whitelist: &[]` 合法。`Patch` 指针的三种状态（省略、空串、值）各有用例。
+- **settings 纯校验**：白名单空编号 / trim 后重复 / 空展示名 / 201 条；cron 非法（另测 `cron_expr` 前后空白 trim 后通过、全空白按空串拒绝）；URL 非 http(s)；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文各测「恰好 4096 字节通过、4097 字节拒绝」（`jw_username` 按 `TrimSpace` 后计；`ocr_base_url` 另测带前后空白的口径：trim 后恰好 4096 字节通过、trim 后 4097 字节拒绝，前后空白不计入这 4096）；反向用例钉住上界的作用范围：≤200 条白名单序列化后超过 4096 字节仍然合法，`cron_expr` 只按 5 字段语法判定、不量字节，而 4097 字节的合法 URL 形状 `feishu_webhook` 仍被拒——说明拒绝来自字节上界而不是 URL 形状；`Whitelist: &[]` 合法。`Patch` 指针的三种状态（省略、空串、值）各有用例。
 - **settings 服务（替身 Store + 临时密钥）**：合法保存把所有变更放进**一次** `ApplySettings` 调用；校验失败与「非空秘密 + 密钥不可用」时 `ApplySettings` 调用次数为 0；只把秘密设为空串时不碰 `Current()` 且照常删除；秘密 `Seal` 用的 AAD 是 `settings/<key>`（替身记录参数）；`Reveal` 能取回明文、换键名与篡改密文都失败；`Load` 的 `*_set` 只由库中键存在性决定。
 - **settings 仓储集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：迁移到 0005 后 `ApplySettings` 的 upsert/delete、`updated_at`、事务回滚（注入一条超长值或让第二条失败）；`LoadSettings` 只返回七个键。
 - **迁移集成**：`schema_migration` 记满 0001–0005 五行；0005 的三条路径各一条断言——全新迁移后 `cron_expr='10 4 * * 6'`、旧库（还原旧值并抹掉 0005 记账）重跑后被改写且 `updated_at` 前进、值已就位时重跑不再命中（值与 `updated_at` 都不变），管理员自定义的表达式不被覆盖。
