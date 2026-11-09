@@ -62,6 +62,7 @@ type Server struct {
 	keys         *secret.Manager      // 密钥文件管理器；nil 表示未装配，初始化按内部错误、指纹按 null 处理
 	settingsSvc  *settings.Service    // 业务设置读写；nil 表示未装配，设置端点按内部错误处理
 	runStatus    RunReader            // 轮次只读视图；nil 表示未装配，runs 端点按内部错误处理
+	syncStarter  SyncStarter          // 手动同步的启动端口；nil 表示未装配，sync 端点按内部错误处理
 	// settingsMu 把一次 PUT 的「Patch → reloadCron」串成一段临界区：两次并发保存若交错
 	// 成「A 写库、B 写库、B 重排、A 重排」，进程内的计划会停在 A，而库里已经是 B，
 	// 直到下次重启才对得上。GET 不加这把锁：只读快照不需要与保存串行。
@@ -161,6 +162,12 @@ func (s *Server) Handler() http.Handler {
 	// r.PathValue 取值后自己解析，ServeMux 不替它判「是不是正整数」。
 	mux.Handle("GET /api/admin/runs", s.adminRead(s.adminRunsList))
 	mux.Handle("GET /api/admin/runs/{run_id}", s.adminRead(s.adminRunDetail))
+
+	// 手动同步（tasklist 第 11 项）：写端点，但**没有请求体**，所以链是
+	// no-store → 会话 → CSRF（adminWriteNoBody），不装体门、不要求 Content-Type
+	// （Requirement 8.7）。同步会建轮次，CSRF 不能省；202 由 `writeSuccessStatus` 写出，
+	// 与 200 共用成功信封。
+	mux.Handle("POST /api/admin/sync", s.adminWriteNoBody(s.adminSync))
 	return withAdminNoStore(mux)
 }
 

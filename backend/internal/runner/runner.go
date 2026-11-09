@@ -109,6 +109,92 @@ func (e *BusyError) Unwrap() error {
 	return model.ErrRunBusy
 }
 
+// 启动失败的阶段取值，StageError.Stage 只会是这五个之一。
+//
+// 五段对应 Start 里「原样上抛」的五处失败：收敛过期轮次、读进行中轮次、读白名单、
+// 建 blocked 轮、采集启动器（design「Error Handling」的日志列）。API 层按它把 500 的
+// 日志分成五条互不相同的文案；写成常量而不是在包装点各写一份字面量，是因为阶段名同时
+// 被 runner 的包装、api 的分派与两边的测试读取，散成字面量后改名不会有编译错误，
+// 只会在日志里悄悄退化成一句「手动同步失败」。
+const (
+	StageConverge  = "converge"  // 启动前收敛超过 2 小时的 running 轮次
+	StageRunning   = "running"   // 读进行中轮次（判冲突）
+	StageWhitelist = "whitelist" // 读教学楼白名单
+	StageBlocked   = "blocked"   // 白名单为空时建立 blocked 终态轮次
+	StageCollector = "collector" // 把建轮交给采集启动器
+)
+
+// StageLabel 返回五段阶段的中文标签（「收敛过期轮次」等），未知阶段返回空串。
+//
+// 标签只有这一份：StageError.Error() 与 api 的 syncFailureLogMsg 都从这里取。
+// 两处各写一套 switch 时，改一个阶段的措辞只会让其中一处静默退化——错误文案已经
+// 换了新名、500 日志还是旧名——编译却照样通过。
+func StageLabel(stage string) string {
+	switch stage {
+	case StageConverge:
+		return "收敛过期轮次"
+	case StageRunning:
+		return "读取进行中轮次"
+	case StageWhitelist:
+		return "读取白名单"
+	case StageBlocked:
+		return "建立 blocked 轮"
+	case StageCollector:
+		return "采集启动器"
+	default:
+		return ""
+	}
+}
+
+// StageError 给「原样上抛」的启动失败贴上阶段标签，供 API 层区分 500 日志。
+//
+// 只包原样上抛的错误：映射成 409 的 *BusyError 与未装配的 model.ErrCollectorUnavailable
+// 都不包——它们的语义已由类型与哨兵表达，再包一层只会让 API 的两条专门分派绕远路。
+// Unwrap 返回原错误，所以 errors.Is / errors.As 对既有哨兵与类型（model.ErrRunConflict、
+// model.ErrRunStoreFailed、model.ErrSettingStoreFailed 等）的判定完全不变：包装只多一个
+// Stage 字段，不改变错误的类别（design「哨兵的包装关系」）。
+//
+// Error() 带原错误文案，它只用于排障：API 层从不把 Error() 写进响应——500 的响应固定
+// 「内部错误」，日志只写按阶段区分的固定 logMsg（err 可能带 SQL 与上游地址）。唯一把
+// Error() 原样落日志的路径在本包之外：StartCron 的失败被 scheduler 用
+// slog.Any("err", err) 记进 cron WARN，所以文案必须中性——不点名触发来源，但仍点名
+// 阶段；与 api 的 500 兜底文案「不点名阶段」是两回事（见 Error）。
+type StageError struct {
+	Stage string // 五段之一，见上面的 Stage* 常量
+	Err   error  // 原样上抛的错误，Unwrap 透传
+}
+
+// Error 返回「采集启动在<中文阶段>阶段失败: <原错误>」。
+//
+// 文案不点名触发来源：既不写「手动同步」，也不写「定时触发」。同一条错误路径被
+// StartCron 与手动同步共用，定时触发失败时会经 scheduler 的 slog.Any("err", err)
+// 原样落进 cron WARN；写成「手动同步」会让一条定时触发的日志看起来像管理员点了按钮，
+// 排障时先去追一个根本没发生的手动操作。
+//
+// 「中性」只约束触发来源，不约束阶段：本类型仍点名五段之一。这与 api 的
+// syncFailureLogMsg 在取不到阶段时退回的「手动同步失败」（不点名阶段）不是同一条规则
+// ——这里是「阶段已知，只是不说谁触发」，那边是「阶段未知，所以不说阶段」。混为一谈
+// 会让人以为阶段标签也该去掉。
+//
+// 阶段写中文标签而不是 converge / collector 这类内部取值：落日志时「采集启动在采集
+// 启动器阶段失败」能直接读懂，英文取值要靠代码才能对应回是哪一段。
+// 只改措辞，不改 Stage 的判定与 API 层的 409 / 50000 映射：阶段仍是五段之一，
+// 409 的 *BusyError 与未装配的 ErrCollectorUnavailable 依旧不经过本类型。
+func (e *StageError) Error() string {
+	label := StageLabel(e.Stage)
+	if label == "" {
+		// 未知阶段（调用方违约）宁可露出原取值用于排障，也不伪造一个「未知」标签，
+		// 把两段不同的失败混成同一句文案。
+		label = e.Stage
+	}
+	return fmt.Sprintf("采集启动在%s阶段失败: %v", label, e.Err)
+}
+
+// Unwrap 返回原错误，供 errors.Is / errors.As 继续判定既有哨兵与类型。
+func (e *StageError) Unwrap() error {
+	return e.Err
+}
+
 // Converge 把超过 2 小时的 running 轮次收敛成 failed，返回被收敛的轮次编号。
 //
 // 装配层用 pipeline.ConvergeStaleRuns 实现并注入（design D8）：本包不 import pipeline，
@@ -195,14 +281,19 @@ func New(deps Deps) (*Service, error) {
 // now 在一次 Start 里只取一次：Converge 的 cutoff 与 blocked 轮的三个时刻必须来自同一
 // 个瞬间，分两次取会让「收敛」与「建轮」跨过秒边界，日志与库里的时刻对不上。
 //
+// 五处「原样上抛」的失败都包成 *StageError（阶段是设计里写死的五段之一）：API 层据此
+// 把 500 日志分成五条文案，而不必去猜同一句「手动同步失败」背后的原因。映射成 409 的
+// *BusyError 与未装配的 model.ErrCollectorUnavailable 不包阶段，见 StageError 的注释。
+//
 // 第 2～5 步在 startLocked 的锁里完成；本函数只在解锁之后才做冲突重读、才记日志。
 func (s *Service) Start(ctx context.Context, source model.TriggerSource) (StartResult, error) {
 	now := s.clock()
 
 	// 先收敛再判冲突：这就是 Requirement 8.3「超过 2 小时先置 failed 再按无轮次处理」。
 	// Converge 的返回值（被收敛的编号）在这里不消费，也不进日志字段白名单。
+	// 失败包上阶段：API 层的 500 日志要能说出「是收敛那一段断的」。
 	if _, err := s.converge(ctx, now); err != nil {
-		return StartResult{}, err
+		return StartResult{}, &StageError{Stage: StageConverge, Err: err}
 	}
 
 	result, err := s.startLocked(ctx, source, now)
@@ -228,14 +319,15 @@ func (s *Service) Start(ctx context.Context, source model.TriggerSource) (StartR
 // 协程里，锁不覆盖它。
 //
 // defer 解锁：读库、白名单、建轮、Collector 每一条失败路径都先释放锁再返回，调用方拿到
-// 的错误不会带着一把还握着的锁。
+// 的错误不会带着一把还握着的锁。四条失败路径各自包成 *StageError（见 StageError），
+// 阶段分别为 running / whitelist / blocked / collector。
 func (s *Service) startLocked(ctx context.Context, source model.TriggerSource, now time.Time) (StartResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	running, found, err := s.runs.Running(ctx)
 	if err != nil {
-		return StartResult{}, err
+		return StartResult{}, &StageError{Stage: StageRunning, Err: err}
 	}
 	if found {
 		return StartResult{}, &BusyError{Run: running}
@@ -243,13 +335,13 @@ func (s *Service) startLocked(ctx context.Context, source model.TriggerSource, n
 
 	whitelist, err := s.settings.Whitelist(ctx)
 	if err != nil {
-		return StartResult{}, err
+		return StartResult{}, &StageError{Stage: StageWhitelist, Err: err}
 	}
 
 	if len(whitelist) == 0 {
 		runID, startedAt, err := s.runs.StartBlockedRun(ctx, whitelistEmptyReason, now)
 		if err != nil {
-			return StartResult{}, err
+			return StartResult{}, &StageError{Stage: StageBlocked, Err: err}
 		}
 		return StartResult{
 			RunID:     runID,
@@ -263,7 +355,13 @@ func (s *Service) startLocked(ctx context.Context, source model.TriggerSource, n
 		return StartResult{}, model.ErrCollectorUnavailable
 	}
 
-	return s.collect.Start(ctx, source)
+	// 阶段包装加在 Collector.Start 的错误上：mapCollectError 仍能通过 Unwrap 用
+	// errors.Is 认到 model.ErrRunConflict，冲突重读的映射语义不变。
+	result, err := s.collect.Start(ctx, source)
+	if err != nil {
+		return StartResult{}, &StageError{Stage: StageCollector, Err: err}
+	}
+	return result, nil
 }
 
 // StartCron 是调度器到点触发的入口：与手动共用同一段启动逻辑，只以来源 cron 区分日志
@@ -299,6 +397,13 @@ func (s *Service) StartCron(ctx context.Context) error {
 // *BusyError（409），不猜轮次编号；读不到：冲突窗口已过，返回包装了原错误的错误，
 // 让上层按 50000 让管理员重试（design「Components and Interfaces」的 Collector 契约）。
 // 重读本身失败时不改写类别：读库失败就是基础设施失败，它的错误比原冲突更有用。
+// 传进来的 err 可能已被 StageError 包过（collector 阶段的失败），errors.Is 通过 Unwrap
+// 仍能命中 model.ErrRunConflict；返回时也保留那层包装，阶段信息不会在这里丢掉。
+//
+// 外层文案只说「冲突窗口已过、请重试」，不再点名「采集启动器」：阶段已经由内层的
+// StageError 写成「采集启动在采集启动器阶段失败」，外层再点一次会让同一段在日志里
+// 出现两遍——「采集启动器报告轮次冲突…: 采集启动在采集启动器阶段失败: …」，读起来
+// 像两处独立故障，实际只有采集启动器那一段断了。
 func (s *Service) mapCollectError(ctx context.Context, err error) error {
 	if !errors.Is(err, model.ErrRunConflict) {
 		return err
@@ -311,7 +416,7 @@ func (s *Service) mapCollectError(ctx context.Context, err error) error {
 	if found {
 		return &BusyError{Run: running}
 	}
-	return fmt.Errorf("采集启动器报告轮次冲突，但已无进行中轮次，请重试: %w", err)
+	return fmt.Errorf("冲突窗口内那轮已结束，请重试: %w", err)
 }
 
 // logStarted 按来源记录一条启动结果日志。

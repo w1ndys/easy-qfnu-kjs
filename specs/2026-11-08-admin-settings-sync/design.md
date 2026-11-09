@@ -24,7 +24,7 @@ Updated: 2026-11-08
 | D6 | **采集启动器是端口，不是本 spec 的实现**：`runner.Collector` 由 `collect-runner` 注入；未装配时白名单非空的手动同步与定时触发返回 `50000` 且**不建轮次** | 编排层需要先定三件本 spec 无权决定的事：窗口由谁写（`collect_run.window_start` 目前没有写入口）、明细任务的「不可用格」列表从哪来、断点续跑时内存候选如何重建。硬塞进本 spec 会让一个 spec 覆盖两条交付线，也违反「一次一个最小功能」。过渡态是可观察的：启动日志一条 WARN，接口返回 `50000`，库中不留假轮次（CP16） |
 | D7 | **触发来源只进日志，不落库** | 没有验收条目要求按来源筛选；加一列就要一版迁移。日志字段 `trigger=manual\|cron` 足以排障；将来要按来源统计再加下一版迁移 |
 | D8 | **启动前先收敛过期轮次**：复用 `pipeline.ConvergeStaleRuns`（装配层注入为 `runner.Converge`），口径「超过 2 小时的 running 置 failed + `stale_run`」只有一份 | 否则进程在长跑期间崩溃留下的 running 会永久占住唯一索引，之后每次手动同步都只能 409（Requirement 8.3）。把函数注入而不是在 runner 里重算 cutoff，是为了让「2 小时」与 `started_at <` 的边界不会出现第二份实现 |
-| D9 | **手动同步不复用进行中轮次**：先判冲突（409），冲突时不调用采集启动器 | `pipeline.StartRun` 撞唯一索引时会把已有轮次返回给调用方（`Reused=true`），那是「进程重启后续跑」的语义，不是「管理员点了第二次」。两者混用会让手动同步静默接上别人的轮次，面板看到的状态与管理员的操作对不上（CP13） |
+| D9 | **手动同步不复用进行中轮次**：先判冲突（409），不复用赢家的轮次；两条 409 路径的副作用范围不同——`Running()` 判空路径直接返回 409，**不调用** `Collector.Start`；跨副本输家由 `Collector.Start` 撞唯一索引返回包装 `model.ErrRunConflict` 的错误、重读 `Running` 命中赢家，同样折成 409，这条路径**调用了一次** `Collector.Start`，但**零建轮** | `pipeline.StartRun` 撞唯一索引时会把已有轮次返回给调用方（`Reused=true`），那是「进程重启后续跑」的语义，不是「管理员点了第二次」。两者混用会让手动同步静默接上别人的轮次，面板看到的状态与管理员的操作对不上（CP13） |
 | D10 | **设置写入严格且原子**：`DisallowUnknownFields` + 64 KiB 体上限 + 单事务 | 拼错键名（如 `cron_express`）静默不生效最难排；严格解码直接 `40001`。白名单 200 条时大约几 KiB，`adminWrite` 的 8 KiB 是给密码留的，不够，所以设置用 64 KiB 的独立上限；64 KiB 是**请求体（解码前）**的上限，序列化后的库内值可能更大（`settings.value` 是 `text`，无长度约束）——白名单按条数与每条字段规则（`jxlbh`/`name` 各 trim 后 ≤ 4096 字节）校验，整个数组不另设字节上界。原子性按 PRD 5.2「校验失败时整次不保存」 |
 | D11 | **白名单顺序即归属裁决顺序**，保存时按提交顺序落库、不排序、不去重后重排 | 归属冲突的「首个命中」按白名单顺序（原 spec Requirement 5.3），保存时排序会悄悄改变裁决结果（CP6） |
 | D12 | **单实例进程内调度**：compose 部署单副本；多副本时各实例都会触发，靠唯一索引只让一轮启动 | 与 D1 单进程 + 采集协程一致。多副本下「提交了 `cron_expr` 的保存后立即重排」只发生在处理该请求的实例，其余实例要等重启；这条限制写进 CP17，不假装已解决 |
@@ -113,7 +113,7 @@ model      → 标准库
 
 `api` 的 allow 列表补 `internal/settings`、`internal/runner`、`internal/cronexpr`（`internal/store` 已在列表里）。
 
-> **task 9 的提前放行**：`api` allow 里的 `internal/settings` 与 `internal/cronexpr` 已在 task 9 加上（不加这两条，task 9 的 `golangci-lint` 门禁根本过不去）。**task 12 仍欠四条 depguard 规则**（`settings`/`cronexpr`/`scheduler`/`runner`）与 `api` allow 的 `internal/runner`：lint 现在是绿的，不代表依赖规则已经补完——新包目前没有任何「不许 import 谁」的约束，越层不会被拦。
+> **api allow 的放行进度**：`api` allow 已全部补齐——`internal/settings` 与 `internal/cronexpr` 在 task 9 加上（不加这两条，task 9 的 `golangci-lint` 门禁根本过不去），`internal/runner` 在 task 11 加上。**仍欠 `settings`/`cronexpr`/`scheduler`/`runner` 四条包规则**（task 12 补）：lint 现在是绿的，不代表依赖规则已经补完——这四个新包目前没有任何「不许 import 谁」的约束，越层不会被拦。
 
 ## Components and Interfaces
 
@@ -135,10 +135,12 @@ backend/internal/store/runstatus.go            RunStatusRepo（Recent/ByID/Weeks
 backend/internal/store/settings_integration_test.go
 backend/internal/store/runstatus_integration_test.go
 backend/internal/api/admin_settings.go         GET/PUT /api/admin/settings
-backend/internal/api/admin_runs.go             GET runs、GET runs/{id}、POST sync
+backend/internal/api/admin_runs.go             GET runs、GET runs/{id}
+backend/internal/api/admin_sync.go             POST /api/admin/sync
 backend/internal/api/admin_read.go             adminRead / adminWriteLimit / adminWriteNoBody（或并入 admin_middleware.go）
 backend/internal/api/admin_settings_test.go    契约测试
 backend/internal/api/admin_runs_test.go
+backend/internal/api/admin_sync_test.go        契约测试
 backend/internal/e2e/admin_settings_sync_test.go  端到端检查点
 ```
 
@@ -368,6 +370,22 @@ type BusyError struct { Run store.RunSummary }
 func (e *BusyError) Error() string
 func (e *BusyError) Unwrap() error // 恒为 model.ErrRunBusy，供 errors.Is 判定；errors.As 取 Run 拼 409 文案
 
+// StageError 给「原样上抛」的启动失败贴阶段标签：Stage 取 converge / running /
+// whitelist / blocked / collector 五段之一，Unwrap 返回原错误（既有哨兵判定不变）。
+// API 层从不把 Error() 写进响应；唯一日志出口是 StartCron 失败经 scheduler 的
+// slog.Any("err", err) 进 cron WARN，故 Error() 文案必须中性：不点名触发来源
+// （不写「手动同步」，也不写「定时触发」），但仍点名阶段；这与 api 的 500 日志在
+// 取不到阶段时退回「手动同步失败」（不点名阶段）是两回事，不要混为一谈。
+// 阶段用中文标签（StageLabel），与 API 的 500 日志文案共用同一份。
+type StageError struct {
+    Stage string
+    Err   error
+}
+func (e *StageError) Error() string
+func (e *StageError) Unwrap() error
+
+func StageLabel(stage string) string // 五段的中文标签（「收敛过期轮次」等），未知阶段返回空串
+
 type Converge func(ctx context.Context, now time.Time) ([]int64, error) // 装配层用 pipeline.ConvergeStaleRuns 实现
 
 type Deps struct {
@@ -404,7 +422,7 @@ func (s *Scheduler) Next() (time.Time, bool)      // 供测试与启动日志
 // internal/api —— 新增装配项与中间件
 func WithAdminSettings(svc *settings.Service, reloadCron func(expr string) error) Option
 func WithRunStatus(reader RunReader) Option
-func WithSync(svc *runner.Service) Option
+func WithSync(starter SyncStarter) Option
 
 type RunReader interface {
     Recent(ctx context.Context, limit, offset int) ([]store.RunSummary, int, error)
@@ -419,6 +437,8 @@ func (s *Server) adminWriteLimit(limit int64, next http.HandlerFunc) http.Handle
 func (s *Server) adminWriteNoBody(next http.HandlerFunc) http.HandlerFunc          // no-store → 会话 → CSRF（sync 无请求体）
 func (s *Server) withJSONBodyLimit(limit int64, next http.HandlerFunc) http.HandlerFunc // withJSONBody 参数化，8 KiB 仍由旧调用点传入
 ```
+
+`SyncStarter` 是本包自己声明的消费侧接口，只有 `Start` 一个方法，是 `*runner.Service` 的子集：装配层直接把 `runner.New` 的返回值传给 `WithSync`，测试则可以给纯替身。用接口而不是具体类型，是为了让 HTTP 层只依赖它真正消费的那一件事（发起一轮并拿到 `StartResult` 或错误），不把 `runner` 的其余能力（`StartCron`、`Next` 等）带进 API 层。
 
 `adminWriteLimit` 之外还要一个 `decodeAdminBodyStrict`（`dec.DisallowUnknownFields()`）与既有的 `decodeAdminBody` 并列：严格解码只用于 `PUT /api/admin/settings`，避免影响 `admin-bootstrap` 已定的密码端点契约。
 
@@ -528,12 +548,14 @@ func (s *Server) withJSONBodyLimit(limit int64, next http.HandlerFunc) http.Hand
 ```json
 // 202：启动成功
 { "code": 0, "message": "success",
-  "data": { "run_id": 15, "status": "running", "started_at": "2026-11-08T12:10:00Z" } }
+  "data": { "run_id": 15, "status": "running", "started_at": "2026-11-08T12:10:00Z" },
+  "request_id": "req_..." }
 
 // 202：白名单为空，轮次已阻止
 { "code": 0, "message": "success",
   "data": { "run_id": 16, "status": "blocked", "started_at": "2026-11-08T12:10:00Z",
-            "reason": "教学楼白名单为空，未发起采集" } }
+            "reason": "教学楼白名单为空，未发起采集" },
+  "request_id": "req_..." }
 
 // 409：已有进行中轮次
 { "code": 40901, "message": "已有一轮采集进行中（run_id=14, phase=week_matrix），请等待其结束",
@@ -660,7 +682,7 @@ RETURNING run_id, started_at;
 - CP11 **单轮互斥**：`collect_run_single_running` 仍是最终判据；`runner.Service` 的互斥锁让单进程内的「读 running → 建轮」不互相穿插，跨进程由唯一索引兜底，输家映射成 `40901`。
 - CP12 **blocked 不占 running 槽**：`blocked` 轮次直接以终态插入，不触发部分唯一索引；紧接着的第二次同步仍可正常启动（或得到 409，取决于是否真有 running）。
 - CP13 **409 只在真有进行中轮次时出现**：判冲突前先收敛超过 2 小时（严格 `<`）的 running；`stale_run` 被收敛后同一请求继续按无轮次处理，不返回 409，也不调用采集启动器。
-- CP14 **冲突不产生副作用**：返回 409 的请求不新建轮次、不调用 `Collector.Start`（替身断言调用次数为 0）。
+- CP14 **冲突不产生副作用（零建轮）**：返回 409 的请求都不新建轮次。两种 409 的副作用边界不同：`Running()` 判空路径（单进程内输家、已有进行中轮次）**不调用** `Collector.Start`，替身断言调用次数为 0；跨副本输家路径（`Collector.Start` 撞唯一索引返回 `ErrRunConflict`、重读 `Running` 命中赢家）**调用了一次** `Collector.Start`，但**零建轮**——输家没有写出任何 `collect_run` 行，赢家的轮次不被复用。
 - CP15 **运行状态只读且忠实**：轮次字段原样来自 `collect_run` / `collect_run_week` / `sync_task` 聚合，不做推算；未知 `run_id` → `40401`；一条轮次都没有时是空列表而不是错误。
 - CP16 **未装配不留脏数据**：`Collector` 为 nil 且白名单非空时返回 `50000`，`collect_run` 行数不变；装配缺失只记日志，不写假轮次。
 - CP17 **单实例前提**：调度在进程内，单副本部署下「提交了 `cron_expr` 的保存即重排」成立；多副本时其它实例要等重启，且同一计划时刻每个实例都会触发一次，靠唯一索引只让一轮成立——这是已知限制，不是本 spec 的保证。
@@ -686,6 +708,7 @@ RETURNING run_id, started_at;
 | `ApplySettings` 已成功但回读失败 | 500 | 50000 | 设置已落库；重试幂等（重放后可见设置相同），不回滚已提交的事务；日志文案「回读设置失败（写入已提交）」，与写入失败的「保存设置失败」区分（`*settings.ReadBackError` 分派） |
 | 空补丁（`{}` / `null`）回读失败 | 500 | 50000 | 一个字段都没提交，`ApplySettings` 零调用、从未开过写事务，因此既不是「保存设置失败」也没有「已提交」可讲；日志文案「设置读写失败」，与「保存设置失败」「回读设置失败（写入已提交）」三条互不相同（handler 把 `emptySettingsPatch` 作独立 case、排在 `*ReadBackError` 之后与哨兵兜底之前，分派不看错误类别——非哨兵的读错误同样记这条），否则运维会去追一次根本没发生的写入，或误以为设置已经落库 |
 | 采集启动器未装配（白名单非空） | 500 | 50000 | 不建轮次；启动期已记一条 WARN |
+| 手动同步启动失败（收敛过期轮次 / 读进行中轮次 / 读白名单 / 建 blocked 轮 / 采集启动器） | 500 | 50000 | 响应固定「内部错误」；`logMsg` 按 `runner.StageError.Stage` 分成五条互不相同的固定文案（「手动同步失败（收敛过期轮次）」等），取不到阶段时退回「手动同步失败」；**不记 err 原文**（可能带 SQL 与上游地址） |
 | 装配缺失（`WithAdminSettings`/`WithRunStatus`/`WithSync` 未调用） | 500 | 50000 | 与既有 `WithAdmin` 未装配同口径，不以 404 掩盖 |
 | `PUT /api/admin/settings` 未装配 `WithAdminSettings`，请求体同时非法 | 500 | 50000 | handler 的 nil 检查在严格解码**之前**：`50000` 优先于 `40001`；体门与会话/CSRF 仍在外层（`Content-Type` 不符先 `40001`、未登录先 `40101`） |
 | cron 存量表达式非法（启动期） | — | — | 记 ERROR 后回落 `DefaultCronExpr`，服务照常启动（Requirement 9.6） |
@@ -703,6 +726,7 @@ RETURNING run_id, started_at;
 - `model.ErrSettingStoreFailed` 由 `store.SettingsRepo` 在 SQL 或事务失败（含回滚）时用 `%w` 映射，另含开事务前的键白名单拒绝；`settings.Service` 的读路径（`Load`/`Reveal`/`Whitelist`/`CronExpr`）不吞不换、原样上抛。唯一例外是 `Patch` 在 `ApplySettings` 提交之后的那次回读：它包成 `*settings.ReadBackError`（`Unwrap` 透传原始错误，`errors.Is` 仍命中本哨兵），让 API 层把「写入已提交、只是回读失败」与「写入失败」记成两种日志文案；API 层必须**先**按 `*ReadBackError` 分派、再按哨兵兜底，两者都映射 `50000` 并共用固定响应文案。
 - `model.ErrRunNotFound` 保留（reserved），当前没有调用点：`store.RunStatusRepo.ByID` 的 `(RunSummary, bool, error)` 用 `bool` 承载「没有这一轮」，`false` 就是「未找到」，由 handler 映射 404 / `40401`，`error` 只承载真正的读库失败；`ByID` 自己不返回这个哨兵，也不把「未找到」写进 `error`。将来只回单个 `error`、没有 `bool` 通道的读取路径再用它。
 - `model.ErrCollectorUnavailable` 不包装：`runner.Start` 在白名单非空而 `Deps.Collect == nil` 时直接返回它，没有错误类型承载额外字段；API 层 `errors.Is` 命中即 `50000`。不要为它再造一层包装，那只会让判定多一跳，换不来任何上下文。
+- `runner.StageError{Stage, Err}` 是「原样上抛」的启动失败的外层包装，不是哨兵：`Unwrap` 返回 `Err`，因此 `errors.Is` 对 `model.ErrRunConflict`、`model.ErrRunStoreFailed`、`model.ErrSettingStoreFailed` 等既有哨兵的判定不变，`mapCollectError` 照旧能认出 `ErrRunConflict`。`Stage` 只取五段之一（`converge`/`running`/`whitelist`/`blocked`/`collector`，对应 `Start` 与 `startLocked` 的五处失败）；API 层 `errors.As` 取到后仅用它选 500 日志文案，409 的 `*BusyError` 与未装配的 `ErrCollectorUnavailable` 都不包阶段。
 
 ## Test Strategy
 
@@ -714,10 +738,10 @@ RETURNING run_id, started_at;
 - **settings 仓储单测（替身）**：`LoadSettings` 的查询参数就是 `model.SettingKeys()` 的七项；SQL 片段钉住 `WHERE key = ANY($1)`、`ORDER BY key` 与 upsert 的三处 `EXCLUDED.*`（`value`/`is_secret`/`updated_at`）；`pgx.Rows` 替身按位置真赋值并校验列数与类型，锁住四列 `key, value, is_secret, updated_at` 的扫描顺序；空批次不开事务；一批只开一个事务、每条 upsert 都用同一个 `now`、最后提交一次；键外变更在开事务前整批拒绝且零语句；`Delete` 分支只传键；第二条失败立即停止并回滚；Query/Scan/`rows.Err`/Begin/Commit 各自包 `ErrSettingStoreFailed`，错误消息只带键名不带值。
 - **settings 仓储集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：迁移到 0005 后 `ApplySettings` 的 upsert/delete、`updated_at`、事务回滚（第二条注入 NUL 等必然失败的值）；`LoadSettings` 只返回七个键，且键外行仍在库里（直查 `count(*)` 为 1）——证明「存在但读不到」，而不是「压根没插进去」。
 - **迁移集成**：`schema_migration` 记满 0001–0005 五行；0005 的三条路径各一条断言——全新迁移后 `cron_expr='10 4 * * 6'`、旧库（还原旧值并抹掉 0005 记账）重跑后被改写且 `updated_at` 前进、值已就位时重跑不再命中（值与 `updated_at` 都不变），管理员自定义的表达式不被覆盖。
-- **runner（替身）**：白名单为空 → 不调用 `Collector`、`StartBlockedRun` 调用一次、结果 `blocked`；有 running → `BusyError` 且 `Collector` 调用 0 次；`Converge` 先于 `Running` 调用（记录顺序）；`Converge` 报错时不继续；`Collector` 返回 `model.ErrRunConflict` 映射成 `BusyError`；`Collector` 为 nil 且白名单非空 → `ErrCollectorUnavailable` 且零建轮；10 个并发 `Start` 中 `Collector.Start` 至多被调 1 次（互斥锁 + 假 Collector 的冲突响应）。
+- **runner（替身）**：白名单为空 → 不调用 `Collector`、`StartBlockedRun` 调用一次、结果 `blocked`；有 running → `BusyError` 且 `Collector` 调用 0 次；`Converge` 先于 `Running` 调用（记录顺序）；`Converge` 报错时不继续；`Collector` 返回 `model.ErrRunConflict` 映射成 `BusyError`；`Collector` 为 nil 且白名单非空 → `ErrCollectorUnavailable` 且零建轮；五段失败各自包成 `*StageError` 且 `Stage` 为 `converge`/`running`/`whitelist`/`blocked`/`collector`、`errors.Is` 仍命中原错误，`BusyError` 与 `ErrCollectorUnavailable` 不带阶段；10 个并发 `Start` 中 `Collector.Start` 至多被调 1 次（互斥锁 + 假 Collector 的冲突响应）。
 - **scheduler（假时钟 + 注入 `wait`）**：到点触发一次；`Reload` 后按新表达式；触发返回错误只记日志并在下一时刻继续；`ctx` 取消后 `Run` 返回；存量表达式非法时回落默认值；`Next` 与 cronexpr 结果一致。
-- **api 契约（httptest + 替身 Reader/Service）**：五个端点的状态码、业务码、`data` 键集合、`Cache-Control: no-store`；GET 响应不含秘密哨兵；PUT 非法字段整次不变；PUT 未知字段 40001；64 KiB 边界（恰好通过、+1 拒绝）；`limit`/`offset`/`run_id` 越界；409 消息含 `run_id`；未装配三件依赖时 50000。
-- **并发同步**：50 个 `POST /api/admin/sync` 同时打（假 Collector 用互斥模拟唯一索引，并发输家返回 `ErrRunConflict`），断言恰好 1 个 202 `running`，其余 409/40901，且 `collect_run` 只多一行。
+- **api 契约（httptest + 替身 Reader/Service）**：五个端点的状态码、业务码、`data` 键集合、`Cache-Control: no-store`；GET 响应不含秘密哨兵；PUT 非法字段整次不变；PUT 未知字段 40001；64 KiB 边界（恰好通过、+1 拒绝）；`limit`/`offset`/`run_id` 越界；409 消息含 `run_id`；未装配三件依赖时 50000；手动同步 500 的五段日志文案互不相同且不含 err 原文（取不到阶段时退回「手动同步失败」）。
+- **并发同步**：50 个 `POST /api/admin/sync` 同时打，断言恰好 1 个 202 `running`，其余 409/40901，且采集启动器只被调用 1 次。单进程内的输家由 `Running()` 判空拦下（不经过唯一索引、不产生 `ErrRunConflict`）；跨副本输家撞唯一索引、`Collector.Start` 返回 `ErrRunConflict` 后重读 `Running` 命中的形态，由单独用例覆盖，不在 50 并发里复现。
 - **并发保存**：两个 `PUT /api/admin/settings` 带不同 `cron_expr` 同时打（重复 32 轮），断言两次都 `200`、各重排一次，且 `reload` 记录的最后一项等于库里的 `cron_expr`——即「最后一次写库」与「最后一次重排」是同一个请求（CP19）。缺 `settingsMu` 时会出现「库=B、进程内计划=A」，而且 `reload` 记录与存储替身的行/调用计数会被两个请求 goroutine 同时写，`-race` 会直接报出来。
 - **端到端检查点（真实库 + 假 Collector）**：init → login → `GET /api/admin/settings`（默认 cron、空白名单）→ `PUT` 白名单 + cron + 三个秘密 → `GET`（`*_set=true`、无明文、`cron_next_at` 正确）→ 空名单手动 sync → 202 `blocked` → 配好名单后手动 sync → 202 `running` → 再 sync → 409 → `GET /api/admin/runs` 与 `/runs/{id}` → `PUT` 非法 cron → 42201 且设置逐字节不变 → 库里 `jw_password` 以 `v1:` 开头且不等于明文。
 - **日志脱敏**：用唯一哨兵作为秘密与密码提交，捕获 `slog` 输出，断言整段日志不含哨兵、不含密文、不含 Cookie 与 CSRF 值。

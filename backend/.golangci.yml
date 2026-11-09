@@ -122,6 +122,10 @@ linters:
         # secret 只被管理端的 state/init 用来取指纹与一次性创建密钥，同样是纯能力调用。
         # settings 是业务设置的读写服务（GET/PUT /api/admin/settings），cronexpr 被设置端点
         # 直接用来算 cron_next_at；两者都只是调用，不存在反向依赖。
+        # runner 只被 POST /api/admin/sync 消费：handler 拿 runner.StartResult 拼 202 的
+        # data、用 *runner.BusyError 拼 409 文案，不反向依赖 HTTP 层。runner 是本项 import
+        # 必要（与第 9 项 settings/cronexpr 同一性质）；第 12 项仍欠
+        # settings/cronexpr/scheduler/runner 四条 depguard 包规则。
         api:
           files:
             - "**/internal/api/**"
@@ -138,3 +142,4 @@ linters:
             - github.com/w1ndys/easy-qfnu-kjs/internal/secret
             - github.com/w1ndys/easy-qfnu-kjs/internal/settings
             - github.com/w1ndys/easy-qfnu-kjs/internal/cronexpr
+            - github.com/w1ndys/easy-qfnu-kjs/internal/runner

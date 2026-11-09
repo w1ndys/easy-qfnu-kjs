@@ -70,11 +70,11 @@
 - [ ] 11. api 手动同步端点
   - `POST /api/admin/sync`：`adminWriteNoBody`（no-store → 会话 → CSRF，不读体、不要求 `Content-Type`）→ `runner.Start(manual)`
   - 202 返回 `{run_id, status, started_at}`（blocked 另带 `reason`）；`BusyError` 映射 409 + `40901`，消息点名 `run_id` 与 `phase`；`ErrCollectorUnavailable` 与仓储失败映射 `50000`
-  - 新增业务码常量 `codeRunBusy=40901`；`codeRunNotFound=40401` 复用第 10 项已定义的常量；202 走 `writeJSON`（`ok` 固定 200）
-  - 契约测试：202 三种形状、409 消息、未装配 50000、缺 CSRF 40301、并发 50 请求只 1 个 202（假 Collector 对并发输家返回 `ErrRunConflict`）
+  - 新增业务码常量 `codeRunBusy=40901`；`codeRunNotFound=40401` 复用第 10 项已定义的常量；202 走 `writeSuccessStatus`（`ok` 与 `writeSuccess` 固定 200，成功信封仍只在一处定义）
+  - 契约测试：202 两种 data 形状（running 3 键 / blocked 4 键）、409 消息、未装配 50000、缺 CSRF 40301、并发 50 请求只 1 个 202；另有一例（假 Collector 返回 `ErrRunConflict`、重读 `Running` 命中）覆盖输家的 409 路径
 
 - [ ] 12. 装配、依赖规则与端到端检查点
   - `main.go` 装配 `settings.New(store.NewSettingsRepo(pool), keys, nil)`、`store.NewRunStatusRepo(pool)`、`runner.New`（`Converge` 用 `pipeline.ConvergeStaleRuns` 包装）、`scheduler.New` 并 `go Run(ctx)`、三个 `api.With*`；装配层加 `var _ settings.Store = store.SettingsRepo{}`
-  - depguard 补 `settings`/`cronexpr`/`scheduler`/`runner` 四条规则，`api` allow 补 `settings`/`runner`/`cronexpr`；启动日志新增 `collector_wired`、`settings_cron`，`Collector==nil` 时记一条 WARN（task 9 已提前给 `api` allow 放行 `settings`/`cronexpr`；**本条仍欠四条规则 + `api` allow 的 `runner`**，lint 绿不等于依赖规则已补完）
+  - depguard 补 `settings`/`cronexpr`/`scheduler`/`runner` 四条规则，`api` allow 补 `settings`/`runner`/`cronexpr`；启动日志新增 `collector_wired`、`settings_cron`，`Collector==nil` 时记一条 WARN（`api` allow 的 `runner` 已在第 11 项补齐、`settings`/`cronexpr` 已在第 9 项补齐；**仍欠 `settings`/`cronexpr`/`scheduler`/`runner` 四条 depguard 包规则**，lint 绿不等于依赖规则已补完）
   - 端到端（真实库 + 假 Collector）：init → login → GET 默认设置 → PUT（白名单 + cron + 三个秘密）→ GET（`*_set`、无明文、`cron_next_at`）→ 空白名单 sync 得 blocked → 配名单后 sync 得 running → 再 sync 得 409 → runs 列表与详情 → 非法 cron 42201 且设置不变 → 库里密文以 `v1:` 开头
   - 日志脱敏（哨兵不出现在日志/响应）、门禁与任务 9 同口径（`go build ./...`、`go vet ./...`、`golangci-lint run`、`go test -count=1 ./...`、`go test -race -count=1 ./internal/api ./internal/settings` 全部 0 退出）、`go.mod` 无变化；有疑问询问用户

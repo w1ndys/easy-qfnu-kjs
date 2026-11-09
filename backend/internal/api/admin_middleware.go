@@ -3,12 +3,14 @@ package api
 // 本文件是管理端 HTTP 的横切层：请求体大小与 Content-Type、会话、CSRF、no-store、错误码映射
 // 与日志字段白名单。
 // 管理端读端点的顺序固定为 no-store → 会话 → 业务（adminRead）；
-// 写端点的顺序固定为 no-store → 体门 → 会话 → CSRF → 业务（adminWrite / adminWriteLimit）：
+// 写端点的顺序固定为 no-store → 体门 → 会话 → CSRF → 业务（adminWrite / adminWriteLimit），
+// 没有请求体的写端点（sync）省掉体门，其余门序不变（adminWriteNoBody）：
 // 任何一步失败都不进入下一步，因此「缺会话 / 缺 CSRF 时业务写方法调用为 0」由链路结构保证，
 // 而不是靠每个 handler 自觉（CP7）。
 // 体门的上限是参数：密码类端点 8 KiB、设置端点 64 KiB，两条链只有这一个差异。
 // state/init 的处理器在 admin.go、路由在 api.go 注册；登录、退出与改密的处理器在
-// admin_session.go，设置读写处理器在 admin_settings.go，路由同样在 api.go 注册。
+// admin_session.go，设置读写处理器在 admin_settings.go，轮次读取在 admin_runs.go，
+// 手动同步在 admin_sync.go，路由同样在 api.go 注册。
 // 这里只提供可组合的中间件与解析入口。
 
 import (
@@ -156,6 +158,18 @@ func (s *Server) adminWrite(next http.HandlerFunc) http.HandlerFunc {
 // 本函数不猜端点。
 func (s *Server) adminWriteLimit(limit int64, next http.HandlerFunc) http.HandlerFunc {
 	return withNoStore(s.withJSONBodyLimit(limit, s.withSession(s.withCSRF(next))))
+}
+
+// adminWriteNoBody 是「没有请求体」的管理端写链路：
+//
+//	no-store → 会话 → CSRF → 业务
+//
+// POST /api/admin/sync 不读请求体、也不要求 Content-Type（Requirement 8.7）：
+// 套上 withJSONBodyLimit 会把 `curl -X POST` 这种空体、无 Content-Type 的请求按 40001
+// 拒掉，而同步不需要任何输入。除体门之外门序与 adminWrite 完全相同——同步会建轮次，
+// 属于写操作，CSRF 不能省；未通过会话的请求连 CSRF 比对都不做（与 adminWrite 一致）。
+func (s *Server) adminWriteNoBody(next http.HandlerFunc) http.HandlerFunc {
+	return withNoStore(s.withSession(s.withCSRF(next)))
 }
 
 // withJSONBody 是写请求体的门：8 KiB 上限 + Content-Type 必须是 application/json。

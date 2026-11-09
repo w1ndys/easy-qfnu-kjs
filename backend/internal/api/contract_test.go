@@ -275,8 +275,18 @@ func decodeContractBody(t *testing.T, rec *httptest.ResponseRecorder) map[string
 // 业务码为 0 同时排除了 40401：空态与「无数据」都不能走错误码。
 func contractSuccessData(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
-	if rec.Code != http.StatusOK {
-		t.Fatalf("期望 HTTP 200，实际 %d，body=%s", rec.Code, rec.Body.String())
+	return contractSuccessDataStatus(t, rec, http.StatusOK)
+}
+
+// contractSuccessDataStatus 是成功信封的形状断言，状态码由调用方指定。
+//
+// 手动同步的成功响应是 202（已受理、轮次还没跑完），信封与 200 完全一致；状态码参数化
+// 之后 202 的用例复用同一份形状断言，而不是另写一份只差一个数字的副本——副本迟早会忘掉
+// 新增的信封校验（例如 request_id 的格式），而契约测试的价值全在「一处定义、处处同源」。
+func contractSuccessDataStatus(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int) map[string]any {
+	t.Helper()
+	if rec.Code != wantStatus {
+		t.Fatalf("期望 HTTP %d，实际 %d，body=%s", wantStatus, rec.Code, rec.Body.String())
 	}
 	body := decodeContractBody(t, rec)
 	if code, ok := body["code"].(float64); !ok || code != 0 {
@@ -313,15 +323,64 @@ func assertContractFailure(t *testing.T, rec *httptest.ResponseRecorder, wantSta
 	return body
 }
 
-// assertContractRequestID 断言 request_id 是 req_ + 32 位十六进制。
+// assertContractRequestID 断言 request_id 是 req_ + 32 位小写十六进制（a-f0-9）。
+//
+// 字符集也要校验：只判长度与前缀时，`req_` 后接 32 个任意字符（大写十六进制、路径片段、
+// 甚至注入用的符号）都能通过，「req_ + 32 位」这条契约就只剩一半。newRequestID 用
+// hex.EncodeToString 生成，输出恒为小写，所以合法值必须逐字符落在 0-9a-f 内。
 func assertContractRequestID(t *testing.T, value any) {
 	t.Helper()
 	id, ok := value.(string)
 	if !ok {
 		t.Fatalf("request_id 不是字符串: %#v", value)
 	}
-	if len(id) != len("req_")+32 || !strings.HasPrefix(id, "req_") {
-		t.Fatalf("request_id 不符合 req_+32 位十六进制: %q", id)
+	if !validContractRequestID(id) {
+		t.Fatalf("request_id 不符合 req_ + 32 位小写十六进制（a-f0-9）: %q", id)
+	}
+}
+
+// validContractRequestID 是 assertContractRequestID 的纯谓词，单独拆出来是为了让
+// 反例（大写、长度不对、非十六进制字符）能被表驱动用例直接覆盖——断言函数只会
+// t.Fatalf，没法在测试里安全地喂给它非法值。
+func validContractRequestID(id string) bool {
+	if !strings.HasPrefix(id, "req_") {
+		return false
+	}
+	digest := id[len("req_"):]
+	if len(digest) != 32 {
+		return false
+	}
+	for _, c := range digest {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// TestValidContractRequestID 锁住 request_id 的完整契约：前缀、长度与字符集三者缺一不可。
+// 反例都取自「只判长度 + 前缀」时会被误放行的写法：大写十六进制、32 位非十六进制字符串。
+func TestValidContractRequestID(t *testing.T) {
+	lower := strings.Repeat("0a", 16)
+	cases := []struct {
+		name string
+		id   string
+		want bool
+	}{
+		{"合法：req_ + 32 位小写十六进制", "req_" + lower, true},
+		{"大写十六进制", "req_" + strings.Repeat("AB", 16), false},
+		{"长度 31", "req_" + strings.Repeat("a", 31), false},
+		{"长度 33", "req_" + strings.Repeat("a", 33), false},
+		{"缺前缀", strings.Repeat("a", 32), false},
+		{"含非十六进制字符", "req_" + strings.Repeat("a", 31) + "g", false},
+		{"空串", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validContractRequestID(tc.id); got != tc.want {
+				t.Fatalf("validContractRequestID(%q) = %v，期望 %v", tc.id, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -50,14 +50,25 @@ func (s *Server) ok(w http.ResponseWriter, data any) {
 	writeSuccess(w, newRequestID(), data)
 }
 
-// writeSuccess 按成功信封写回，成功响应的形状只在这里定义一次。
+// writeSuccess 按成功信封写回 200；信封形状统一由 writeSuccessStatus 末尾那次
+// writeJSON(..., envelope{Code: 0, Message: "success", ...}) 写出，本函数只是把它固定成 200。
 //
 // 它比 s.ok 多一个 request_id 参数：有些调用点（设置保存）要先拿到 id 去写一条与本次
 // 响应同 id 的日志，再写响应。让这些调用点也走这里，而不是自己拼 envelope，成功信封就
 // 不会出现第二份「code=0 + message=success」的副本——GET 与 PUT 的同形状因此是构造同源，
 // 不是两处各自对齐。
 func writeSuccess(w http.ResponseWriter, requestID string, data any) {
-	writeJSON(w, http.StatusOK, envelope{Code: 0, Message: "success", Data: data, RequestID: requestID})
+	writeSuccessStatus(w, http.StatusOK, requestID, data)
+}
+
+// writeSuccessStatus 按成功信封写回指定状态码：成功信封的 code=0 与 message=success 由本函数
+// 末尾那次 writeJSON(..., envelope{Code: 0, Message: "success", ...}) 写出，200 与 202 都走这一处。
+//
+// 手动同步的 202 与其它端点的 200 共用这条路径：同步的语义是「已受理、轮次还在后台跑」，
+// 状态码必须是 202，但信封形状与 200 完全一致。若让 handler 自己拼 envelope，成功信封就
+// 有了第二份副本，给成功响应加字段时只会改到其中一份。
+func writeSuccessStatus(w http.ResponseWriter, status int, requestID string, data any) {
+	writeJSON(w, status, envelope{Code: 0, Message: "success", Data: data, RequestID: requestID})
 }
 
 // fail 输出失败响应，HTTP 状态与业务码分开表达。

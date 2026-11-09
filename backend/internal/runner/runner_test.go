@@ -808,6 +808,9 @@ func TestStartMapsCollectorConflictToBusyWhenRunFound(t *testing.T) {
 
 // TestStartReturnsRetryableErrorWhenConflictRunIsGone 覆盖「冲突窗口内那轮刚好结束」：
 // 重读不到 running 时不猜轮次编号，保留 ErrRunConflict 交给上层映射 50000 让管理员重试。
+//
+// 返回的错误是被 %w 重新包过的那层 collector 阶段错误：阶段信息不能在这里丢掉，
+// API 层据此把 500 的日志说成「采集启动器」那一段，而不是退回不点名阶段的文案。
 func TestStartReturnsRetryableErrorWhenConflictRunIsGone(t *testing.T) {
 	runs := newFakeRunStore()
 	collector := newFakeCollector(runs)
@@ -832,8 +835,19 @@ func TestStartReturnsRetryableErrorWhenConflictRunIsGone(t *testing.T) {
 	if !errors.Is(err, model.ErrRunConflict) {
 		t.Fatalf("应保留 ErrRunConflict 供排障，实际 %v", err)
 	}
-	if !strings.Contains(err.Error(), "重试") {
-		t.Fatalf("文案应提示管理员重试，实际 %q", err.Error())
+	var stageErr *StageError
+	if !errors.As(err, &stageErr) {
+		t.Fatalf("冲突窗口已过时应保留 collector 阶段，实际类型 %T: %v", err, err)
+	}
+	if stageErr.Stage != StageCollector {
+		t.Fatalf("阶段应为 %q，实际 %q", StageCollector, stageErr.Stage)
+	}
+	// minor 1 的回归点：外层不再重复点名阶段。文案按固定串断言——只判 Contains("重试")
+	// 时，外层再点一次「采集启动器」（「采集启动器报告轮次冲突…: 采集启动在采集启动器
+	// 阶段失败」）也照样通过，同一段在日志里被说两遍却没人发现。
+	wantErr := "冲突窗口内那轮已结束，请重试: 采集启动在采集启动器阶段失败: 采集轮次冲突: 唯一索引冲突"
+	if got := err.Error(); got != wantErr {
+		t.Fatalf("Error() 期望固定文案 %q，实际 %q", wantErr, got)
 	}
 	if got := runs.runningCount(); got != 2 {
 		t.Fatalf("应读两次 running，实际 %d 次", got)
@@ -842,6 +856,9 @@ func TestStartReturnsRetryableErrorWhenConflictRunIsGone(t *testing.T) {
 
 // TestStartReturnsReadErrorWhenConflictRereadFails 覆盖「Collector 报冲突、重读又读库失败」：
 // 读库失败比原冲突更能说明问题，错误类别跟着 readErr 走，不改写成 busy，也不重试 Collector。
+//
+// 返回的是裸读错误、不带任何阶段：API 层据此退回不点名阶段的「手动同步失败」文案，
+// 不会把一次读库失败说成采集启动器失败。
 func TestStartReturnsReadErrorWhenConflictRereadFails(t *testing.T) {
 	readErr := errors.New("重读进行中轮次失败")
 	runs := newFakeRunStore()
@@ -865,6 +882,10 @@ func TestStartReturnsReadErrorWhenConflictRereadFails(t *testing.T) {
 	}
 	if errors.Is(err, model.ErrRunBusy) {
 		t.Fatalf("读库失败时不应映射成 busy，实际 %v", err)
+	}
+	var stageErr *StageError
+	if errors.As(err, &stageErr) {
+		t.Fatalf("重读失败返回的是裸读错误，不该带阶段，实际 %q", stageErr.Stage)
 	}
 	if got := collector.callCount(); got != 1 {
 		t.Fatalf("冲突后的重读失败不应重试 Collector，实际调用 %d 次", got)
@@ -981,6 +1002,181 @@ func TestStartPropagatesRunningReadFailure(t *testing.T) {
 	if got := collector.callCount(); got != 0 {
 		t.Fatalf("读库失败时不应调 Collector，实际 %d 次", got)
 	}
+}
+
+// TestStartWrapsFailuresWithStage 覆盖五段「原样上抛」的失败各自带 *StageError，
+// 且 Stage 与失败位置一一对应（design「Error Handling」的日志列）。
+//
+// 阶段标签是 API 层区分 500 日志的唯一依据：漏包一段，那条日志就退回不点名阶段的
+// 「手动同步失败」，排障时分不出是收敛、读轮次、读白名单、建 blocked 轮还是采集启动器。
+// 每段同时断言 errors.Is 仍命中原错误、Error() 逐字等于预期的固定文案——包装只多一个
+// 字段，不改变错误的类别，也不把原因藏起来。文案按字面量断言而不是复用 tc.stage：
+// 用阶段取值反查 Error() 只要自洽就能通过，标签写错或漏了中文标签都发现不了。
+func TestStartWrapsFailuresWithStage(t *testing.T) {
+	failErr := errors.New("阶段失败")
+	okWhitelist := whitelistFunc(func(context.Context) ([]model.Building, error) { return whitelistOf(), nil })
+	emptyWhitelist := whitelistFunc(func(context.Context) ([]model.Building, error) { return []model.Building{}, nil })
+
+	cases := []struct {
+		name    string
+		stage   string
+		wantErr string
+		deps    func(runs *fakeRunStore, collector *fakeCollector) Deps
+	}{
+		{
+			name:    "收敛过期轮次",
+			stage:   StageConverge,
+			wantErr: "采集启动在收敛过期轮次阶段失败: 阶段失败",
+			deps: func(runs *fakeRunStore, _ *fakeCollector) Deps {
+				return Deps{
+					Runs:     runs,
+					Settings: okWhitelist,
+					Converge: func(context.Context, time.Time) ([]int64, error) { return nil, failErr },
+				}
+			},
+		},
+		{
+			name:    "读取进行中轮次",
+			stage:   StageRunning,
+			wantErr: "采集启动在读取进行中轮次阶段失败: 阶段失败",
+			deps: func(runs *fakeRunStore, _ *fakeCollector) Deps {
+				runs.runningErr = failErr
+				return Deps{Runs: runs, Settings: okWhitelist, Converge: emptyConverge}
+			},
+		},
+		{
+			name:    "读取白名单",
+			stage:   StageWhitelist,
+			wantErr: "采集启动在读取白名单阶段失败: 阶段失败",
+			deps: func(runs *fakeRunStore, _ *fakeCollector) Deps {
+				failWhitelist := whitelistFunc(func(context.Context) ([]model.Building, error) { return nil, failErr })
+				return Deps{Runs: runs, Settings: failWhitelist, Converge: emptyConverge}
+			},
+		},
+		{
+			name:    "建立 blocked 轮",
+			stage:   StageBlocked,
+			wantErr: "采集启动在建立 blocked 轮阶段失败: 阶段失败",
+			deps: func(runs *fakeRunStore, _ *fakeCollector) Deps {
+				runs.blockedErr = failErr
+				return Deps{Runs: runs, Settings: emptyWhitelist, Converge: emptyConverge}
+			},
+		},
+		{
+			name:    "采集启动器",
+			stage:   StageCollector,
+			wantErr: "采集启动在采集启动器阶段失败: 阶段失败",
+			deps: func(runs *fakeRunStore, collector *fakeCollector) Deps {
+				collector.onStart = func(context.Context, model.TriggerSource) (StartResult, error) {
+					return StartResult{}, failErr
+				}
+				return Deps{Runs: runs, Settings: okWhitelist, Collect: collector, Converge: emptyConverge}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runs := newFakeRunStore()
+			collector := newFakeCollector(runs)
+			svc := newService(t, tc.deps(runs, collector))
+
+			_, err := svc.Start(context.Background(), model.TriggerManual)
+			if err == nil {
+				t.Fatal("该路径应返回错误而不是成功")
+			}
+
+			var stageErr *StageError
+			if !errors.As(err, &stageErr) {
+				t.Fatalf("失败应包成 *StageError（阶段 %q），实际 %T: %v", tc.stage, err, err)
+			}
+			if stageErr.Stage != tc.stage {
+				t.Fatalf("阶段应为 %q，实际 %q", tc.stage, stageErr.Stage)
+			}
+			if !errors.Is(err, failErr) {
+				t.Fatalf("包装后仍应 errors.Is 到原错误，实际 %v", err)
+			}
+			// 固定串断言：格式、中文阶段标签、原错误三者都钉死，换标签或漏掉原因
+			// 都会在这里失败，而不是被一句 Contains(tc.stage) 自证通过。
+			if got := err.Error(); got != tc.wantErr {
+				t.Fatalf("Error() 期望固定文案 %q，实际 %q", tc.wantErr, got)
+			}
+			// 文案的中性只针对触发来源：同一条错误也被 StartCron 共用，会经 scheduler
+			// 的 slog.Any("err", err) 落进 cron WARN，写成「手动同步」会把定时触发误读
+			// 成管理员的按钮操作。阶段标签仍要出现（见上面 tc.wantErr 的固定串）。
+			if strings.Contains(err.Error(), "手动同步") {
+				t.Fatalf("Error() 不该点名「手动同步」，实际 %q", err.Error())
+			}
+		})
+	}
+}
+
+// TestStageErrorUnknownStageFallsBackToRawStage 覆盖 StageError.Error() 的未知阶段回退：
+// Stage 不在五段内（调用方违约，例如将来新增阶段却漏加 StageLabel 分支）时，文案用原
+// 取值当标签，而不是留空或伪造一个「未知」。
+//
+// 留空会让文案退化成「采集启动在阶段失败」，把几段不同的失败混成同一句；伪造「未知」
+// 则丢掉排障时唯一能反查是哪个阶段漏了标签的线索。直接构造 StageError 是因为正常
+// 启动路径产不出未知阶段——这里钉的是 Error() 自己的兜底，不是 Start 的包装。
+func TestStageErrorUnknownStageFallsBackToRawStage(t *testing.T) {
+	cause := errors.New("上游返回 502")
+	stageErr := &StageError{Stage: "future", Err: cause}
+
+	want := "采集启动在future阶段失败: 上游返回 502"
+	if got := stageErr.Error(); got != want {
+		t.Fatalf("Error() 期望 %q，实际 %q", want, got)
+	}
+	// 回退只换标签来源，不影响错误的类别：Unwrap 仍透传原因。
+	if !errors.Is(stageErr, cause) {
+		t.Fatalf("未知阶段也应透传原因，实际 %v", stageErr)
+	}
+	if got := StageLabel("future"); got != "" {
+		t.Fatalf("StageLabel 对未知阶段应返回空串，实际 %q", got)
+	}
+}
+
+// TestStartStageErrorOnlyForPropagatedFailures 钉住阶段包装的作用范围：映射成 409 的
+// *BusyError 与未装配的 model.ErrCollectorUnavailable 都不带阶段。
+//
+// 这两种结果的语义已由类型与哨兵表达，API 层也有各自的分派分支；给它们包一层阶段只会
+// 让「409 与未装配」看起来像一次普通的启动故障，日志文案也就跟着错位。
+func TestStartStageErrorOnlyForPropagatedFailures(t *testing.T) {
+	t.Run("繁忙不包阶段", func(t *testing.T) {
+		runs := newFakeRunStore()
+		runs.setRunning(store.RunSummary{RunID: 14, Status: StatusRunning, Phase: "login"})
+		svc := newService(t, Deps{
+			Runs:     runs,
+			Settings: whitelistFunc(func(context.Context) ([]model.Building, error) { return whitelistOf(), nil }),
+			Converge: emptyConverge,
+		})
+
+		_, err := svc.Start(context.Background(), model.TriggerManual)
+		var stageErr *StageError
+		if errors.As(err, &stageErr) {
+			t.Fatalf("busy 不该带阶段，实际 %q", stageErr.Stage)
+		}
+		if !errors.Is(err, model.ErrRunBusy) {
+			t.Fatalf("应仍是 model.ErrRunBusy，实际 %v", err)
+		}
+	})
+
+	t.Run("未装配不包阶段", func(t *testing.T) {
+		runs := newFakeRunStore()
+		svc := newService(t, Deps{
+			Runs:     runs,
+			Settings: whitelistFunc(func(context.Context) ([]model.Building, error) { return whitelistOf(), nil }),
+			Converge: emptyConverge,
+		})
+
+		_, err := svc.Start(context.Background(), model.TriggerManual)
+		var stageErr *StageError
+		if errors.As(err, &stageErr) {
+			t.Fatalf("未装配不该带阶段，实际 %q", stageErr.Stage)
+		}
+		if !errors.Is(err, model.ErrCollectorUnavailable) {
+			t.Fatalf("应仍是 model.ErrCollectorUnavailable，实际 %v", err)
+		}
+	})
 }
 
 // TestStartCronLogsBusyAndReturnsNil 覆盖定时触发撞上 busy：记一条 INFO
