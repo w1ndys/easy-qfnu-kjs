@@ -61,6 +61,7 @@ type Server struct {
 	admin        adminStore           // 管理端数据来源；nil 表示未装配，管理端点按内部错误处理
 	keys         *secret.Manager      // 密钥文件管理器；nil 表示未装配，初始化按内部错误、指纹按 null 处理
 	settingsSvc  *settings.Service    // 业务设置读写；nil 表示未装配，设置端点按内部错误处理
+	runStatus    RunReader            // 轮次只读视图；nil 表示未装配，runs 端点按内部错误处理
 	// settingsMu 把一次 PUT 的「Patch → reloadCron」串成一段临界区：两次并发保存若交错
 	// 成「A 写库、B 写库、B 重排、A 重排」，进程内的计划会停在 A，而库里已经是 B，
 	// 直到下次重启才对得上。GET 不加这把锁：只读快照不需要与保存串行。
@@ -154,6 +155,12 @@ func (s *Server) Handler() http.Handler {
 	// 8 KiB 宽（白名单 200 条 + 展示名），但门序与 adminWrite 完全相同。
 	mux.Handle("GET /api/admin/settings", s.adminRead(s.adminSettingsGet))
 	mux.Handle("PUT /api/admin/settings", s.adminWriteLimit(adminSettingsBodyLimit, s.adminSettingsPut))
+
+	// 运行状态（tasklist 第 10 项）：两条都是只读的会话端点，链与 GET settings 相同
+	// （no-store → 会话 → 业务）。{run_id} 是 Go 1.22 的路径参数，handler 用
+	// r.PathValue 取值后自己解析，ServeMux 不替它判「是不是正整数」。
+	mux.Handle("GET /api/admin/runs", s.adminRead(s.adminRunsList))
+	mux.Handle("GET /api/admin/runs/{run_id}", s.adminRead(s.adminRunDetail))
 	return withAdminNoStore(mux)
 }
 

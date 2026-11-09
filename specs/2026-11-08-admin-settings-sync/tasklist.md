@@ -63,13 +63,14 @@
 - [ ] 10. api 轮次读取端点
   - `GET /api/admin/runs`：`limit` 1–100 默认 20、`offset ≥ 0`，越界 `40001`；`{runs,total,limit,offset}`
   - `GET /api/admin/runs/{run_id}`：路径参数解析（非正整数 `40001`）、`ByID` 不存在 `40401`、附 `tasks` 与 `weeks`
+  - 新增业务码常量 `codeRunNotFound=40401`（`404` 未知轮次；第 11 项复用同一常量，不重复声明）
   - 响应结构体固定 json 标签，空列表输出 `[]` 而非 `null`；所有响应 `no-store`
   - 契约测试：摘要 22 个键、详情 `tasks`/`weeks` 形状、`term` 为 null 的 blocked 轮、未知 id、空表
 
 - [ ] 11. api 手动同步端点
   - `POST /api/admin/sync`：`adminWriteNoBody`（no-store → 会话 → CSRF，不读体、不要求 `Content-Type`）→ `runner.Start(manual)`
   - 202 返回 `{run_id, status, started_at}`（blocked 另带 `reason`）；`BusyError` 映射 409 + `40901`，消息点名 `run_id` 与 `phase`；`ErrCollectorUnavailable` 与仓储失败映射 `50000`
-  - 新增业务码常量 `codeRunBusy=40901`、`codeRunNotFound=40401`；202 走 `writeJSON`（`ok` 固定 200）
+  - 新增业务码常量 `codeRunBusy=40901`；`codeRunNotFound=40401` 复用第 10 项已定义的常量；202 走 `writeJSON`（`ok` 固定 200）
   - 契约测试：202 三种形状、409 消息、未装配 50000、缺 CSRF 40301、并发 50 请求只 1 个 202（假 Collector 对并发输家返回 `ErrRunConflict`）
 
 - [ ] 12. 装配、依赖规则与端到端检查点
