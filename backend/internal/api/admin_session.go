@@ -162,9 +162,10 @@ func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 	// 让本次已经成功的登录变成 500。日志字段仍限于 Requirement 9.1 的白名单，
 	// 不含 err 原文（可能带 SQL 细节）与任何令牌。
 	//
-	// 这里不用 s.ok 而是自己写信封，是为了让清理失败的 WARN 与成功响应共享同一个
-	// request_id：s.ok 内部现生成 id，外面拿不到，抄进日志就会和响应里那个对不上。
-	// 信封形状与 s.ok 完全一致（code 0、message success）。
+	// 先显式取一次 request_id，再交给 writeSuccess：让清理失败的 WARN 与成功响应
+	// 共享同一个 id（s.ok 内部现生成 id，外面拿不到，抄进日志就会和响应里那个对不上）。
+	// writeSuccess 是成功信封的唯一构造点，s.ok 也走它，所以这里的应答形状与其它
+	// 成功响应同源，而不是另抄一份「code 0 + message success」。
 	requestID := newRequestID()
 	if _, err := s.admin.DeleteExpiredSessions(ctx, now); err != nil {
 		s.log.Warn("清理过期管理会话失败",
@@ -183,11 +184,9 @@ func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Max-Age 取会话总时长（43200 秒），与库里 expires_at 同源，不做滑动续期（D6）。
 	http.SetCookie(w, s.adminCookie(rawToken, int(auth.SessionTTL/time.Second)))
-	writeJSON(w, http.StatusOK, envelope{
-		Code:      0,
-		Message:   "success",
-		Data:      adminLoginResponse{ExpiresAt: expiresAt.UTC().Format(time.RFC3339), CSRFToken: csrfToken},
-		RequestID: requestID,
+	writeSuccess(w, requestID, adminLoginResponse{
+		ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
+		CSRFToken: csrfToken,
 	})
 }
 

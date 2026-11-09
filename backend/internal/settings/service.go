@@ -111,6 +111,11 @@ func (s *Service) Load(ctx context.Context) (Snapshot, error) {
 //  3. 整批变更放进**一次** ApplySettings：仓储用单事务保证任一条失败整体回滚（Requirement 6.4）；
 //  4. 回读：响应与 GET 同形状，前端保存后不必再发一次 GET（Requirement 2.7）。
 //
+// 第 4 步失败返回 *ReadBackError 而不是裸仓储错误：此时写入已提交，与第 3 步失败
+// （事务已回滚）是两种事实，上层要能把它们记成两种日志文案（CP5）。这条包装只在
+// 真的开过写事务（changes 非空）时成立：空补丁没有「已提交」可言，它的回读失败
+// 按普通读失败原样上抛。
+//
 // 省略全部字段（Patch{}）时不调 ApplySettings：没有变更就没有事务可开，直接回读。
 // 秘密的明文不 trim、非秘密文本 trim 后存、白名单按提交顺序序列化，各自的口径见
 // secretChange / textChange / whitelistChange。
@@ -191,8 +196,50 @@ func (s *Service) Patch(ctx context.Context, p Patch) (Snapshot, error) {
 		}
 	}
 
-	return s.Load(ctx)
+	snapshot, err := s.Load(ctx)
+	if err != nil {
+		// 只有真的写过库才有「写事务已经提交」这层事实。空补丁（PUT {} / PUT null）
+		// 从不开事务，回读失败就是普通读失败：包成 ReadBackError 会让日志谎称
+		// 「写入已提交」，而实际上一个键都没写（CP5）。
+		//
+		// 有变更时，包一层独立类型，让 API 层能把「回读失败（写入已提交）」与
+		// 「写入失败（事务已回滚）」映射成两种日志文案：两者对客户端都是 500/50000，
+		// 但排障时混成一句会让人以为设置没存进去（CP5）。
+		if len(changes) > 0 {
+			return Snapshot{}, &ReadBackError{Err: err}
+		}
+		return Snapshot{}, err
+	}
+	return snapshot, nil
 }
+
+// ReadBackError 表示一次 Patch 的写事务已经提交、但提交后的回读失败。
+//
+// 它只覆盖「本次确实开了写事务」的情况：空补丁（PUT {} / PUT null）不写库，回读
+// 失败就是普通读失败，不能被这个类型认领，否则「已提交」这句日志会是假的。
+//
+// 它与写入失败是两种事实：写入失败时事务已回滚，库里的设置与保存前逐字节相同；
+// 回读失败时设置已经落库，只是 handler 拿不到最新快照（因此也没有表达式可交给调度器）。
+// 客户端拿到的都是 500/50000 与固定文案，区别只在服务端日志：把回读失败记成
+// 「保存设置失败」会导致多余的重放甚至误判「设置丢了」（design 错误表对应行、CP5）。
+//
+// Err 是回读时仓储返回的原始错误。仓储契约保证它已经用 %w 包着
+// model.ErrSettingStoreFailed，所以 errors.Is(err, model.ErrSettingStoreFailed) 仍然成立；
+// 本类型只负责把「已提交」这一事实显式化，供上层用 errors.As 分流。
+type ReadBackError struct {
+	Err error
+}
+
+// Error 在原始错误前加上「已提交」，不改变原始错误的类别文案。
+func (e *ReadBackError) Error() string {
+	if e.Err == nil {
+		return "设置已提交但回读失败"
+	}
+	return "设置已提交但回读失败: " + e.Err.Error()
+}
+
+// Unwrap 透传原始错误：errors.Is / errors.As 对它的判定与直接返回仓储错误时一致。
+func (e *ReadBackError) Unwrap() error { return e.Err }
 
 // Reveal 解封一个秘密项并返回明文，是唯一的明文出口（collect-runner 与测试用；
 // 名字刻意可 grep）。快照与 handler 都拿不到它。

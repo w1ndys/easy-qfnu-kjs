@@ -23,7 +23,7 @@ import (
 const (
 	codeAdminExists     = 40902 // 管理员记录已存在，拒绝初始化
 	codeKeyExists       = 40903 // 密钥文件已存在（含存在但不可用），拒绝初始化
-	codePasswordInvalid = 42201 // 两次密码不一致或长度不合规
+	codePasswordInvalid = 42201 // 两次密码不一致或长度不合规；设置字段校验同样用它（别名 codeSettingInvalid）
 )
 
 // keyAlgorithm 是初始化响应里声明的密钥算法。密钥本身固定 32 字节（AES-256），

@@ -120,6 +120,8 @@ linters:
         # HTTP 层：编排与查询都从这一层进，不直接访问上游。
         # auth 只被管理端中间件用来判定会话有效性与比对 CSRF，属于纯函数调用，没有反向依赖。
         # secret 只被管理端的 state/init 用来取指纹与一次性创建密钥，同样是纯能力调用。
+        # settings 是业务设置的读写服务（GET/PUT /api/admin/settings），cronexpr 被设置端点
+        # 直接用来算 cron_next_at；两者都只是调用，不存在反向依赖。
         api:
           files:
             - "**/internal/api/**"
@@ -134,3 +136,5 @@ linters:
             - github.com/w1ndys/easy-qfnu-kjs/internal/config
             - github.com/w1ndys/easy-qfnu-kjs/internal/auth
             - github.com/w1ndys/easy-qfnu-kjs/internal/secret
+            - github.com/w1ndys/easy-qfnu-kjs/internal/settings
+            - github.com/w1ndys/easy-qfnu-kjs/internal/cronexpr

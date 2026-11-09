@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/query"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/secret"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/settings"
 )
 
 // Pinger 是就绪检查唯一需要的能力；声明在这里，避免 API 层直接依赖数据库驱动。
@@ -58,6 +60,13 @@ type Server struct {
 	recorder     StatsRecorder        // 访问统计记账入口；nil 表示不记账
 	admin        adminStore           // 管理端数据来源；nil 表示未装配，管理端点按内部错误处理
 	keys         *secret.Manager      // 密钥文件管理器；nil 表示未装配，初始化按内部错误、指纹按 null 处理
+	settingsSvc  *settings.Service    // 业务设置读写；nil 表示未装配，设置端点按内部错误处理
+	// settingsMu 把一次 PUT 的「Patch → reloadCron」串成一段临界区：两次并发保存若交错
+	// 成「A 写库、B 写库、B 重排、A 重排」，进程内的计划会停在 A，而库里已经是 B，
+	// 直到下次重启才对得上。GET 不加这把锁：只读快照不需要与保存串行。
+	settingsMu sync.Mutex
+	// reloadCron 是保存设置后重排调度计划的回调；nil 表示调度器未装配，保存后跳过重排。
+	reloadCron func(expr string) error
 	// initLimiter 按来源统计初始化密码校验失败；与登录限流分开计数。
 	initLimiter *failureLimiter
 	// loginLimiter 按来源统计登录凭据失败；与初始化限流分开计数，
@@ -138,6 +147,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/admin/session", withNoStore(s.adminLoginLimited(s.withJSONBody(s.adminLogin))))
 	mux.Handle("DELETE /api/admin/session", s.adminWrite(s.adminLogout))
 	mux.Handle("POST /api/admin/password", s.adminWrite(s.adminPassword))
+
+	// 业务设置（tasklist 第 9 项）：
+	// GET 是管理端读端点，只要会话（no-store → 会话）；
+	// PUT 是写端点，链是 no-store → 64 KiB 体门 → 会话 → CSRF，体上限比密码端点的
+	// 8 KiB 宽（白名单 200 条 + 展示名），但门序与 adminWrite 完全相同。
+	mux.Handle("GET /api/admin/settings", s.adminRead(s.adminSettingsGet))
+	mux.Handle("PUT /api/admin/settings", s.adminWriteLimit(adminSettingsBodyLimit, s.adminSettingsPut))
 	return withAdminNoStore(mux)
 }
 

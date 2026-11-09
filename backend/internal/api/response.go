@@ -47,7 +47,17 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 // ok 输出成功响应，业务码固定为 0。
 func (s *Server) ok(w http.ResponseWriter, data any) {
-	writeJSON(w, http.StatusOK, envelope{Code: 0, Message: "success", Data: data, RequestID: newRequestID()})
+	writeSuccess(w, newRequestID(), data)
+}
+
+// writeSuccess 按成功信封写回，成功响应的形状只在这里定义一次。
+//
+// 它比 s.ok 多一个 request_id 参数：有些调用点（设置保存）要先拿到 id 去写一条与本次
+// 响应同 id 的日志，再写响应。让这些调用点也走这里，而不是自己拼 envelope，成功信封就
+// 不会出现第二份「code=0 + message=success」的副本——GET 与 PUT 的同形状因此是构造同源，
+// 不是两处各自对齐。
+func writeSuccess(w http.ResponseWriter, requestID string, data any) {
+	writeJSON(w, http.StatusOK, envelope{Code: 0, Message: "success", Data: data, RequestID: requestID})
 }
 
 // fail 输出失败响应，HTTP 状态与业务码分开表达。

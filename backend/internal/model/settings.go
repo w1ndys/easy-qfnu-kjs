@@ -31,9 +31,9 @@ const (
 
 	// MaxSettingValueBytes 是文本项明文的上界，作用于五个文本设置项：jw_username、
 	// jw_password、ocr_base_url、feishu_webhook、feishu_sign_secret（见 design.md
-	// 「Data Models → 设置项」表）。其余两项各有自己的口径，不套这个上界：
-	// building_whitelist 看条数（≤ MaxWhitelistEntries）与每条字段规则，
-	// cron_expr 看 5 字段语法。
+	// 「Data Models → 设置项」表），以及 building_whitelist 每条的两个字段（`jxlbh`
+	// 与 `name` 各自 trim 后计，不是整个数组）；cron_expr 不套这个上界，只看 5 字段
+	// 语法。
 	//
 	// 它限的是管理员**提交的明文**字节数，不是库里的值长度：校验发生在加封之前，
 	// 明文超限在 Seal 之前就被拒。计数口径跟着存储口径走：非秘密文本项按 TrimSpace

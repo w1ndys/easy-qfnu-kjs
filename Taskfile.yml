@@ -98,7 +98,17 @@ tasks:
     desc: 后端全量测试
     dir: backend
     cmds:
-      - '{{.GO}} test ./...'
+      - '{{.GO}} test -count=1 ./...'
+
+  # 设置端点的并发不变式（settingsMu 串行化）只有带竞态检测器才完整，所以它是
+  # 第 9 项的必跑口径、进 gate，而不是一个可选手动任务。
+  # -count=1 关掉 go test 的结果缓存：同代码同参数再跑一次时，go 会直接回放上一次
+  # （同上一次 gate）的 "ok (cached)"，竞态二进制根本不执行，等于把守门人关掉。
+  backend:test-race:
+    desc: 后端竞态检测（api 设置端点 + settings 服务，-race 必跑、禁缓存）
+    dir: backend
+    cmds:
+      - '{{.GO}} test -race -count=1 ./internal/api ./internal/settings'
 
   # 带 DSN 的全量测试必须 -p 1：e2e 与 store 的集成用例都会 DROP SCHEMA public，
   # go test 默认按包并行，两个包同时重建同一个测试库会互踩（详见
@@ -178,9 +188,10 @@ tasks:
       - task: frontend:fmt
 
   gate:
-    desc: 提交前门禁：后端测试/vet/lint + 前端测试/lint/构建
+    desc: 提交前门禁：后端测试/竞态/vet/lint + 前端测试/lint/构建
     cmds:
       - task: backend:test
+      - task: backend:test-race
       - task: backend:vet
       - task: backend:lint
       - task: frontend:test

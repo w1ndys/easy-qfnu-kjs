@@ -1,8 +1,8 @@
 package settings
 
-// 本文件覆盖 Validate 的纯校验：白名单、cron、URL 形状、五项文本项的 4096 字节上界，
-// 以及 Patch 指针三态（省略 / 空串 / 值）。所有用例都不碰密钥与数据库，因此不需要
-// 替身；每条拒绝用例都断言 *FieldError.Field，确保 42201 能点名到具体设置项。
+// 本文件覆盖 Validate 的纯校验：白名单、cron、URL 形状、五项文本项与白名单两个字段
+// 的 4096 字节上界，以及 Patch 指针三态（省略 / 空串 / 值）。所有用例都不碰密钥与数据库，
+// 因此不需要替身；每条拒绝用例都断言 *FieldError.Field，确保 42201 能点名到具体设置项。
 
 import (
 	"encoding/json"
@@ -56,11 +56,14 @@ func httpURLOfBytes(t *testing.T, n int) string {
 
 // validateCase 是一条 Validate 用例。wantField 为空表示期望通过；非空时断言
 // FieldError.Field 与该字段名，并按需对文案做包含/不包含断言（空串表示不检查）。
+// wantContainsAll 用于一条文案里必须同时出现的多个片段：wantContains 只能钉一段
+// 连续文字，而「第 2 条的楼编号……超过上限 4096 字节」这类文案的几个要素是分开的。
 type validateCase struct {
 	name            string
 	patch           Patch
 	wantField       string
 	wantContains    string
+	wantContainsAll []string
 	wantNotContains string
 }
 
@@ -78,6 +81,11 @@ func runValidateCases(t *testing.T, cases []validateCase) {
 			assertFieldError(t, err, tc.wantField)
 			if tc.wantContains != "" && !strings.Contains(err.Error(), tc.wantContains) {
 				t.Fatalf("错误文案应包含 %q：%q", tc.wantContains, err.Error())
+			}
+			for _, want := range tc.wantContainsAll {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("错误文案应同时包含 %q：%q", want, err.Error())
+				}
 			}
 			if tc.wantNotContains != "" && strings.Contains(err.Error(), tc.wantNotContains) {
 				t.Fatalf("错误文案不应包含 %q：%q", tc.wantNotContains, err.Error())
@@ -224,10 +232,18 @@ func TestValidateWhitelist(t *testing.T) {
 func TestValidateCronExpr(t *testing.T) {
 	// 4107 字节、语法合法的表达式：分钟字段是 strings.Repeat("0,", 2049) 拼上末尾
 	// 一个 `0`，共 2050 个 `0` 的列表。它超过 4096 仍须通过，因为 4096 上界只管
-	// 五项文本项（design「设置项」）。
+	// 五项文本项与白名单的两个字段（design「设置项」）。
 	longValidCron := strings.Repeat("0,", 2049) + "0 * * * *"
 	if len(longValidCron) <= model.MaxSettingValueBytes {
 		t.Fatalf("用例前提不成立：表达式只有 %d 字节，未超过上界 %d", len(longValidCron), model.MaxSettingValueBytes)
+	}
+
+	// 恰好 4097 字节的合法表达式（分钟字段 2045 个 `0` 的列表）：越过上界一格，
+	// 用来钉住 cron_expr 根本不量字节——拒绝与否只看 cronexpr.Parse。
+	cronAt4097Bytes := strings.Repeat("0,", 2044) + "0 * * * *"
+	if len(cronAt4097Bytes) != model.MaxSettingValueBytes+1 {
+		t.Fatalf("用例前提不成立：表达式应为 %d 字节，实际 %d 字节",
+			model.MaxSettingValueBytes+1, len(cronAt4097Bytes))
 	}
 
 	cases := []validateCase{
@@ -238,6 +254,7 @@ func TestValidateCronExpr(t *testing.T) {
 		{name: "周 7 归一为周日", patch: Patch{CronExpr: ptr("10 4 * * 7")}},
 		{name: "语法合法但不可达仍通过", patch: Patch{CronExpr: ptr("0 0 30 2 *")}},
 		{name: "超过 4096 字节仍按语法判定通过", patch: Patch{CronExpr: ptr(longValidCron)}},
+		{name: "恰好 4097 字节仍合法", patch: Patch{CronExpr: ptr(cronAt4097Bytes)}},
 
 		{name: "空串非法", patch: Patch{CronExpr: ptr("")},
 			wantField: model.SettingCronExpr, wantContains: "表达式为空"},
@@ -340,8 +357,53 @@ func TestValidateTextValueByteLimit(t *testing.T) {
 	runValidateCases(t, cases)
 }
 
+// TestValidateWhitelistFieldByteLimit 覆盖白名单每条字段的 4096 字节上界：
+// `jxlbh` 与 `name` 各自按 trim 后的字节数计，恰好 4096 通过、4097 拒绝；
+// 上界是逐字段的，不是整个数组的（数组另有条数上限，见下一个用例）。
+//
+// 拒绝用例把违规条目放在第二条，并同时断言文案里的「第 2 条」「楼编号/展示名」
+// 与「4096」三个要素（Requirement 4.7 / AC 7）：只断言字节数字会漏掉「哪一条、
+// 哪个字段」，管理员拿到 42201 时仍不知道该改哪里。
+func TestValidateWhitelistFieldByteLimit(t *testing.T) {
+	const limit = model.MaxSettingValueBytes
+
+	cases := []validateCase{
+		{name: "楼编号恰好 4096 字节通过", patch: Patch{Whitelist: buildingListPtr([]model.Building{
+			{ID: strings.Repeat("B", limit), Name: "综合楼"},
+		})}},
+		{name: "楼编号 4097 字节拒绝", patch: Patch{Whitelist: buildingListPtr([]model.Building{
+			{ID: "Q10", Name: "综合楼"},
+			{ID: strings.Repeat("B", limit+1), Name: "实验楼"},
+		})}, wantField: model.SettingBuildingWhitelist,
+			wantContainsAll: []string{"第 2 条", "楼编号", "4096"}},
+		{name: "楼编号前后空白不计入上界", patch: Patch{Whitelist: buildingListPtr([]model.Building{
+			{ID: "  " + strings.Repeat("B", limit) + "  ", Name: "综合楼"},
+		})}},
+
+		{name: "展示名恰好 4096 字节通过", patch: Patch{Whitelist: buildingListPtr([]model.Building{
+			{ID: "Q10", Name: strings.Repeat("n", limit)},
+		})}},
+		{name: "展示名 4097 字节拒绝", patch: Patch{Whitelist: buildingListPtr([]model.Building{
+			{ID: "Q10", Name: "综合楼"},
+			{ID: "Q11", Name: strings.Repeat("n", limit+1)},
+		})}, wantField: model.SettingBuildingWhitelist,
+			wantContainsAll: []string{"第 2 条", "展示名", "4096"}},
+		{name: "展示名 trim 后 4097 字节拒绝", patch: Patch{Whitelist: buildingListPtr([]model.Building{
+			{ID: "Q10", Name: "综合楼"},
+			{ID: "Q11", Name: "  " + strings.Repeat("n", limit+1) + "  "},
+		})}, wantField: model.SettingBuildingWhitelist,
+			wantContainsAll: []string{"第 2 条", "展示名", "4097", "4096"}},
+		{name: "展示名前后空白不计入上界", patch: Patch{Whitelist: buildingListPtr([]model.Building{
+			{ID: "Q10", Name: "  " + strings.Repeat("n", limit) + "  "},
+		})}},
+	}
+
+	runValidateCases(t, cases)
+}
+
 // TestValidateWhitelistIsNotSubjectToByteLimit 是反向用例：200 条白名单序列化后
-// 超过 4096 字节仍然合法——4096 只管五项文本项，白名单的口径是条数与字段规则。
+// 超过 4096 字节仍然合法——4096 逐字段作用在 `jxlbh`/`name` 上，整个数组没有字节
+// 上界，条数由 MaxWhitelistEntries 管。
 func TestValidateWhitelistIsNotSubjectToByteLimit(t *testing.T) {
 	list := make([]model.Building, 0, model.MaxWhitelistEntries)
 	for i := range model.MaxWhitelistEntries {

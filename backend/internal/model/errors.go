@@ -56,7 +56,8 @@ var ErrRunStoreFailed = errors.New("采集轮次读写失败")
 var ErrRunConflict = errors.New("采集轮次冲突")
 
 // ErrSettingInvalid 表示设置值未通过纯校验：白名单空编号/重复/空展示名/超条数、
-// cron 语法或取值非法、URL 不是 http(s) 绝对地址、文本项明文超过 4096 字节。
+// 白名单字段超 4096 字节、cron 语法或取值非法、URL 不是 http(s) 绝对地址、
+// 文本项明文超过 4096 字节。
 // settings.FieldError 包它（FieldError.Unwrap 恒返回本哨兵），API 层据此映射 42201；
 // 校验不碰密钥与数据库，命中它的请求一行设置都不写（Requirement 6.3、CP5）。
 var ErrSettingInvalid = errors.New("设置值非法")

@@ -152,7 +152,7 @@ func validateSecretText(field string, value *string, requireURL bool) error {
 //
 // 只判语法，不判可达性：Parse 通过但 Next 五年内无命中的表达式（如 `0 0 30 2 *`）
 // 仍算合法，GET 快照的 cron_next_at 返回 null（Requirement 1.4）。也不量字节：
-// 4096 上界只管五项文本项，cron 的口径是语法（design「设置项」）。
+// 4096 上界只管五项文本项与白名单的两个字段，cron 的口径是语法（design「设置项」）。
 func validateCronExpr(value *string) error {
 	if value == nil {
 		return nil
@@ -165,8 +165,13 @@ func validateCronExpr(value *string) error {
 	return nil
 }
 
-// validateWhitelist 校验白名单：条数 ≤ MaxWhitelistEntries，每条楼编号 trim 后非空且
-// 唯一、展示名 trim 后非空；空数组合法，指针为 nil 表示省略、不校验。
+// validateWhitelist 校验白名单：条数 ≤ MaxWhitelistEntries，每条楼编号 trim 后非空、
+// 不超过 MaxSettingValueBytes、唯一，展示名 trim 后非空且不超过 MaxSettingValueBytes；
+// 空数组合法，指针为 nil 表示省略、不校验。
+//
+// 两个字段各自套与五项文本项同一个 4096 字节上界，但整个数组不设字节上界：200 条
+// 合法条目序列化后超过 4096 是正常的（`settings.value` 是 text）。上界按 trim 后的
+// 字节数计，与写入侧「存 trim 后的值」同口径，前后空白不该把一条短名字撑成超限。
 //
 // 这里只判不写：不 trim 入参、不重排、不去重，归一化与落库留给写入侧（D11 要求顺序
 // 即裁决顺序）。编号唯一性按 trim 后的原字符串精确比较：spec 的口径是「trim 后唯一」，
@@ -188,13 +193,22 @@ func validateWhitelist(list *[]model.Building) error {
 		if id == "" {
 			return invalidf(model.SettingBuildingWhitelist, "第 %d 条的楼编号去除空白后为空", i+1)
 		}
+		if n := len(id); n > model.MaxSettingValueBytes {
+			return invalidf(model.SettingBuildingWhitelist, "第 %d 条的楼编号去除空白后 %d 字节，超过上限 %d 字节",
+				i+1, n, model.MaxSettingValueBytes)
+		}
 		if _, duplicated := seen[id]; duplicated {
 			return invalidf(model.SettingBuildingWhitelist, "第 %d 条的楼编号 %q 与前面的条目重复", i+1, id)
 		}
 		seen[id] = struct{}{}
 
-		if strings.TrimSpace(building.Name) == "" {
+		name := strings.TrimSpace(building.Name)
+		if name == "" {
 			return invalidf(model.SettingBuildingWhitelist, "第 %d 条的展示名去除空白后为空", i+1)
+		}
+		if n := len(name); n > model.MaxSettingValueBytes {
+			return invalidf(model.SettingBuildingWhitelist, "第 %d 条的展示名去除空白后 %d 字节，超过上限 %d 字节",
+				i+1, n, model.MaxSettingValueBytes)
 		}
 	}
 

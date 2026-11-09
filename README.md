@@ -30,7 +30,7 @@ task            # 列出全部任务
 task up         # 起 web + server + postgres
 task db:up      # 只起数据库
 task backend:run / task frontend:dev   # 本地开发
-task gate       # 提交前门禁：后端 test/vet/lint + 前端 test/lint/build
+task gate       # 提交前门禁：后端 test/race/vet/lint + 前端 test/lint/build
 ```
 
 ## 边界

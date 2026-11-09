@@ -409,6 +409,31 @@ func TestAdminWriteBodyLimit8KiB(t *testing.T) {
 	})
 }
 
+// TestBodyLimitMessageFormatsActualLimit 覆盖超限文案的取数口径：
+// 整 KiB 的上限（8 KiB、64 KiB）按 KiB 报，方便管理员对照文档；
+// 非整 KiB 的上限按字节报，不能整除后就丢掉余数——否则 1025 会被报成「1 KiB」，
+// 文案里的数字与真实门限不一致，管理员按提示删到 1 KiB 仍然超限。
+func TestBodyLimitMessageFormatsActualLimit(t *testing.T) {
+	cases := []struct {
+		name  string
+		limit int64
+		want  string
+	}{
+		{"8 KiB", adminBodyLimit, "请求体超过 8 KiB"},
+		{"64 KiB", adminSettingsBodyLimit, "请求体超过 64 KiB"},
+		{"多 1 字节", 1<<10 + 1, "请求体超过 1025 字节"},
+		{"不足 1 KiB", 1000, "请求体超过 1000 字节"},
+		{"0 字节上限", 0, "请求体超过 0 字节"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bodyLimitMessage(tc.limit); got != tc.want {
+				t.Fatalf("bodyLimitMessage(%d) = %q，期望 %q", tc.limit, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestAdminWriteRejectsInvalidJSONBody 覆盖体解析：空体、非 JSON、截断、
 // 多个 JSON 值都映射 40001，且不进入业务逻辑（design 错误表）。
 func TestAdminWriteRejectsInvalidJSONBody(t *testing.T) {

@@ -35,14 +35,18 @@ type fakeStore struct {
 	batches    [][]model.SettingChange
 	nows       []time.Time
 
-	loadErr  error
-	applyErr error
+	loadErr     error
+	applyErr    error
+	readBackErr error // 只在 ApplySettings 成功后生效：模拟「写已提交、回读失败」
 }
 
 func (s *fakeStore) LoadSettings(context.Context) ([]model.SettingRow, error) {
 	s.loadCalls++
 	if s.loadErr != nil {
 		return nil, s.loadErr
+	}
+	if s.readBackErr != nil && s.applyCalls > 0 {
+		return nil, s.readBackErr
 	}
 	return append([]model.SettingRow(nil), s.rows...), nil
 }
@@ -618,6 +622,76 @@ func TestServicePatchApplyFailurePropagates(t *testing.T) {
 	}
 	if store.loadCalls != 0 {
 		t.Fatalf("写入失败后不应回读，实际 %d 次", store.loadCalls)
+	}
+}
+
+// TestServicePatchReadBackFailureWrapsReadBackError 覆盖 CP5 的回读例外：
+// ApplySettings 提交之后那次 LoadSettings 失败，返回的是 *ReadBackError，而不是裸的
+// 仓储错误或写入失败。类型用来让 API 层把「已提交、只是回读失败」记成独立日志文案；
+// 同时 errors.Is 仍能命中 model.ErrSettingStoreFailed（Unwrap 透传原始错误）。
+// 读路径（Load）的失败不受影响：它不是「写已提交」，不能被包成 ReadBackError。
+func TestServicePatchReadBackFailureWrapsReadBackError(t *testing.T) {
+	store := &fakeStore{readBackErr: fmt.Errorf("select settings: %w", model.ErrSettingStoreFailed)}
+	svc := New(store, &fakeSealer{key: serviceTestKey()}, nil)
+
+	_, err := svc.Patch(context.Background(), Patch{JWUsername: ptr("teacher01")})
+	if err == nil {
+		t.Fatal("回读失败应返回错误")
+	}
+	var readBackErr *ReadBackError
+	if !errors.As(err, &readBackErr) {
+		t.Fatalf("回读失败应包成 *ReadBackError，实际类型 %T: %v", err, err)
+	}
+	if !errors.Is(err, model.ErrSettingStoreFailed) {
+		t.Fatalf("ReadBackError 应保留 model.ErrSettingStoreFailed 类别，实际 err=%v", err)
+	}
+	if store.applyCalls != 1 {
+		t.Fatalf("回读失败前写入应已提交一次，实际 ApplySettings %d 次", store.applyCalls)
+	}
+	if store.loadCalls != 1 {
+		t.Fatalf("应只回读一次，实际 LoadSettings %d 次", store.loadCalls)
+	}
+	if !strings.Contains(readBackErr.Error(), "已提交") {
+		t.Fatalf("ReadBackError 文案应点明写入已提交，实际 %q", readBackErr.Error())
+	}
+
+	// 单纯的读失败（GET 路径）：语义是「没读到」，不是「写已提交、回读失败」。
+	loadStore := &fakeStore{loadErr: fmt.Errorf("select settings: %w", model.ErrSettingStoreFailed)}
+	loadSvc := New(loadStore, &fakeSealer{key: serviceTestKey()}, nil)
+	if _, err := loadSvc.Load(context.Background()); err == nil {
+		t.Fatal("读失败应返回错误")
+	} else {
+		var notReadBack *ReadBackError
+		if errors.As(err, &notReadBack) {
+			t.Fatalf("Load 的读失败不该是 ReadBackError，实际 %v", err)
+		}
+	}
+}
+
+// TestServicePatchEmptyReadBackFailureIsPlainReadError 钉住空补丁的回读口径：
+// PUT {} 与 PUT null 解码出的都是全 nil 的 Patch，changes 为空、从不开事务，因此
+// 那次 Load 失败只是普通读失败，不能被包成 *ReadBackError——否则日志会声称
+// 「写入已提交」，而库里的行一个字节都没动（CP5 的例外只对真写过库的 Patch 成立）。
+func TestServicePatchEmptyReadBackFailureIsPlainReadError(t *testing.T) {
+	store := &fakeStore{loadErr: fmt.Errorf("select settings: %w", model.ErrSettingStoreFailed)}
+	svc := New(store, &fakeSealer{key: serviceTestKey()}, nil)
+
+	_, err := svc.Patch(context.Background(), Patch{})
+	if err == nil {
+		t.Fatal("空补丁的回读失败应返回错误")
+	}
+	if !errors.Is(err, model.ErrSettingStoreFailed) {
+		t.Fatalf("应保留 model.ErrSettingStoreFailed 类别，实际 err=%v", err)
+	}
+	var readBackErr *ReadBackError
+	if errors.As(err, &readBackErr) {
+		t.Fatalf("空补丁没有写事务，回读失败不该包成 *ReadBackError：%v", err)
+	}
+	if store.applyCalls != 0 {
+		t.Fatalf("空补丁不应调用 ApplySettings，实际 %d 次", store.applyCalls)
+	}
+	if store.loadCalls != 1 {
+		t.Fatalf("应只回读一次，实际 LoadSettings %d 次", store.loadCalls)
 	}
 }
 

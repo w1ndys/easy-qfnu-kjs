@@ -25,9 +25,9 @@ Updated: 2026-11-08
 | D7 | **触发来源只进日志，不落库** | 没有验收条目要求按来源筛选；加一列就要一版迁移。日志字段 `trigger=manual\|cron` 足以排障；将来要按来源统计再加下一版迁移 |
 | D8 | **启动前先收敛过期轮次**：复用 `pipeline.ConvergeStaleRuns`（装配层注入为 `runner.Converge`），口径「超过 2 小时的 running 置 failed + `stale_run`」只有一份 | 否则进程在长跑期间崩溃留下的 running 会永久占住唯一索引，之后每次手动同步都只能 409（Requirement 8.3）。把函数注入而不是在 runner 里重算 cutoff，是为了让「2 小时」与 `started_at <` 的边界不会出现第二份实现 |
 | D9 | **手动同步不复用进行中轮次**：先判冲突（409），冲突时不调用采集启动器 | `pipeline.StartRun` 撞唯一索引时会把已有轮次返回给调用方（`Reused=true`），那是「进程重启后续跑」的语义，不是「管理员点了第二次」。两者混用会让手动同步静默接上别人的轮次，面板看到的状态与管理员的操作对不上（CP13） |
-| D10 | **设置写入严格且原子**：`DisallowUnknownFields` + 64 KiB 体上限 + 单事务 | 拼错键名（如 `cron_express`）静默不生效最难排；严格解码直接 `40001`。白名单 200 条时大约几 KiB，`adminWrite` 的 8 KiB 是给密码留的，不够，所以设置用 64 KiB 的独立上限。原子性按 PRD 5.2「校验失败时整次不保存」 |
+| D10 | **设置写入严格且原子**：`DisallowUnknownFields` + 64 KiB 体上限 + 单事务 | 拼错键名（如 `cron_express`）静默不生效最难排；严格解码直接 `40001`。白名单 200 条时大约几 KiB，`adminWrite` 的 8 KiB 是给密码留的，不够，所以设置用 64 KiB 的独立上限；64 KiB 是**请求体（解码前）**的上限，序列化后的库内值可能更大（`settings.value` 是 `text`，无长度约束）——白名单按条数与每条字段规则（`jxlbh`/`name` 各 trim 后 ≤ 4096 字节）校验，整个数组不另设字节上界。原子性按 PRD 5.2「校验失败时整次不保存」 |
 | D11 | **白名单顺序即归属裁决顺序**，保存时按提交顺序落库、不排序、不去重后重排 | 归属冲突的「首个命中」按白名单顺序（原 spec Requirement 5.3），保存时排序会悄悄改变裁决结果（CP6） |
-| D12 | **单实例进程内调度**：compose 部署单副本；多副本时各实例都会触发，靠唯一索引只让一轮启动 | 与 D1 单进程 + 采集协程一致。多副本下「保存后立即重排」只发生在处理该请求的实例，其余实例要等重启；这条限制写进 CP17，不假装已解决 |
+| D12 | **单实例进程内调度**：compose 部署单副本；多副本时各实例都会触发，靠唯一索引只让一轮启动 | 与 D1 单进程 + 采集协程一致。多副本下「提交了 `cron_expr` 的保存后立即重排」只发生在处理该请求的实例，其余实例要等重启；这条限制写进 CP17，不假装已解决 |
 | D13 | **管理端读接口不套公开 60 次/分钟限流** | 面板会轮询轮次列表，60 次/分钟是给公开查询的；管理端读已经由会话门槛保护，再叠一层会让正常刷新误伤 429。`admin-bootstrap` 的 `state` 继续走公开限流，本 spec 不改既有行为 |
 
 ## Architecture
@@ -56,7 +56,7 @@ sequenceDiagram
     SET->>SET: Validate（白名单/cron/URL/文本项明文长度；未知字段在 handler 的严格解码已挡）
     SET->>SET: Seal(settings/<key>, 明文)  ← 非空秘密字段取不到密钥则 50000，一个键都不写
     SET->>ST: ApplySettings(tx: upsert / delete) → Load()
-    API->>SCH: Reload(cron_expr)
+    API->>SCH: Reload(cron_expr)（仅提交了 cron_expr 时）
     API-->>AD: 最新快照
 
     Note over AD,ST: 手动同步
@@ -84,7 +84,7 @@ sequenceDiagram
 
 ```text
 settings: GET → LoadSettings → {明文项, 秘密 "已设置"} + cron_next_at
-          PUT → 严格解码 → Validate → Seal(settings/<key>) → 单事务 upsert/delete → 回读 → scheduler.Reload
+          PUT → 严格解码 → Validate → Seal(settings/<key>) → 单事务 upsert/delete → 回读 → scheduler.Reload（仅提交了 cron_expr 时）
 sync:     Converge(>2h) → Running()? 409/40901 : Whitelist() 空? 202+blocked : Collector.Start() → 202
 cron:     Load expr → Next → wait(timer) → StartCron() → 记日志，不重试
 runs:     Recent/ByID + Weeks + TaskSummary → 原样输出 collect_run 列
@@ -104,7 +104,7 @@ model      → 标准库
 
 `settings.Store` 是消费侧接口，`store.SettingsRepo` 用同名方法结构匹配，与 `auth.AdminStore` 的既有做法一致；装配层放 `var _ settings.Store = store.SettingsRepo{}`。SQL 只出现在 `store`。
 
-`backend/.golangci.yml` 的 depguard 需要补四条规则（否则 lint 直接失败）：
+`backend/.golangci.yml` 的 depguard 需要补四条规则（不补则新包不受依赖约束：lint 不会报错，越层不会被拦）：
 
 - `settings`：`$gostd`、`internal/model`、`internal/secret`、`internal/cronexpr`
 - `cronexpr`：`$gostd`、`internal/model`
@@ -112,6 +112,8 @@ model      → 标准库
 - `runner`：`$gostd`、`internal/model`、`internal/store`
 
 `api` 的 allow 列表补 `internal/settings`、`internal/runner`、`internal/cronexpr`（`internal/store` 已在列表里）。
+
+> **task 9 的提前放行**：`api` allow 里的 `internal/settings` 与 `internal/cronexpr` 已在 task 9 加上（不加这两条，task 9 的 `golangci-lint` 门禁根本过不去）。**task 12 仍欠四条 depguard 规则**（`settings`/`cronexpr`/`scheduler`/`runner`）与 `api` allow 的 `internal/runner`：lint 现在是绿的，不代表依赖规则已经补完——新包目前没有任何「不许 import 谁」的约束，越层不会被拦。
 
 ## Components and Interfaces
 
@@ -157,7 +159,7 @@ const (
 
     DefaultCronExpr      = "10 4 * * 6" // 5 字段；0005 已把 0001 的旧种子改写成同值
     MaxWhitelistEntries  = 200             // 4 周窗口 × 200 楼 = 800 条周结果，详情响应仍可控
-    MaxSettingValueBytes = 4096            // 五项文本项的明文上界（含两个 URL 项）；白名单看条数、cron 看语法
+    MaxSettingValueBytes = 4096            // 五项文本项 + 白名单每条两字段的明文上界；cron 看语法
 )
 
 // Building 是白名单条目；JSON 键名沿用上游 jxlbh 与展示名 name（与 meta 的存储形状一致）。
@@ -259,7 +261,7 @@ type FieldError struct { Field, Message string }
 func (e *FieldError) Error() string
 func (e *FieldError) Unwrap() error   // 恒为 model.ErrSettingInvalid，供 errors.Is 判定 → 42201
 
-// Validate 是纯校验：白名单、cron、URL、五项文本项明文 ≤ 4096 字节。不碰密钥与数据库。
+// Validate 是纯校验：白名单（条数、两字段非空/唯一/各 ≤ 4096 字节）、cron、URL、五项文本项明文 ≤ 4096 字节。不碰密钥与数据库。
 func Validate(p Patch) error
 
 type Service struct { /* store + sealer + clock */ }
@@ -454,7 +456,7 @@ func (s *Server) withJSONBodyLimit(limit int64, next http.HandlerFunc) http.Hand
 
 `cron_next_at` 是「2026-11-14 04:10 +08:00」的 UTC 写法（2026-11-08 是周日，下一个周六是 11-14）；前端自行标注 `Asia/Shanghai`（原 spec Requirement 27.3）。
 
-`PUT /api/admin/settings` 请求体（省略即不变，空串即清除）：
+`PUT /api/admin/settings` 请求体（省略即不变，空串即清除）。整体或字段级 `null` 一律按省略处理：body 为 `null` 等于全部省略，保存照常 200、不写库（no-op）；`{"jw_password":null}` 这类字段级 `null` 等同没提交该字段，保持原值：
 
 ```json
 {
@@ -544,8 +546,9 @@ func (s *Server) withJSONBodyLimit(limit int64, next http.HandlerFunc) http.Hand
 
 - `POST /api/admin/sync` 不读请求体、不要求 `Content-Type`：`curl -X POST` 就能用（Requirement 8.7）。
 - 参数越界（`limit=0`、`limit=101`、`offset=-1`、`run_id=abc`）一律 `40001`，沿用公开查询那套「入口解析、越界即拒」的分页写法。
-- 设置写入的顺序固定：**严格解码（40001）→ 字段校验（42201）→ 取密钥（50000）→ 事务写（50000）→ 回读 → `scheduler.Reload`**。取密钥放在校验之后、写之前：非法请求不必碰密钥文件，而任何合法请求都不会在拿不到密钥时写进半个秘密。成功响应与 `GET /api/admin/settings` **同一形状**（含重算后的 `cron_next_at`），前端保存后不必再发一次 GET。
-- `scheduler.Reload` 失败（理论上不可达：校验与调度共用同一个 `cronexpr.Parse`）只记 ERROR，不回滚已保存的设置；下一次启动会按库里的表达式装载。`reloadCron` 回调为 nil 时跳过（此时 `WithAdminSettings` 未装配，端点已经返回 `50000`）。
+- 设置写入的顺序固定：**严格解码（40001）→ 字段校验（42201）→ 取密钥（50000）→ 事务写（50000）→ 回读 → `scheduler.Reload`（仅提交了 `cron_expr` 时）**。取密钥放在校验之后、写之前：非法请求不必碰密钥文件，而任何合法请求都不会在拿不到密钥时写进半个秘密。重排只跟着 `cron_expr` 走：保存白名单或用户名不改变调度计划，也不该借这次保存去重排库里可能非法的存量表达式（那会多出一条与本请求无关的 ERROR）；只在回读成功之后才重排，回读失败时 handler 没有新表达式可交。成功响应与 `GET /api/admin/settings` **同一形状**（含重算后的 `cron_next_at`），前端保存后不必再发一次 GET。
+- 并发保存时，「`Patch`（写事务 + 回读）→ `scheduler.Reload`」整段在同一把进程内互斥锁（`Server.settingsMu`）下成对执行：重排必须紧跟着它自己那次写事务，否则两次并发保存的「回读 → 重排」可以交错成「A 写库、B 写库、B 重排、A 重排」——库是 B、进程内计划是 A，`GET` 显示 B 而调度器按 A 跑，直到下次重启才对齐。锁只包住这一段，响应写出（`writeSuccess`）不在临界区内；`GET /api/admin/settings` 不取这把锁（只读一次快照，与保存的先后不影响任何不变式）。单实例前提见 CP17，串行化的不变式见 CP19。
+- `scheduler.Reload` 失败（理论上不可达：校验与调度共用同一个 `cronexpr.Parse`）只记 ERROR，不回滚已保存的设置；下一次启动会按库里的表达式装载。这条 ERROR 日志带 `request_id`（与本次 `200` 响应里的同一个）、`status=200`、`code=0`：它描述的是「保存已成功，只是进程内的计划没换」，不是失败响应，排障时不能当 `50000` 读。**这条路径上会先后出现两条日志，别当成两次失败**：`scheduler.Reload` 先在包内记一条 WARN（含 `cron` 表达式原文与 `err` 原文，见 `internal/scheduler/scheduler.go` 的 `Reload`），handler 再记上面那条 ERROR；两条都只含 cron 表达式与解析错误、不含任何设置值（表达式不是秘密，CP1），且按 CP8 该路径不可达，写清它是为了「日志里同时出现这对 WARN+ERROR」时能一眼认出是同一次保存的下半段。`svc` 与 `reloadCron` 分开注入：调度器未装配时只传 `svc`、`reloadCron` 传 nil，保存照常 200 并跳过重排；只有 `svc` 为 nil 才返回 `50000`。
 - 时间一律取自 `s.clock()`；store 侧由 `settings.Service` 传入 `now`，不在 SQL 里写 `now()`。
 - 未装配 `WithAdminSettings` / `WithRunStatus` / `WithSync` 时端点仍注册，按 `50000` 返回（与 `WithAdmin`/`WithMeta` 的既有做法一致），让 `main.go` 漏装配立刻暴露。
 
@@ -577,9 +580,9 @@ UPDATE settings
 | `feishu_webhook` | **是** | `v1:` 信封密文 | 加封之前按明文校验：http/https 绝对地址且 ≤ 4096 字节；空串 = 清除 |
 | `feishu_sign_secret` | **是** | `v1:` 信封密文 | 明文 ≤ 4096 字节；空串 = 清除 |
 | `cron_expr` | 否 | 5 字段表达式，trim 后存 | 先 `TrimSpace` 再 `cronexpr.Parse`；空串或 TrimSpace 后为空非法，Parse 通过才保存 |
-| `building_whitelist` | 否 | JSON 数组 `[{"jxlbh","name"}]` | 楼编号非空且唯一、展示名非空、≤ 200 条；`[]` 合法 |
+| `building_whitelist` | 否 | JSON 数组 `[{"jxlbh","name"}]` | 楼编号、展示名 trim 后非空且各 ≤ 4096 字节；楼编号 trim 后唯一；≤ 200 条；`[]` 合法 |
 
-`MaxSettingValueBytes`（4096）作用于五项文本项的**明文**字节数：`jw_username`、`jw_password`、`ocr_base_url`、`feishu_webhook`、`feishu_sign_secret`（非秘密文本项 `jw_username`、`ocr_base_url` 按 `TrimSpace` 后计，口径见下一段）。`building_whitelist` 按条数（≤ `MaxWhitelistEntries`）与每条字段规则、`cron_expr` 按 5 字段语法校验，都不套这个字节上界。
+`MaxSettingValueBytes`（4096）作用于五项文本项的**明文**字节数：`jw_username`、`jw_password`、`ocr_base_url`、`feishu_webhook`、`feishu_sign_secret`（非秘密文本项 `jw_username`、`ocr_base_url` 按 `TrimSpace` 后计，口径见下一段）。白名单的 `jxlbh` 与 `name` 各自按 `TrimSpace` 后的字节数套同一个上界（逐字段计，不是整个数组：200 条合法条目序列化后超过 4096 是允许的，`settings.value` 是 `text`），整个数组只看条数（≤ `MaxWhitelistEntries`）；`cron_expr` 只按 5 字段语法校验，不套这个字节上界。**白名单事实上的总上限是 64 KiB 请求体**：逐字段的 4096 上界只在请求体已经通过体门的前提下判定，一个 ≤ 200 条、每字段都 ≤ 4096 字节的合法名单若序列化后超过 64 KiB，请求在解码前就被 Requirement 6.1 以 `40001` 拒绝，走不到 `42201`——4096 管的是「单条能写多长」，不是「整个数组能有多大」。
 
 `feishu_webhook` 虽按 URL 形状校验，也必须受这个上界：它是秘密项，落库是 `v1:` 信封，明文字节数与信封长度线性相关。信封长度 ≤ `3 + 4·ceil((p+28)/3)`：`v1:` 前缀在 base64 之外（单独 3 字节），`p+28` 是 nonce 12 + 密文 + GCM tag 16 的载荷长度；无填充 base64url 每 3 字节编成 4 字符、末组不足 3 字节也按整组 4 字符计，因此这个式子是上界、取等只在 `(p+28) % 3 == 0` 时成立（`p=4096` 时该式给 5503，实际 5502）。`secret.Open` 的 64 KiB 长度门要求 `3 + 4·ceil((p+28)/3) ≤ 65536`，即 `p_max = 49121`；明文超过 49121 字节就成了「加封存得进、`Reveal` 读不出」。对 `ocr_base_url` 这类非秘密文本项，上界只是统一口径、挡住误贴的整段网页，不是凭据的强度规则。
 
@@ -648,10 +651,10 @@ RETURNING run_id, started_at;
 - CP2 **密文绑定设置项**：秘密以 `secret.Key.Seal("settings/<key>", …)` 写入；换键名无法解开（`secret` 包既有 AAD 测试已锁住），明文只在 `Reveal` 的返回值里出现。
 - CP3 **密钥不可用即拒写**：`Patch` 含任一**非空**秘密字段时先 `Current()` 取密钥；取不到时整请求 `50000`、零行写入，不存在「密钥坏了就存明文」的退化路径。只把秘密设为空串（清除）不需要密钥，照常删除。
 - CP4 **回显判定只认键名**：是否秘密由 `model.SecretSetting(key)` 决定，`settings.is_secret` 列只作记录；手工插一行 `is_secret=false` 的 `jw_password` 也不会被回显。
-- CP5 **写入原子**：一次保存的 upsert/delete 在同一事务；校验失败、密钥不可用、任一条 SQL 失败时，`settings` 行的键集合与值都与保存前逐字节相同。
+- CP5 **写入原子**：一次保存的 upsert/delete 在同一事务；校验失败、密钥不可用、**事务内 upsert/delete 任一条失败**时，`settings` 行的键集合与值都与保存前逐字节相同。回读（`ApplySettings` 提交之后的那次 `LoadSettings`）失败不在本条范围内：此时事务已提交、设置已落库，handler 返回 `50000` 但不回滚，与错误表「`ApplySettings` 已成功但回读失败」一行一致。空补丁（`PUT {}` / `PUT null`）不调 `ApplySettings`、没有「已提交」可言，它的 `Load` 失败按普通读失败上抛，不包成 `*settings.ReadBackError`；API 层据此把它记成第三条日志文案「设置读写失败」——与写入失败的「保存设置失败」、回读失败的「回读设置失败（写入已提交）」互不相同，三种 500 只在服务端日志上可区分。这条分派只看补丁是否为空（一个字段都没提交），**不与 `ErrSettingStoreFailed` 绑定**：没包哨兵的读错误（替身、将来的仓储实现、上下文取消等）同样记「设置读写失败」，不会被说成一次根本没发生的写入。
 - CP6 **局部更新语义**：省略 = 保持；空串 = 删除该键（回显空串 / `false`）；提供 = 替换。白名单按提交顺序保存，不排序、不按编号重排。
-- CP7 **白名单可用性**：保存成功后的 `building_whitelist` 恒为合法 JSON 数组，每条 `jxlbh` 非空唯一、`name` 非空、条数 ≤ 200；`meta` 的 `parseBuildingWhitelist` 能原样解析它（写入形状与读取形状同一套键名）。
-- CP8 **表达式单一判据**：API 校验与调度装载共用 `cronexpr.Parse`；`PUT` 成功 ⇒ `Reload` 必成功。不存在「存进去却排不了」或「能排的表达式存不进去」的组合。
+- CP7 **白名单可用性**：保存成功后的 `building_whitelist` 恒为合法 JSON 数组，每条 `jxlbh` 非空唯一且 ≤ 4096 字节、`name` 非空且 ≤ 4096 字节、条数 ≤ 200；`meta` 的 `parseBuildingWhitelist` 能原样解析它（写入形状与读取形状同一套键名）。
+- CP8 **表达式单一判据**：API 校验与调度装载共用 `cronexpr.Parse`；提交了 `cron_expr` 的 `PUT` 成功 ⇒ 该表达式对两者同样合法，`Reload` 不会因表达式本身失败，不存在「存进去却排不了」或「能排的表达式存不进去」的组合。回调返回错误只记 ERROR、不回滚已保存的设置、响应仍 `200` + `code=0`；当前实现的回调失败模式只有 `cronexpr.Parse` 失败这一种（`scheduler.Reload` 先 Parse 再装载），而在提交了 `cron_expr` 的 `PUT` 路径下它与校验共用同一个 `cronexpr.Parse`、同一串 trim 后的表达式，因此不可达；将来回调引入其它失败模式（装载、锁、内部状态等）时仍按本口径处理。不可达指的是**这对日志不该出现**：该路径真被触发时会先后留下 `scheduler.Reload` 的 WARN（`cron` 表达式原文 + `err` 原文）与 handler 的 ERROR（`request_id`、`status=200`、`code=0`），两条同属「保存已成功、进程内计划没换」，都不含设置值——所以看到 WARN+ERROR 成对出现，说明是表达式判据分叉了，而不是两次独立故障。
 - CP9 **时区确定**：`Next` 恒在 `Asia/Shanghai`（+08:00）日历上求值；同一表达式与同一 `after` 恒得同一结果。日/周字段都受限时按「任一命中」触发（Vixie 语义，`*` 之外的 `*/n` 也算受限）；5 年内无命中返回 `false`（`0 0 30 2 *`）。
 - CP10 **调度不堆积**：到点触发失败或撞上进行中轮次时只记一条日志，不重试、不排队；下一个计划时刻照常评估。同一进程内不存在两个调度循环。
 - CP11 **单轮互斥**：`collect_run_single_running` 仍是最终判据；`runner.Service` 的互斥锁让单进程内的「读 running → 建轮」不互相穿插，跨进程由唯一索引兜底，输家映射成 `40901`。
@@ -660,27 +663,31 @@ RETURNING run_id, started_at;
 - CP14 **冲突不产生副作用**：返回 409 的请求不新建轮次、不调用 `Collector.Start`（替身断言调用次数为 0）。
 - CP15 **运行状态只读且忠实**：轮次字段原样来自 `collect_run` / `collect_run_week` / `sync_task` 聚合，不做推算；未知 `run_id` → `40401`；一条轮次都没有时是空列表而不是错误。
 - CP16 **未装配不留脏数据**：`Collector` 为 nil 且白名单非空时返回 `50000`，`collect_run` 行数不变；装配缺失只记日志，不写假轮次。
-- CP17 **单实例前提**：调度在进程内，单副本部署下「保存即重排」成立；多副本时其它实例要等重启，且同一计划时刻每个实例都会触发一次，靠唯一索引只让一轮成立——这是已知限制，不是本 spec 的保证。
+- CP17 **单实例前提**：调度在进程内，单副本部署下「提交了 `cron_expr` 的保存即重排」成立；多副本时其它实例要等重启，且同一计划时刻每个实例都会触发一次，靠唯一索引只让一轮成立——这是已知限制，不是本 spec 的保证。
 - CP18 **响应键白名单**：设置响应的 `data` 只有 8 个键（`jw_username`、`jw_password_set`、`ocr_base_url`、`feishu_webhook_set`、`feishu_sign_secret_set`、`cron_expr`、`cron_next_at`、`building_whitelist`）；轮次响应只有设计表列的键；所有新响应（含 4xx/5xx）带 `Cache-Control: no-store`。
+- CP19 **并发保存串行**：`PUT /api/admin/settings` 的「`Patch`（写事务 + 回读）→ `scheduler.Reload`」整段由 `Server.settingsMu` 串行化，任意两次保存的写事务与重排不会交错；因为每次重排都紧跟在它自己那次写事务之后，并发 PUT 结束后「最后一次写库的那次请求」就是「最后一次重排」，**重排成功时**库里的 `cron_expr` 与进程内调度计划一致，不会分叉到下次重启；重排失败按 CP8 处理（保留旧计划、只记 ERROR、不回滚设置），此时库与进程内计划允许不一致，直到下次启动、或下一次提交 `cron_expr` 且重排成功的保存才对齐。只锁 `Patch` 不够：重排留在锁外时，两次保存的「回读 → 重排」仍可穿插，A 的重排可以晚于 B 的重排。锁不覆盖响应写出；`GET /api/admin/settings` 不取这把锁。
 
 ## Error Handling
 
 | 场景 | HTTP | 业务码 | 处理 |
 |---|---|---|---|
-| 请求体不是 JSON / `Content-Type` 不符 / 超过 64 KiB | 400 | 40001 | 不进入业务逻辑，不写设置 |
+| 请求体不是 JSON / `Content-Type` 不符 / 超过 64 KiB | 400 | 40001 | 不进入业务逻辑，不写设置；64 KiB 是请求体（解码前）上限，序列化后的库内值可能更大（`settings.value` 是 `text`，无长度约束） |
 | 请求体含未定义字段 | 400 | 40001 | 严格解码失败；消息点名该字段 |
 | `limit`/`offset`/`run_id` 非法 | 400 | 40001 | 参数门在查库之前 |
 | 无会话 / 会话过期 | 401 | 40101 | 清 Cookie，统一文案（沿用既有中间件） |
 | CSRF 缺失或与会话不一致 | 403 | 40301 | 不执行业务写入，保留会话 |
-| 白名单编号为空/重复、展示名为空、超过 200 条 | 422 | 42201 | 消息点名 `building_whitelist` 与原因，整次不保存 |
+| 白名单编号为空/重复、展示名为空、`jxlbh`/`name` 超过 4096 字节、超过 200 条 | 422 | 42201 | 消息点名 `building_whitelist` 与原因，整次不保存 |
 | cron 字段数、取值、区间、步进非法 | 422 | 42201 | 消息点名 `cron_expr` 与字段位置，整次不保存 |
 | `ocr_base_url` / 飞书地址不是 http(s) URL | 422 | 42201 | 消息点名字段，整次不保存 |
 | 指定 `run_id` 不存在 | 404 | 40401 | 固定文案「采集轮次不存在」 |
 | 已有进行中轮次（≤ 2 小时） | 409 | 40901 | 消息点名 `run_id` 与阶段；不建轮次 |
 | 密钥不可用且请求体含非空秘密字段 | 500 | 50000 | 零行写入；消息「加密密钥不可用，无法保存秘密」 |
 | 设置/轮次仓储失败、事务回滚 | 500 | 50000 | 日志只记错误类别与 `request_id`，响应固定文案 |
+| `ApplySettings` 已成功但回读失败 | 500 | 50000 | 设置已落库；重试幂等（重放后可见设置相同），不回滚已提交的事务；日志文案「回读设置失败（写入已提交）」，与写入失败的「保存设置失败」区分（`*settings.ReadBackError` 分派） |
+| 空补丁（`{}` / `null`）回读失败 | 500 | 50000 | 一个字段都没提交，`ApplySettings` 零调用、从未开过写事务，因此既不是「保存设置失败」也没有「已提交」可讲；日志文案「设置读写失败」，与「保存设置失败」「回读设置失败（写入已提交）」三条互不相同（handler 把 `emptySettingsPatch` 作独立 case、排在 `*ReadBackError` 之后与哨兵兜底之前，分派不看错误类别——非哨兵的读错误同样记这条），否则运维会去追一次根本没发生的写入，或误以为设置已经落库 |
 | 采集启动器未装配（白名单非空） | 500 | 50000 | 不建轮次；启动期已记一条 WARN |
 | 装配缺失（`WithAdminSettings`/`WithRunStatus`/`WithSync` 未调用） | 500 | 50000 | 与既有 `WithAdmin` 未装配同口径，不以 404 掩盖 |
+| `PUT /api/admin/settings` 未装配 `WithAdminSettings`，请求体同时非法 | 500 | 50000 | handler 的 nil 检查在严格解码**之前**：`50000` 优先于 `40001`；体门与会话/CSRF 仍在外层（`Content-Type` 不符先 `40001`、未登录先 `40101`） |
 | cron 存量表达式非法（启动期） | — | — | 记 ERROR 后回落 `DefaultCronExpr`，服务照常启动（Requirement 9.6） |
 | 到点触发撞上进行中轮次（cron 来源） | — | — | 记 INFO `cron_skipped_busy`，返回 nil，不重试 |
 | 到点触发其它失败（cron 来源） | — | — | 记 WARN（含类别与 `run_id` 若已有），等待下一个计划时刻 |
@@ -693,7 +700,7 @@ RETURNING run_id, started_at;
 
 - `model.ErrRunBusy` 由 `runner.BusyError{Run store.RunSummary}` 包装，`Unwrap` 恒返回它。错误值里就带着冲突轮次的 `RunID` 与 `Phase`，API 层 `errors.As` 取到 `*runner.BusyError` 后直接拼 409 / `40901` 文案，不再查一次库；需要只判类别时 `errors.Is(err, model.ErrRunBusy)` 即可。`runner.Start` 只在两种情况下返回它：读到进行中轮次，或 `Collector.Start` 返回包装了 `model.ErrRunConflict` 的错误且重读 `Running` 命中。
 - `model.ErrSettingInvalid` 由 `settings.FieldError{Field, Message}` 包装：`FieldError.Unwrap` 恒返回它，`Error()` 的文案点名字段与原因。API 层既用 `errors.As` 取 `*settings.FieldError` 拿字段名拼 `42201`，也用 `errors.Is(err, model.ErrSettingInvalid)` 只判类别；`Validate` 只返回包装后的 `*FieldError`，不直接返回裸哨兵，否则错误文案里就少了具体是哪个字段。
-- `model.ErrSettingStoreFailed` 由 `store.SettingsRepo` 在 SQL 或事务失败（含回滚）时用 `%w` 映射，另含开事务前的键白名单拒绝；`settings.Service` 不吞不换，原样上抛；API 层据此映射 `50000` 并固定文案。
+- `model.ErrSettingStoreFailed` 由 `store.SettingsRepo` 在 SQL 或事务失败（含回滚）时用 `%w` 映射，另含开事务前的键白名单拒绝；`settings.Service` 的读路径（`Load`/`Reveal`/`Whitelist`/`CronExpr`）不吞不换、原样上抛。唯一例外是 `Patch` 在 `ApplySettings` 提交之后的那次回读：它包成 `*settings.ReadBackError`（`Unwrap` 透传原始错误，`errors.Is` 仍命中本哨兵），让 API 层把「写入已提交、只是回读失败」与「写入失败」记成两种日志文案；API 层必须**先**按 `*ReadBackError` 分派、再按哨兵兜底，两者都映射 `50000` 并共用固定响应文案。
 - `model.ErrRunNotFound` 保留（reserved），当前没有调用点：`store.RunStatusRepo.ByID` 的 `(RunSummary, bool, error)` 用 `bool` 承载「没有这一轮」，`false` 就是「未找到」，由 handler 映射 404 / `40401`，`error` 只承载真正的读库失败；`ByID` 自己不返回这个哨兵，也不把「未找到」写进 `error`。将来只回单个 `error`、没有 `bool` 通道的读取路径再用它。
 - `model.ErrCollectorUnavailable` 不包装：`runner.Start` 在白名单非空而 `Deps.Collect == nil` 时直接返回它，没有错误类型承载额外字段；API 层 `errors.Is` 命中即 `50000`。不要为它再造一层包装，那只会让判定多一跳，换不来任何上下文。
 
@@ -702,7 +709,7 @@ RETURNING run_id, started_at;
 - **cronexpr 表驱动**：合法（`* * * * *`、`*/5 * * * *`、`10 4 * * 6`、`30 8-18/2 * * 1-5`、`0,30 * * * *`、`1,* * * * *`、周 `7` 归一为周日）与非法（字段数 4/6、`*/0`、`*/+5`、`1-2/+1`、`5-1`、`1,,2`、`60 * * * *`、`0 24 * * *`、`0 0 32 * *`、`0 0 * 13 *`、`0 0 * * 8`、`@every 1h`、`MON`、空串、前后多余空格）。错误文案断言含字段位置。另有一条用例直接解析 `model.DefaultCronExpr`：字段数必须是 5，`Next` 必须落在周六 04:10——默认值退回 6 段时它先红。
 - **cronexpr 属性测试**：对随机 `after` 与随机合法表达式，断言 `Matches(Next(after))` 为真且 `(after, Next(after))` 区间内无命中；`Next` 严格晚于 `after`（同一分钟不重复触发）。
 - **cronexpr 时间边界**：23:59→次日 00:00、月末→次月 1 日、12 月 31 日→次年 1 月 1 日、闰年 2 月 29 日、`0 0 30 2 *` 返回 `false`、日/周同时受限的 OR 语义（例如 `0 0 1 * 1` 在「每月 1 日」与「每周一」都触发）、`*/2` 在日字段视为受限。
-- **settings 纯校验**：白名单空编号 / trim 后重复 / 空展示名 / 201 条；cron 非法（另测 `cron_expr` 前后空白 trim 后通过、全空白按空串拒绝）；URL 非 http(s)；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文各测「恰好 4096 字节通过、4097 字节拒绝」（`jw_username` 按 `TrimSpace` 后计；`ocr_base_url` 另测带前后空白的口径：trim 后恰好 4096 字节通过、trim 后 4097 字节拒绝，前后空白不计入这 4096）；反向用例钉住上界的作用范围：≤200 条白名单序列化后超过 4096 字节仍然合法，`cron_expr` 只按 5 字段语法判定、不量字节，而 4097 字节的合法 URL 形状 `feishu_webhook` 仍被拒——说明拒绝来自字节上界而不是 URL 形状；`Whitelist: &[]` 合法。`Patch` 指针的三种状态（省略、空串、值）各有用例。
+- **settings 纯校验**：白名单空编号 / trim 后重复 / 空展示名 / 201 条 / `jxlbh` 与 `name` 各测「恰好 4096 字节通过、4097 字节拒绝」（按 trim 后计）；cron 非法（另测 `cron_expr` 前后空白 trim 后通过、全空白按空串拒绝）；URL 非 http(s)；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文各测「恰好 4096 字节通过、4097 字节拒绝」（`jw_username` 按 `TrimSpace` 后计；`ocr_base_url` 另测带前后空白的口径：trim 后恰好 4096 字节通过、trim 后 4097 字节拒绝，前后空白不计入这 4096）；反向用例钉住上界的作用范围：≤200 条白名单序列化后超过 4096 字节仍然合法（上界逐字段，不按数组），`cron_expr` 只按 5 字段语法判定、不量字节（含恰好 4097 字节的合法表达式仍通过），而 4097 字节的合法 URL 形状 `feishu_webhook` 仍被拒——说明拒绝来自字节上界而不是 URL 形状；`Whitelist: &[]` 合法。`Patch` 指针的三种状态（省略、空串、值）各有用例。
 - **settings 服务（替身 Store + 临时密钥）**：合法保存把所有变更放进**一次** `ApplySettings` 调用；校验失败与「非空秘密 + 密钥不可用」时 `ApplySettings` 调用次数为 0；只把秘密设为空串时不碰 `Current()` 且照常删除；秘密 `Seal` 用的 AAD 是 `settings/<key>`（替身记录参数）；`Reveal` 能取回明文、换键名与篡改密文都失败；`Load` 的 `*_set` 只由库中键存在性决定。
 - **settings 仓储单测（替身）**：`LoadSettings` 的查询参数就是 `model.SettingKeys()` 的七项；SQL 片段钉住 `WHERE key = ANY($1)`、`ORDER BY key` 与 upsert 的三处 `EXCLUDED.*`（`value`/`is_secret`/`updated_at`）；`pgx.Rows` 替身按位置真赋值并校验列数与类型，锁住四列 `key, value, is_secret, updated_at` 的扫描顺序；空批次不开事务；一批只开一个事务、每条 upsert 都用同一个 `now`、最后提交一次；键外变更在开事务前整批拒绝且零语句；`Delete` 分支只传键；第二条失败立即停止并回滚；Query/Scan/`rows.Err`/Begin/Commit 各自包 `ErrSettingStoreFailed`，错误消息只带键名不带值。
 - **settings 仓储集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：迁移到 0005 后 `ApplySettings` 的 upsert/delete、`updated_at`、事务回滚（第二条注入 NUL 等必然失败的值）；`LoadSettings` 只返回七个键，且键外行仍在库里（直查 `count(*)` 为 1）——证明「存在但读不到」，而不是「压根没插进去」。
@@ -711,9 +718,10 @@ RETURNING run_id, started_at;
 - **scheduler（假时钟 + 注入 `wait`）**：到点触发一次；`Reload` 后按新表达式；触发返回错误只记日志并在下一时刻继续；`ctx` 取消后 `Run` 返回；存量表达式非法时回落默认值；`Next` 与 cronexpr 结果一致。
 - **api 契约（httptest + 替身 Reader/Service）**：五个端点的状态码、业务码、`data` 键集合、`Cache-Control: no-store`；GET 响应不含秘密哨兵；PUT 非法字段整次不变；PUT 未知字段 40001；64 KiB 边界（恰好通过、+1 拒绝）；`limit`/`offset`/`run_id` 越界；409 消息含 `run_id`；未装配三件依赖时 50000。
 - **并发同步**：50 个 `POST /api/admin/sync` 同时打（假 Collector 用互斥模拟唯一索引，并发输家返回 `ErrRunConflict`），断言恰好 1 个 202 `running`，其余 409/40901，且 `collect_run` 只多一行。
+- **并发保存**：两个 `PUT /api/admin/settings` 带不同 `cron_expr` 同时打（重复 32 轮），断言两次都 `200`、各重排一次，且 `reload` 记录的最后一项等于库里的 `cron_expr`——即「最后一次写库」与「最后一次重排」是同一个请求（CP19）。缺 `settingsMu` 时会出现「库=B、进程内计划=A」，而且 `reload` 记录与存储替身的行/调用计数会被两个请求 goroutine 同时写，`-race` 会直接报出来。
 - **端到端检查点（真实库 + 假 Collector）**：init → login → `GET /api/admin/settings`（默认 cron、空白名单）→ `PUT` 白名单 + cron + 三个秘密 → `GET`（`*_set=true`、无明文、`cron_next_at` 正确）→ 空名单手动 sync → 202 `blocked` → 配好名单后手动 sync → 202 `running` → 再 sync → 409 → `GET /api/admin/runs` 与 `/runs/{id}` → `PUT` 非法 cron → 42201 且设置逐字节不变 → 库里 `jw_password` 以 `v1:` 开头且不等于明文。
 - **日志脱敏**：用唯一哨兵作为秘密与密码提交，捕获 `slog` 输出，断言整段日志不含哨兵、不含密文、不含 Cookie 与 CSRF 值。
-- **门禁**：`go build ./...`、`go vet ./...`、`go test ./...`、`golangci-lint run`（含新增四条 depguard 规则）四条全绿；`go.mod` 不变。
+- **门禁**：`go build ./...`、`go vet ./...`、`go test -count=1 ./...`、`golangci-lint run`（含新增四条 depguard 规则）、`go test -race -count=1 ./internal/api ./internal/settings` 全部 0 退出；`go.mod` 不变。**`-race` 那一项是必跑口径，不是可选项**：第 9 项的 `settingsMu` 串行化与并发 PUT 用例只有在竞态检测器下才完整（库行、`reload` 记录、调用计数都在多个请求 goroutine 之间共享），只跑 `go test -count=1 ./...` 不带检测器，等于把这条不变式的守门人关掉；`-count=1` 同样不能省——同代码同参数复跑（例如连续两次 gate）时 go test 会回放上一次的 `ok (cached)`，竞态二进制根本不执行，`-count=1` 强制每次都真跑一遍。仓库根的 `Taskfile.yml` 用 `task backend:test-race` 暴露同一条命令（`go test -race -count=1 ./internal/api ./internal/settings`），`task gate` 已包含它。
 
 ## 与既有文档的差异
 

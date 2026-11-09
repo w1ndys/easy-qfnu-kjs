@@ -2,19 +2,25 @@ package api
 
 // 本文件是管理端 HTTP 的横切层：请求体大小与 Content-Type、会话、CSRF、no-store、错误码映射
 // 与日志字段白名单。
-// 管理端写端点的顺序固定为 no-store → 体门 → 会话 → CSRF → 业务：任何一步失败都不进入下一步，
-// 因此「缺会话 / 缺 CSRF 时业务写方法调用为 0」由链路结构保证，而不是靠每个 handler 自觉（CP7）。
+// 管理端读端点的顺序固定为 no-store → 会话 → 业务（adminRead）；
+// 写端点的顺序固定为 no-store → 体门 → 会话 → CSRF → 业务（adminWrite / adminWriteLimit）：
+// 任何一步失败都不进入下一步，因此「缺会话 / 缺 CSRF 时业务写方法调用为 0」由链路结构保证，
+// 而不是靠每个 handler 自觉（CP7）。
+// 体门的上限是参数：密码类端点 8 KiB、设置端点 64 KiB，两条链只有这一个差异。
 // state/init 的处理器在 admin.go、路由在 api.go 注册；登录、退出与改密的处理器在
-// admin_session.go，路由同样在 api.go 注册。五个端点都经由本文件提供的中间件，
+// admin_session.go，设置读写处理器在 admin_settings.go，路由同样在 api.go 注册。
 // 这里只提供可组合的中间件与解析入口。
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/auth"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
@@ -25,6 +31,13 @@ const (
 	// 管理端提交的是密码与确认密码，8 KiB 足够容纳 256 码点上限且留了编码余量，
 	// 同时挡住「用一个超大请求体把解析与哈希拖死」的尝试（design「约束」）。
 	adminBodyLimit = 8 << 10
+	// adminSettingsBodyLimit 是 PUT /api/admin/settings 的请求体上限：64 KiB。
+	// 设置体里最重的是教学楼白名单：200 条、每条几十字节，几 KiB 就到头了，8 KiB
+	// 看似够用；但上界要按「合法但很长」的条目留出余量（白名单整体没有字节上界、
+	// 单条字段最多 4096 字节），且拼错字段时用户会整段贴进请求体，8 KiB 会把这些请求
+	// 误判成体超限。
+	// 单独给 64 KiB 而不是放大 adminBodyLimit，是为了不让密码端点跟着放宽（D10）。
+	adminSettingsBodyLimit = 64 << 10
 	// adminCSRFHeader 是写请求回传 CSRF 同步器令牌的头名（D7、Requirement 6.1）。
 	adminCSRFHeader = "X-CSRF-Token"
 	// adminCookieName 是管理会话 Cookie 名；eqk_ 前缀与同域其它系统的 Cookie 区分。
@@ -36,7 +49,7 @@ const (
 // 管理端错误码（design 错误码表）。HTTP 状态表达「类别」，业务码表达「具体原因」，
 // 前端只认业务码，所以文案与状态都从这里的常量出发，避免各处写字面量漂移。
 const (
-	codeBadRequest     = 40001 // 请求体不合法：非 JSON、字段缺失、超过 8 KiB、Content-Type 不符
+	codeBadRequest     = 40001 // 请求体不合法：非 JSON、字段缺失、超过请求体上限（8 KiB 或 64 KiB）、Content-Type 不符
 	codeSessionInvalid = 40101 // 无会话、会话过期、凭据无效
 	codeCSRFInvalid    = 40301 // CSRF 令牌缺失或与会话不一致
 	codeInternal       = 50000 // 仓储失败、密钥写入失败、装配缺失
@@ -85,7 +98,7 @@ func (s *Server) adminFail(w http.ResponseWriter, r *http.Request, status, code 
 }
 
 // withNoStore 给管理端响应加 Cache-Control: no-store（Requirement 9.5、CP11）。
-// 它挂在管理端写链路的最外层，并且在内层动手之前就把头写好：401/403 是内层中间件直接写出的，
+// 它挂在管理端读/写链路的最外层，并且在内层动手之前就把头写好：401/403 是内层中间件直接写出的，
 // 若 no-store 在内层，这些错误响应就会漏掉缓存控制，而登录态与密钥恰恰最不能被缓存。
 // 用 Set 而不是 Add：进到这里时已有的 Cache-Control（外层或上游留下的）会被替换成单个 no-store，
 // 而不是叠成 `max-age=3600, no-store` 这种自相矛盾的组合。
@@ -110,6 +123,17 @@ func withPragmaNoCache(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// adminRead 组装管理端读端点的中间件链：
+//
+//	no-store → 会话 → 业务
+//
+// 读端点不要求 CSRF（没有写入可伪造），但同样必须带 no-store：设置快照里有教务账号、
+// OCR 地址与白名单，被缓存下来等于把这些配置留在代理与浏览器里（Requirement 10.2、CP18）。
+// 与 adminWrite 共用 withNoStore / withSession，错误响应（40101、50000）也带 no-store。
+func (s *Server) adminRead(next http.HandlerFunc) http.HandlerFunc {
+	return withNoStore(s.withSession(next))
+}
+
 // adminWrite 组装管理端写端点的中间件链：
 //
 //	no-store → 请求体大小与 Content-Type → 会话 → CSRF → 业务
@@ -117,18 +141,43 @@ func withPragmaNoCache(next http.HandlerFunc) http.HandlerFunc {
 // 顺序写在一处而不是各端点自己拼：CP7 要求「有效会话 → CSRF 一致都在业务体解析之前」，
 // CP11 要求每个响应都带 no-store，这两条不该靠每个 handler 各自记得。
 // 体门放在会话之前是最便宜的检查：坏 Content-Type 不必查库，也就不占用数据库连接。
+// 上限固定 8 KiB，就是 adminWriteLimit(adminBodyLimit, …)：链的定义只留在 adminWriteLimit
+// 一处，将来调整门序不必在两个函数里各改一遍。
 func (s *Server) adminWrite(next http.HandlerFunc) http.HandlerFunc {
-	return withNoStore(s.withJSONBody(s.withSession(s.withCSRF(next))))
+	return s.adminWriteLimit(adminBodyLimit, next)
 }
 
-// withJSONBody 是写请求体的门：先装 http.MaxBytesReader（8 KiB），再要求 Content-Type
-// 是 application/json（design「约束」、Requirement 6.6）。
-// 先装读取上限再判头：MaxBytesReader 只约束之后的读取，装在前面才能保证接下来的任何一次
-// 读（包括业务 handler 里的解析）都受 8 KiB 约束。Content-Type 不符直接 40001，体一个字节都不读，
-// 这同时是挡住「表单型 CSRF」的兜底层。
+// adminWriteLimit 是带请求体上限的管理端写链路：
+//
+//	no-store → 体门(limit) → 会话 → CSRF → 业务
+//
+// 签名与 adminWrite 只差一个 limit：密码端点用 8 KiB，设置端点用 64 KiB，其余门序与
+// 语义完全相同（Requirement 6.1、10.1）。limit 只在这里装配，具体哪个体由调用点决定，
+// 本函数不猜端点。
+func (s *Server) adminWriteLimit(limit int64, next http.HandlerFunc) http.HandlerFunc {
+	return withNoStore(s.withJSONBodyLimit(limit, s.withSession(s.withCSRF(next))))
+}
+
+// withJSONBody 是写请求体的门：8 KiB 上限 + Content-Type 必须是 application/json。
+// 它保留无参形式是因为两条既有链都用 8 KiB：init/session 直接用它，password/logout
+// 走 adminWrite → adminWriteLimit(adminBodyLimit)；实现直接转给 withJSONBodyLimit，
+// 8 KiB 只是调用点传入的值，不再是写死在本函数里的常量。
 func (s *Server) withJSONBody(next http.HandlerFunc) http.HandlerFunc {
+	return s.withJSONBodyLimit(adminBodyLimit, next)
+}
+
+// withJSONBodyLimit 是参数化后的体门：先装 http.MaxBytesReader（limit），再要求
+// Content-Type 是 application/json（design「约束」、Requirement 6.6）。
+// 先装读取上限再判头：MaxBytesReader 只约束之后的读取，装在前面才能保证接下来的任何一次
+// 读（包括业务 handler 里的解析）都受 limit 约束。Content-Type 不符直接 40001，体一个字节都不读，
+// 这同时是挡住「表单型 CSRF」的兜底层。
+//
+// 超限错误只会在实际读取时浮现，所以文案不能写死在这里的常量上：由
+// rejectAdminBody 从 *http.MaxBytesError.Limit 取出真实上限再生成，8 KiB 与 64 KiB
+// 两条链各自报各自的数，调用点不必再抄一份上限。
+func (s *Server) withJSONBodyLimit(limit int64, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, adminBodyLimit)
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		if !isJSONMediaType(r.Header.Get("Content-Type")) {
 			// 文案固定、不回显提交值：Content-Type 完全由客户端控制，不回写进响应。
 			s.fail(w, http.StatusBadRequest, codeBadRequest, "请求体必须是 application/json")
@@ -255,17 +304,46 @@ func adminSessionFrom(ctx context.Context) (model.AdminSession, bool) {
 	return session, ok
 }
 
-// decodeAdminBody 解析管理端写请求体，成功返回 true；失败时已写好 40001 响应。
-// 体积上限由 withJSONBody 装的 MaxBytesReader 生效，但超限错误只在读取时浮现，
-// 所以只能在这里折成业务码（design 错误表把「非法 JSON / 超 8 KiB」都映射成 40001）。
+// decodeAdminBody 解析管理端写请求体（8 KiB 链，非严格模式），成功返回 true；
+// 失败时已写好 40001 响应。体积上限由体门装的 MaxBytesReader 生效，
+// 但超限错误只在读取时浮现，所以只能在这里折成业务码
+// （design 错误表把「非法 JSON / 体超限」都映射成 40001）。
 // 只允许一个 JSON 值：`{}` 后跟另一个对象或任意垃圾都按非法处理，避免「前半段合法」的
 // 请求被接受；尾随空白仍是合法的 JSON 文档，按 EOF 处理。
-// 边界：恰好 8 KiB 的体不会触发 MaxBytesError。MaxBytesReader 内部会多读一个字节来判定是否
+// 边界：恰好用满上限的体不会触发 MaxBytesError。MaxBytesReader 内部会多读一个字节来判定是否
 // 超限；恰好用满上限时这次探测得到 EOF（不会把多余字节交给调用方），超限时返回 *MaxBytesError，
 // 所以「正好用满上限」与「超限」本就不会混淆，
 // 不需要也不该再按 Content-Length 特判——那样只会留下一条分块传输时判错、平时从不执行的死分支。
 func (s *Server) decodeAdminBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	return s.decodeAdminJSON(w, r, dst, false)
+}
+
+// decodeAdminBodyStrict 是设置端点的严格解码：除 decodeAdminBody 的全部检查之外，
+// 还打开 DisallowUnknownFields（D10）。拼错的键名（`cron_express`）若被静默忽略，
+// 管理员会以为保存成功而设置根本没变，这是最难排的一类故障（Requirement 6.2）。
+//
+// 只给 PUT /api/admin/settings 用，不替换 decodeAdminBody：严格模式会拒绝既有密码端点
+// 请求体里将来可能多出来的字段，那是另一份已定的契约，不在本项改动范围内。
+// 上限由体门（adminSettingsBodyLimit 装的 MaxBytesReader）决定，超限文案因此报 64 KiB 而不是 8 KiB。
+//
+// 未定义字段的字段名是从错误文案里切出来的：encoding/json 不为这类错误提供具体类型，
+// 只能依赖标准库「json: unknown field 」这个前缀（见 unknownJSONField）。前缀变了最坏
+// 退化成通用「请求体不是合法 JSON」文案，业务码仍是 40001，不会升成 500。
+// 嵌套对象里的未定义字段只报字段名、没有父级路径（标准库错误本身不带路径），所以
+// `{"building_whitelist":[{"name":"x","foo":1}]}` 的文案只说「包含未定义的字段 foo」，
+// 不指出它在 building_whitelist 里。这是已知取舍：补齐路径要自己重写解析，不值得。
+func (s *Server) decodeAdminBodyStrict(w http.ResponseWriter, r *http.Request, dst any) bool {
+	return s.decodeAdminJSON(w, r, dst, true)
+}
+
+// decodeAdminJSON 是两个解码入口的共同实现：解析一个 JSON 值、拒绝尾随内容，
+// 失败一律折成 40001。读取上限由体门的 MaxBytesReader 装好，本函数不接收 limit：
+// 超限文案由 rejectAdminBody 从错误本身取上限，调用点因此没有第二份上限可抄。
+func (s *Server) decodeAdminJSON(w http.ResponseWriter, r *http.Request, dst any, strict bool) bool {
 	dec := json.NewDecoder(r.Body)
+	if strict {
+		dec.DisallowUnknownFields()
+	}
 	if err := dec.Decode(dst); err != nil {
 		s.rejectAdminBody(w, err)
 		return false
@@ -279,19 +357,79 @@ func (s *Server) decodeAdminBody(w http.ResponseWriter, r *http.Request, dst any
 	return true
 }
 
-// rejectAdminBody 把请求体问题折成 40001：超 8 KiB 与非法 JSON 用不同文案便于前端提示，
-// 但都不含提交内容（可能是密码），也不含解析器原文（可能回显输入片段）。
+// rejectAdminBody 把请求体问题折成 40001：超限、未定义字段与非法 JSON 用不同文案便于
+// 前端提示，但都不含提交内容（可能是密码），也不含解析器原文（可能回显输入片段）。
+//
+// 未定义字段先按 Go 字面量还原（strconv.Unquote）再拼文案：标准库用 %q 包装键名，
+// 只裁首尾引号会把 JSON 转义留下的反斜杠一起回显（键名 cron_"express 会显示成 cron_\"express）；
+// Unquote 一次完成「去外层引号」与「还原转义」两件事，键名内部本就有引号时也照实回显。
+// 还原失败（理论上不可达：%q 的输出总能被 Unquote 解析）回退到原串，业务码仍是 40001。
+//
+// 超限文案里的数字来自 *http.MaxBytesError.Limit，也就是装进 MaxBytesReader 的那个值：
+// 8 KiB 链与 64 KiB 链各自报自己的上限，管理员才知道该删多少，且文案不会与真实门限漂移。
 func (s *Server) rejectAdminBody(w http.ResponseWriter, err error) {
-	if isMaxBytesError(err) {
-		s.fail(w, http.StatusBadRequest, codeBadRequest, "请求体超过 8 KiB")
+	if limit, ok := maxBytesLimit(err); ok {
+		s.fail(w, http.StatusBadRequest, codeBadRequest, bodyLimitMessage(limit))
+		return
+	}
+	if field, ok := unknownJSONField(err); ok {
+		// 只回字段名，不回提交值：字段名是请求结构里的键，不会是密码内容。
+		s.fail(w, http.StatusBadRequest, codeBadRequest, "请求体包含未定义的字段 "+unquoteJSONField(field))
 		return
 	}
 	s.fail(w, http.StatusBadRequest, codeBadRequest, "请求体不是合法 JSON")
 }
 
-// isMaxBytesError 判定读取是否撞上 http.MaxBytesReader 的上限。
-// 用 errors.As 而不是比较文案：上限错误带 Limit 字段，文案随 Go 版本可能变。
-func isMaxBytesError(err error) bool {
+// bodyLimitMessage 生成请求体超限的固定文案。
+//
+// 两条管理链的上限都是 KiB 整数（8 KiB、64 KiB），整 KiB 时按 KiB 报数最易读；
+// 但这里不假设 limit 一定是整 KiB：整数除法会把 1025 报成「1 KiB」这种错数，
+// 所以非整 KiB 的 limit 直接按字节报出，文案里的数字始终等于实际门限。
+func bodyLimitMessage(limit int64) string {
+	if limit >= 1<<10 && limit%(1<<10) == 0 {
+		return fmt.Sprintf("请求体超过 %d KiB", limit/(1<<10))
+	}
+	return fmt.Sprintf("请求体超过 %d 字节", limit)
+}
+
+// unknownJSONField 从 encoding/json 的「未定义字段」错误里取出字段名。
+//
+// 标准库没有为这类错误提供具体类型（Decode 返回的是 fmt.Errorf("json: unknown field %q", …)），
+// 要拿到字段名只能按固定的前缀切；前缀来自标准库的错误文案，Go 大版本升级时可能变，
+// 变了也只会退化成「请求体不是合法 JSON」，业务码仍是 40001，不会变成 500。
+// 返回值保留标准库 %q 包上的英文双引号与转义，由调用方（unquoteJSONField）还原。
+func unknownJSONField(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	const prefix = "json: unknown field "
+	message := err.Error()
+	if !strings.HasPrefix(message, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(message, prefix), true
+}
+
+// unquoteJSONField 把标准库 %q 包出来的键名还原成原始字符（去外层引号并还原 \" 等转义）。
+//
+// 只做字面量还原，不做其它清洗：键名来自请求，对外的 JSON 编码由 writeJSON 负责，
+// 多做的任何替换都只会让「提示里的键名」与「请求里的键名」对不上。
+// 还原失败回退原串：宁可带一对引号，也不把键名吞成空串。
+func unquoteJSONField(field string) string {
+	unquoted, err := strconv.Unquote(field)
+	if err != nil {
+		return field
+	}
+	return unquoted
+}
+
+// maxBytesLimit 取出读取撞上的上限值：用 errors.As 取 *http.MaxBytesError 的 Limit 字段，
+// 而不是比较文案（文案随 Go 版本可能变），也不再由调用点手工传一份上限。
+// 这样「体门实际装的 limit」只有一处来源：MaxBytesReader 报出来的那个数。
+func maxBytesLimit(err error) (int64, bool) {
 	var maxErr *http.MaxBytesError
-	return errors.As(err, &maxErr)
+	if !errors.As(err, &maxErr) {
+		return 0, false
+	}
+	return maxErr.Limit, true
 }

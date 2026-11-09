@@ -15,7 +15,7 @@
 
 - [ ] 3. settings.Validate 纯校验
   - 白名单：trim 后编号非空且唯一、展示名非空、≤200 条；`[]` 合法；`Whitelist` 为 nil 时不校验
-  - `cron_expr` 交给 `cronexpr.Parse`；`ocr_base_url` 与 `feishu_webhook` 非空时必须是 http/https 绝对地址（`feishu_webhook` 在加封之前按明文校验）；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文 ≤4096 字节（`jw_username` 按 `TrimSpace` 后计；白名单走条数与字段规则、cron 走语法，不套这个上界）
+  - `cron_expr` 交给 `cronexpr.Parse`；`ocr_base_url` 与 `feishu_webhook` 非空时必须是 http/https 绝对地址（`feishu_webhook` 在加封之前按明文校验）；五项文本项 `jw_username`/`jw_password`/`ocr_base_url`/`feishu_webhook`/`feishu_sign_secret` 的明文 ≤4096 字节（`jw_username` 按 `TrimSpace` 后计；白名单两个字段逐字段套 4096、整个数组不套；cron 走语法，不套这个上界）
   - 反向用例钉住上界的作用范围：≤200 条白名单序列化后超过 4096 字节仍合法；4097 字节的合法 URL 形状 `feishu_webhook` 仍被拒（拒绝来自字节上界而非 URL 形状）
   - `ocr_base_url` 带前后空白的口径：trim 后恰好 4096 字节通过、trim 后 4097 字节拒绝（前后空白不计入这 4096，形状校验也判 trim 后的值）
   - `FieldError{Field,Message}` 用 `%w` 包裹 `model.ErrSettingInvalid`，消息点名字段（handler 直接透出成 `42201`）
@@ -55,8 +55,10 @@
 - [ ] 9. api 设置端点与中间件
   - 中间件：`adminRead`（no-store → 会话）、`adminWriteLimit`（no-store → 体门(limit) → 会话 → CSRF）、`withJSONBodyLimit`（既有 `withJSONBody` 改调它并保持 8 KiB）、`decodeAdminBodyStrict`
   - `GET /api/admin/settings`：`settings.Load` → `cronexpr.Parse` 算 `cron_next_at`（UTC RFC3339，算不出为 null）→ 8 个键的 `data`
-  - `PUT /api/admin/settings`：strict 解码（未知字段 `40001`）→ 64 KiB 体上限 → `settings.Patch` → `reloadCron(snapshot.CronExpr)`（失败只记 ERROR）→ 返回与 GET 同形状的最新快照（含 `cron_next_at`）
+  - `PUT /api/admin/settings`：64 KiB 体门（中间件）→ strict 解码（未知字段 `40001`）→ `settings.Patch` → `reloadCron(snapshot.CronExpr)`（仅提交了 `cron_expr` 时；失败只记 ERROR）→ 返回与 GET 同形状的最新快照（含 `cron_next_at`）
   - 契约测试：键集合、`*_set`、哨兵秘密不回显、40001/42201/50000、`no-store`、缺会话/缺 CSRF、64 KiB 边界（恰好通过、+1 拒绝）
+  - 并发用例：两个带不同 `cron_expr` 的 PUT 同时打（重复 32 轮），断言都 `200`、各重排一次、最后一次重排等于库里的 `cron_expr`（`settingsMu` 串行化，CP19）；空补丁回读失败的日志文案另有一例用非哨兵错误，锁住「按补丁形状分派、不看错误类别」
+  - 门禁：`cd backend && go test -race -count=1 ./internal/api ./internal/settings` **必跑**（`settingsMu` 串行化与并发用例只有带竞态检测器才完整；仓库根 `task gate` 已含 `backend:test-race`），连同 `go build ./...`、`go vet ./...`、`go test -count=1 ./...`、`golangci-lint run` 全部 0 退出
 
 - [ ] 10. api 轮次读取端点
   - `GET /api/admin/runs`：`limit` 1–100 默认 20、`offset ≥ 0`，越界 `40001`；`{runs,total,limit,offset}`
@@ -72,6 +74,6 @@
 
 - [ ] 12. 装配、依赖规则与端到端检查点
   - `main.go` 装配 `settings.New(store.NewSettingsRepo(pool), keys, nil)`、`store.NewRunStatusRepo(pool)`、`runner.New`（`Converge` 用 `pipeline.ConvergeStaleRuns` 包装）、`scheduler.New` 并 `go Run(ctx)`、三个 `api.With*`；装配层加 `var _ settings.Store = store.SettingsRepo{}`
-  - depguard 补 `settings`/`cronexpr`/`scheduler`/`runner` 四条规则，`api` allow 补 `settings`/`runner`/`cronexpr`；启动日志新增 `collector_wired`、`settings_cron`，`Collector==nil` 时记一条 WARN
+  - depguard 补 `settings`/`cronexpr`/`scheduler`/`runner` 四条规则，`api` allow 补 `settings`/`runner`/`cronexpr`；启动日志新增 `collector_wired`、`settings_cron`，`Collector==nil` 时记一条 WARN（task 9 已提前给 `api` allow 放行 `settings`/`cronexpr`；**本条仍欠四条规则 + `api` allow 的 `runner`**，lint 绿不等于依赖规则已补完）
   - 端到端（真实库 + 假 Collector）：init → login → GET 默认设置 → PUT（白名单 + cron + 三个秘密）→ GET（`*_set`、无明文、`cron_next_at`）→ 空白名单 sync 得 blocked → 配名单后 sync 得 running → 再 sync 得 409 → runs 列表与详情 → 非法 cron 42201 且设置不变 → 库里密文以 `v1:` 开头
-  - 日志脱敏（哨兵不出现在日志/响应）、四条门禁全绿（`go build`/`go vet`/`go test`/`golangci-lint`）、`go.mod` 无变化；有疑问询问用户
+  - 日志脱敏（哨兵不出现在日志/响应）、门禁与任务 9 同口径（`go build ./...`、`go vet ./...`、`golangci-lint run`、`go test -count=1 ./...`、`go test -race -count=1 ./internal/api ./internal/settings` 全部 0 退出）、`go.mod` 无变化；有疑问询问用户
