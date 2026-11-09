@@ -165,6 +165,84 @@ func TestParseStringReturnsOriginal(t *testing.T) {
 	}
 }
 
+// TestResolveStartup 覆盖启动期回落规则的三种结局：合法值原样、非法值回落默认值、
+// 空串按缺失回落默认值。回落规则只有这一份实现，装配层与调度器都调它，所以「返回的
+// 生效值能不能直接进日志」「缺失算不算非法」这两条口径都在这一层钉住。
+//
+// 缺失与非法各由一个标记表达：Missing 只描述「来源没给出值」，Invalid 只描述「值被拒」。
+// 调用方按标记选日志级别，不用再拿 Raw 反推缺失；「是否回落」等价于 Expr != Raw，
+// 不另存一份字段。
+func TestResolveStartup(t *testing.T) {
+	cases := []struct {
+		name        string
+		raw         string
+		wantExpr    string
+		wantMissing bool
+		wantInvalid bool
+	}{
+		{
+			name:     "合法值原样返回",
+			raw:      "30 3 * * 1",
+			wantExpr: "30 3 * * 1",
+		},
+		{
+			name:     "默认值本身也原样返回",
+			raw:      model.DefaultCronExpr,
+			wantExpr: model.DefaultCronExpr,
+		},
+		{
+			name:        "非法值回落默认值并记原因",
+			raw:         "0 10 4 * * 6",
+			wantExpr:    model.DefaultCronExpr,
+			wantInvalid: true,
+		},
+		{
+			name:        "空串按缺失回落默认值，不判非法",
+			raw:         "",
+			wantExpr:    model.DefaultCronExpr,
+			wantMissing: true,
+		},
+		{
+			name:        "纯空白同样按缺失处理",
+			raw:         "   ",
+			wantExpr:    model.DefaultCronExpr,
+			wantMissing: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			startup := ResolveStartup(tc.raw)
+
+			if startup.Raw != tc.raw {
+				t.Fatalf("Raw = %q，期望原样保留 %q", startup.Raw, tc.raw)
+			}
+			if startup.Expr != tc.wantExpr {
+				t.Fatalf("Expr = %q，期望 %q", startup.Expr, tc.wantExpr)
+			}
+			if startup.Missing != tc.wantMissing {
+				t.Fatalf("Missing = %v，期望 %v", startup.Missing, tc.wantMissing)
+			}
+			if gotInvalid := startup.Invalid != nil; gotInvalid != tc.wantInvalid {
+				t.Fatalf("Invalid = %v，期望是否有错 %v", startup.Invalid, tc.wantInvalid)
+			}
+			if tc.wantInvalid && !errors.Is(startup.Invalid, ErrInvalid) {
+				t.Fatalf("Invalid 期望包装 ErrInvalid，实际 %v", startup.Invalid)
+			}
+			// 缺失与非法是互斥的两类：一个启动值不可能既「没有」又「被拒」。
+			if startup.Missing && startup.Invalid != nil {
+				t.Fatalf("缺失与非法同时成立：Missing=%v Invalid=%v", startup.Missing, startup.Invalid)
+			}
+
+			// 回落值本身必须能解析：默认值被改坏是代码问题，这一层不负责兜底，
+			// 但至少要保证正常路径下调用方拿到的是可以直接装计划的表达式。
+			if _, err := Parse(startup.Expr); err != nil {
+				t.Fatalf("生效值 %q 无法解析: %v", startup.Expr, err)
+			}
+		})
+	}
+}
+
 // TestMatches 覆盖位图匹配的各个字段、业务时区换算、秒被忽略，以及日/周的 OR 口径。
 func TestMatches(t *testing.T) {
 	cases := []struct {

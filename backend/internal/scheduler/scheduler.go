@@ -14,7 +14,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +36,29 @@ type Trigger func(ctx context.Context) error
 // 让「调度」依赖一条额外的 SQL，且读到的值可能和 Reload 交错，计划就说不清是哪一份。
 type ExprSource interface {
 	CronExpr(ctx context.Context) (string, error)
+}
+
+// ResolveStartupCron 读表达式来源，并把原样值交给 cronexpr.ResolveStartup 做回落。
+//
+// 第二个返回值只表示「来源读失败」：值非法或缺失都不是错误，它们已经按回落口径
+// 处理成 model.DefaultCronExpr，由调用方按 Startup.Invalid / Startup.Missing 决定
+// 记什么日志。读失败时回落出的 Startup 原值也是空的，Missing 同样为 true，所以调用方
+// 要先判 err 再读 Missing——两种结局的日志级别不同。错误原样交回而不是在这里记掉，
+// 因为装配层只记固定类别（不带 err 原文），调度器要记底层原因（Requirement 9.5 / 9.6）。
+//
+// 装配层用它算启动日志里的 settings_cron，调度器用它装启动计划：读取与回落只有
+// 这一份实现，两处走同一套回落规则。规则同源不等于值一定相同——这是两次独立的读库，
+// 调度器在 Run 里还会再读一次，两次之间保存了新表达式、读库瞬时失败或多副本并发写
+// 都会让日志字段与生效计划不同；进程当前的真实计划以 scheduler_started 那条日志为准。
+func ResolveStartupCron(ctx context.Context, src ExprSource) (cronexpr.Startup, error) {
+	raw, err := src.CronExpr(ctx)
+	if err != nil {
+		// 读失败也按回落值处理，但错误要交回调用方：启动日志只记类别、调度器记
+		// 底层原因，两条记录都靠这个错误。
+		return cronexpr.ResolveStartup(""), err
+	}
+
+	return cronexpr.ResolveStartup(raw), nil
 }
 
 // triggerTimeout 是一次触发的上限。触发器只做「建轮并放后台」，30 秒足够走完收敛、
@@ -248,11 +270,13 @@ func (s *Scheduler) Next() (time.Time, bool) {
 	return s.next, s.hasNext
 }
 
-// loadInitial 读启动期的表达式。来源错误与缺行都回落 DefaultCronExpr 并继续跑：
-// 设置读不出来不应该让整个进程起不来（Requirement 9.5 / 9.6）。
+// loadInitial 读启动期的表达式。读失败、缺行与非法值都回落 DefaultCronExpr 并继续跑：
+// 设置读不出来不应该让整个进程起不来（Requirement 9.5 / 9.6）。选值与回落交给
+// ResolveStartupCron（内部调 cronexpr.ResolveStartup），装配层的启动日志用的是同一份。
 //
-// 「缺行」由 settings.Service 在快照层就填成默认值；这里再判一次空串，是给别的
-// ExprSource 实现（例如测试替身或将来的配置来源）兜底，口径不靠调用方自觉。
+// 这里只管「读到了什么、该记哪条日志」：读失败记 ERROR 并带底层原因；缺失记 INFO；
+// 非法值留给 applyStartup 记 ERROR，因为那条日志要点名原值与回落值。缺失与否看
+// startup.Missing，不用 Raw 再判一次空白——分类只在 cronexpr.ResolveStartup 做一次。
 func (s *Scheduler) loadInitial(ctx context.Context) {
 	// 读库之前先记下 Reload 代数：这次读库可能耗时（一次 SQL 往返），期间管理员保存
 	// 设置触发的 Reload 是更新的意图，装计划前要用代数把它识别出来（minor 2）。
@@ -262,61 +286,54 @@ func (s *Scheduler) loadInitial(ctx context.Context) {
 		s.log.Warn("scheduler 未配置表达式来源，使用默认表达式",
 			slog.String("default", model.DefaultCronExpr),
 		)
-		s.applyStartup(model.DefaultCronExpr, gen)
+		s.applyStartup(cronexpr.ResolveStartup(""), gen)
 		return
 	}
 
-	expr, err := s.source.CronExpr(ctx)
-	if err != nil {
+	startup, err := ResolveStartupCron(ctx, s.source)
+	switch {
+	case err != nil:
 		s.log.Error("读取 cron 表达式失败，使用默认表达式",
 			slog.String("default", model.DefaultCronExpr),
 			slog.Any("err", err),
 		)
-		s.applyStartup(model.DefaultCronExpr, gen)
-		return
-	}
-
-	if strings.TrimSpace(expr) == "" {
+	case startup.Missing:
 		s.log.Info("cron 表达式缺失，使用默认表达式",
 			slog.String("default", model.DefaultCronExpr),
 		)
-		s.applyStartup(model.DefaultCronExpr, gen)
-		return
 	}
 
-	s.applyStartup(expr, gen)
+	s.applyStartup(startup, gen)
 }
 
-// applyStartup 把启动期表达式装进计划：非法时记一条 ERROR 并回落到 DefaultCronExpr
-// （Requirement 9.6）。回落值本身装不上只可能是代码被改坏，记 ERROR 后不装计划，
-// 让循环停在「等 Reload」而不是带着一个错误的计划继续跑。
+// applyStartup 把启动期的结论装进计划：原值非法时记一条 ERROR 并点名回落值
+// （Requirement 9.6）。回落值本身装不上只可能是 DefaultCronExpr 被改坏，记 ERROR
+// 后不装计划，让循环停在「等 Reload」而不是带着一个错误的计划继续跑。
 //
 // gen 是开始读库时记下的 Reload 代数：安装与代数比对在同一个锁里完成，读库期间到达
 // 的 Reload 更晚、更权威，启动期这份旧值不覆盖它（minor 2）。
-func (s *Scheduler) applyStartup(expr string, gen uint64) {
-	schedule, err := cronexpr.Parse(expr)
-	if err != nil {
+func (s *Scheduler) applyStartup(startup cronexpr.Startup, gen uint64) {
+	if startup.Invalid != nil {
 		s.log.Error("cron 表达式非法，回落到默认表达式",
-			slog.String("cron", expr),
+			slog.String("cron", startup.Raw),
+			slog.String("default", model.DefaultCronExpr),
+			slog.Any("err", startup.Invalid),
+		)
+	}
+
+	schedule, err := cronexpr.Parse(startup.Expr)
+	if err != nil {
+		s.log.Error("默认 cron 表达式无法解析，调度暂停",
 			slog.String("default", model.DefaultCronExpr),
 			slog.Any("err", err),
 		)
-
-		schedule, err = cronexpr.Parse(model.DefaultCronExpr)
-		if err != nil {
-			s.log.Error("默认 cron 表达式无法解析，调度暂停",
-				slog.String("default", model.DefaultCronExpr),
-				slog.Any("err", err),
-			)
-			if !s.installStartup(cronexpr.Schedule{}, "", gen) {
-				s.logStartupSuperseded()
-			}
-			return
+		if !s.installStartup(cronexpr.Schedule{}, "", gen) {
+			s.logStartupSuperseded()
 		}
-		expr = model.DefaultCronExpr
+		return
 	}
 
-	if !s.installStartup(schedule, expr, gen) {
+	if !s.installStartup(schedule, startup.Expr, gen) {
 		s.logStartupSuperseded()
 	}
 }

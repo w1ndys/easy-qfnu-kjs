@@ -1,7 +1,8 @@
 version: "2"
 
 # 后端质量门禁：standard 默认集 + 依赖方向（depguard）。
-# 依赖方向来自 specs/2026-10-27-classroom-availability-rewrite/design.md「依赖方向」。
+# 依赖方向来自 specs/2026-10-27-classroom-availability-rewrite/design.md 与
+# specs/2026-11-08-admin-settings-sync/design.md 的「依赖方向」。
 
 run:
   timeout: 5m
@@ -117,15 +118,54 @@ linters:
             - github.com/w1ndys/easy-qfnu-kjs/internal/model
             - github.com/w1ndys/easy-qfnu-kjs/internal/store
 
+        # 业务设置：快照、Patch 语义、校验、加封与单事务写。
+        # 不 import store：settings.Store 是消费侧接口，由装配层用 store.SettingsRepo
+        # 做结构匹配（装配层 var _ settings.Store = store.SettingsRepo{}），SQL 只留在 store。
+        settings:
+          files:
+            - "**/internal/settings/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/w1ndys/easy-qfnu-kjs/internal/secret
+            - github.com/w1ndys/easy-qfnu-kjs/internal/cronexpr
+
+        # 纯 cron 解析与求值：只放业务时区与解析，不碰 HTTP、SQL 或时钟。
+        cronexpr:
+          files:
+            - "**/internal/cronexpr/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+
+        # 进程内调度：表达式来源与触发器都是消费侧接口/函数，不 import runner，
+        # 也不 import settings —— 装配层把 settings.Service 与 runner.StartCron 传进来。
+        scheduler:
+          files:
+            - "**/internal/scheduler/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/w1ndys/easy-qfnu-kjs/internal/cronexpr
+
+        # 启动端口：采集执行器由接口注入，不 import upstream / pipeline。
+        # Converge 是函数，装配层用 pipeline.ConvergeStaleRuns 包装后传入（D8）。
+        runner:
+          files:
+            - "**/internal/runner/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/w1ndys/easy-qfnu-kjs/internal/store
+
         # HTTP 层：编排与查询都从这一层进，不直接访问上游。
         # auth 只被管理端中间件用来判定会话有效性与比对 CSRF，属于纯函数调用，没有反向依赖。
         # secret 只被管理端的 state/init 用来取指纹与一次性创建密钥，同样是纯能力调用。
         # settings 是业务设置的读写服务（GET/PUT /api/admin/settings），cronexpr 被设置端点
         # 直接用来算 cron_next_at；两者都只是调用，不存在反向依赖。
         # runner 只被 POST /api/admin/sync 消费：handler 拿 runner.StartResult 拼 202 的
-        # data、用 *runner.BusyError 拼 409 文案，不反向依赖 HTTP 层。runner 是本项 import
-        # 必要（与第 9 项 settings/cronexpr 同一性质）；第 12 项仍欠
-        # settings/cronexpr/scheduler/runner 四条 depguard 包规则。
+        # data、用 *runner.BusyError 拼 409 文案，不反向依赖 HTTP 层。
+        # 四个新包各自的「不许 import 谁」见上面的 settings/cronexpr/scheduler/runner 规则。
         api:
           files:
             - "**/internal/api/**"

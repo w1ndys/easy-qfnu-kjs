@@ -119,6 +119,43 @@ func Parse(expr string) (Schedule, error) {
 	return sched, nil
 }
 
+// Startup 是一次启动期表达式的求值结果。回落规则只有这一份实现（ResolveStartup）：
+// 装配层打启动日志、调度器装启动计划都调它，两边才不会各判一次，把「日志里的值」
+// 与「进程真正调度的值」写成两个答案。
+//
+// 空串与非法值是两种口径：空串表示「库里没有这一行」，属于正常状态，按缺失处理、
+// 不记错误（Requirement 9.5）；非法值表示存量被写坏，要记 ERROR（Requirement 9.6）。
+// 两者都回落 model.DefaultCronExpr，但由 Missing 与 Invalid 各自标记，调用方按标记
+// 选日志级别，不再拿 Raw 反推「这算不算缺失」——那样等于把分类规则抄到每个调用点。
+type Startup struct {
+	Raw     string // 来源给出的原样值，供日志点名
+	Expr    string // 生效表达式的原写法：合法值原样，其余是 model.DefaultCronExpr
+	Missing bool   // 来源没有给出值（空串或纯空白），属于正常状态而不是错误
+	Invalid error  // 原值被拒的原因；缺失与合法值都是 nil
+}
+
+// ResolveStartup 按回落规则算出启动期真正生效的表达式。
+//
+// 它不校验回落后的 Expr：model.DefaultCronExpr 被改坏是代码问题而不是管理员输入，
+// 由调用方 Parse(Expr) 时立刻失败并决定「暂停调度」。选值与解码分开，装配层才可能
+// 只为了打一条启动日志而复用同一份规则，而不是自己再写一遍 Parse + 回落。
+//
+// 三种结局只在这里分类一次：缺失（Missing）、非法（Invalid）、合法（两者皆无）。
+// 「是否回落到默认值」不再单独存一份字段，它等价于 Expr != Raw，存两份迟早写岔。
+func ResolveStartup(raw string) Startup {
+	// 空串与纯空白都按缺失处理：settings.Service 缺行时已经回 DefaultCronExpr，
+	// 这里再判一次是给别的 ExprSource 实现兜底，口径不靠调用方自觉。
+	if strings.TrimSpace(raw) == "" {
+		return Startup{Raw: raw, Expr: model.DefaultCronExpr, Missing: true}
+	}
+
+	if _, err := Parse(raw); err != nil {
+		return Startup{Raw: raw, Expr: model.DefaultCronExpr, Invalid: err}
+	}
+
+	return Startup{Raw: raw, Expr: raw}
+}
+
 // parseField 把一个字段解析成位图，并报告它是否恰为 `*`。
 // 列表里的每一项独立解析，位图取并集；空项（`1,,2`、`1,`、`,1`）直接拒绝。
 // 列表项也可以写 `*` 或 `*/n`（如 `1,*`），但整个字段不恰为 `*`，

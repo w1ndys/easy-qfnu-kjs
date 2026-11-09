@@ -75,6 +75,6 @@
 
 - [ ] 12. 装配、依赖规则与端到端检查点
   - `main.go` 装配 `settings.New(store.NewSettingsRepo(pool), keys, nil)`、`store.NewRunStatusRepo(pool)`、`runner.New`（`Converge` 用 `pipeline.ConvergeStaleRuns` 包装）、`scheduler.New` 并 `go Run(ctx)`、三个 `api.With*`；装配层加 `var _ settings.Store = store.SettingsRepo{}`
-  - depguard 补 `settings`/`cronexpr`/`scheduler`/`runner` 四条规则，`api` allow 补 `settings`/`runner`/`cronexpr`；启动日志新增 `collector_wired`、`settings_cron`，`Collector==nil` 时记一条 WARN（`api` allow 的 `runner` 已在第 11 项补齐、`settings`/`cronexpr` 已在第 9 项补齐；**仍欠 `settings`/`cronexpr`/`scheduler`/`runner` 四条 depguard 包规则**，lint 绿不等于依赖规则已补完）
-  - 端到端（真实库 + 假 Collector）：init → login → GET 默认设置 → PUT（白名单 + cron + 三个秘密）→ GET（`*_set`、无明文、`cron_next_at`）→ 空白名单 sync 得 blocked → 配名单后 sync 得 running → 再 sync 得 409 → runs 列表与详情 → 非法 cron 42201 且设置不变 → 库里密文以 `v1:` 开头
+  - depguard 补 `settings`/`cronexpr`/`scheduler`/`runner` 四条规则，`api` allow 补 `settings`/`runner`/`cronexpr`；启动日志新增 `collector_wired`、`settings_cron`，`Collector==nil` 时记一条 WARN（`api` allow 的 `runner` 已在第 11 项补齐、`settings`/`cronexpr` 已在第 9 项补齐；四条规则已在第 12 项补齐）
+  - 端到端（真实库 + 假 Collector）：init → login → GET 默认设置 → PUT（白名单 + cron + 三个秘密）→ GET（`*_set`、无明文、`cron_next_at`）→ 新调度器启动装载从库读到新表达式（周一 03:30）→ 空白名单 sync 得 blocked → 配名单后 sync 得 running → 再 sync 得 409 → runs 列表与详情 → 非法 cron 42201 且设置不变 → 库里密文以 `v1:` 开头
   - 日志脱敏（哨兵不出现在日志/响应）、门禁与任务 9 同口径（`go build ./...`、`go vet ./...`、`golangci-lint run`、`go test -count=1 ./...`、`go test -race -count=1 ./internal/api ./internal/settings` 全部 0 退出）、`go.mod` 无变化；有疑问询问用户

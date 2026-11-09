@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,7 +24,10 @@ import (
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/pipeline"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/query"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/runner"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/scheduler"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/secret"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/settings"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/stats"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
 )
@@ -32,6 +36,11 @@ import (
 // 实现留在 internal/store（store 不反向 import auth）。断言放在装配层，
 // 两边方法集一旦漂移就在编译期失败，而不是等到某个端点运行期才发现取不到数据。
 var _ auth.AdminStore = store.AdminRepo{}
+
+// 业务设置仓储同理：settings.Store 是消费侧接口，store.SettingsRepo 用同名方法
+// 结构匹配，store 不 import settings（依赖方向见 backend/.golangci.yml）。这条断言
+// 与上面的 auth.AdminStore 并列，把「settings 服务能不能直接用这个仓储」钉在编译期。
+var _ settings.Store = store.SettingsRepo{}
 
 // main 只把 run 的返回值转成退出码：0 正常，1 非正常终止。
 func main() {
@@ -112,6 +121,71 @@ func run() int {
 		log.Info("已收敛过期轮次", "run_ids", staleRunIDs)
 	}
 
+	// 业务设置的装配顺序（design「Components and Interfaces」）：仓储 → 服务。
+	// 服务层持有仓储、密钥与时钟；这里 clock 传 nil，生产用 time.Now。keys 可能尚未
+	// 装载（首次部署），服务层把「密钥不可用」当成保存秘密的失败，读取与清除秘密不受
+	// 影响（Requirement 3.6、10.6）。密钥的生成仍只发生在 POST /api/admin/init。
+	settingsSvc := settings.New(store.NewSettingsRepo(pool), keys, nil)
+
+	// 运行状态的读侧与 blocked 建轮共用同一个仓储：列表、详情、冲突判定与阻止轮次
+	// 都读同一张 collect_run，不另建第二份查询实现。
+	runStatusRepo := store.NewRunStatusRepo(pool)
+
+	// 采集执行器属于 collect-runner spec，本 spec 只交付启动端口（D6）。Collect 保持
+	// nil 是明确的可观察过渡态：白名单非空的手动同步与定时触发返回 50000 且零建轮
+	// （CP16），启动日志另记一条 WARN，运维能从启动信息直接看出这条链还没接上。
+	var collector runner.Collector
+	collectorWired := collector != nil
+
+	// Converge 注入 pipeline.ConvergeStaleRuns，而不是在 runner 里重算 cutoff：
+	// 「2 小时」与 started_at < 的边界只允许有一份实现（D8）。now 由 runner 传入，
+	// 这里只把它转成 pipeline.Clock，不取自己的时钟——否则两者会各算一个时刻。
+	converge := func(ctx context.Context, now time.Time) ([]int64, error) {
+		return pipeline.ConvergeStaleRuns(ctx, store.NewCollectRunRepo(pool), func() time.Time { return now })
+	}
+	syncSvc, err := runner.New(runner.Deps{
+		Runs:     runStatusRepo,
+		Settings: settingsSvc,
+		Collect:  collector,
+		Converge: converge,
+		Log:      log,
+	})
+	// 四个必填依赖都是本函数里刚建好的具体值，缺失只可能是代码被改坏；与 upstream.New
+	// 的启动期校验同口径，直接拒绝启动，不把问题拖到第一次手动同步。
+	if err != nil {
+		log.Error("启动失败", "err", err)
+		return 1
+	}
+
+	// 进程内调度：触发器接 runner.StartCron（busy 只记 INFO），表达式来源接
+	// settings.Service（缺行回落 DefaultCronExpr）。clock/wait 传 nil，生产用真实
+	// 时钟与 time.After；保存设置后的重排由 api.WithAdminSettings 第二参数接 sched.Reload。
+	sched := scheduler.New(log, syncSvc.StartCron, settingsSvc, nil, nil)
+
+	// 启动日志里的 cron 打的是**生效值**，不是库里的原样值：存量表达式非法（0005 之前的
+	// 6 段写法、被手工改坏）时，调度器的启动装载会回落 DefaultCronExpr 并记 ERROR
+	// （Requirement 9.6），进程实际按默认值调度；日志要是照抄库值，就会编一个读得到却
+	// 不会生效的表达式。表达式本身不是秘密，但「只打表达式、不打任何设置值」这条口径
+	// （design「Components and Interfaces」）不变——设置值里可能有凭据。
+	//
+	// 回落规则不在这里另写一份：scheduler.ResolveStartupCron 与调度器的启动装载调的是
+	// 同一个 cronexpr.ResolveStartup，两处走同一套回落规则（缺失、非法都回落默认值）。
+	// 这只是「规则同源」，不等于「值一定相同」：这里是独立的一次读库，调度器在 Run 里
+	// 还会再读一次，两次之间管理员保存了新表达式、这次读库瞬时失败或多副本并发写，都会
+	// 让 settings_cron 与进程真正装载的计划不同。这个字段是装配层启动时按同一套规则解出的
+	// 快照；库里的原样值不进任何启动日志（非法/缺失时它与回落值相同），进程当前生效的
+	// 计划以 scheduler_started 为准。
+	// 读库限时 5 秒：与上面的启动查询同一口径，库卡住时不能让启动无限等。
+	cronCtx, cancelCron := context.WithTimeout(ctx, 5*time.Second)
+	startupCron, cronErr := scheduler.ResolveStartupCron(cronCtx, settingsSvc)
+	cancelCron()
+	if cronErr != nil {
+		// 读失败只记固定类别、不打 err 原文：启动日志没有理由把 SQL 或连接串片段带出去
+		// （与上面 admin_query_failed 同一口径）。细节由调度器启动装载那条 ERROR 负责。
+		log.Warn("settings_cron_read_failed", "default", model.DefaultCronExpr)
+	}
+	settingsCron := startupCron.Expr
+
 	// 启动日志只打非敏感项：连接串拆成主机与库名，密码与查询参数不出现；
 	// 密钥只打路径（运维要确认挂载点），密钥内容与指纹都不进启动日志。
 	dsn, _ := url.Parse(cfg.DatabaseURL)
@@ -129,8 +203,29 @@ func run() int {
 		"trust_proxy_headers", cfg.TrustProxyHeaders,
 		"secret_key_path", keys.Path(),
 		"admin_cookie_secure", cfg.AdminCookieSecure,
+		"collector_wired", collectorWired,
+		"settings_cron", settingsCron,
 		"version", version,
 	)
+	// 采集启动器未装配是本 spec 的过渡态，不是故障：白名单为空的手动同步仍会建
+	// blocked 轮次，数据面照常。但它必须能从启动日志一眼看出来，否则管理员点了
+	// 「立即同步」只会拿到 50000，运维还得去翻代码才知道这一版根本没接执行链（D6）。
+	if !collectorWired {
+		log.Warn("采集启动器未装配，白名单非空的手动同步与定时触发不会建立采集轮次")
+	}
+
+	// 调度协程随信号 ctx 退出：进程收到终止信号后不再发起新的轮次（Requirement 9.7）。
+	// 启动放在日志之后，让「服务启动」那条带 collector_wired / settings_cron 的日志
+	// 先落盘；调度器自己会在装载完成后另记一条 scheduler_started。
+	//
+	// 用 WaitGroup 接管协程的退出：收尾时 join 它，正在跑的触发不会和 server.Shutdown、
+	// 连接池关闭交错（触发自己的 ctx 也派生自这个信号 ctx，取消后不会等满 30 秒）。
+	var schedWG sync.WaitGroup
+	schedWG.Add(1)
+	go func() {
+		defer schedWG.Done()
+		sched.Run(ctx)
+	}()
 
 	// 查询服务只拿两项能力：按日期查学期周与按条件查空教室；连接池被闭包挡在里面。
 	weekLookup := func(ctx context.Context, date time.Time) (model.TermWeek, bool, error) {
@@ -351,6 +446,12 @@ func run() int {
 			api.WithStats(statsRecorder),
 			api.WithAdmin(adminRepo, keys),
 			api.WithAdminCookieSecure(cfg.AdminCookieSecure),
+			// 业务设置：svc 负责读写与加封，reloadCron 接调度器的重排入口（保存 cron 后
+			// 立即生效，无需重启）。RunStatus 与 Sync 分别接轮次只读视图与启动端口；
+			// 三件依赖缺一，对应端点按 50000 返回，不以 404 掩盖装配缺失（Requirement 10.7）。
+			api.WithAdminSettings(settingsSvc, sched.Reload),
+			api.WithRunStatus(runStatusRepo),
+			api.WithSync(syncSvc),
 		).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -366,6 +467,11 @@ func run() int {
 	// 收到终止信号不等同步任务，只给在途只读请求 5 秒收尾，超时直接断开；
 	// 之后还要等统计后台把最后一批写完才返回。
 	log.Info("收到终止信号，开始收尾")
+
+	// 先等调度协程退出：它派生自同一个信号 ctx，取消后正在跑的触发会立刻返回。
+	// 等它返回再关 HTTP 与连接池，收尾期间就不会再有调度侧在建轮或占用连接。
+	schedWG.Wait()
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {

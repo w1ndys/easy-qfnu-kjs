@@ -458,6 +458,74 @@ func TestReloadRejectsInvalidAndKeepsPlan(t *testing.T) {
 	}
 }
 
+// TestResolveStartupCron 覆盖启动期读取的四个结局：合法值原样、非法值回落默认值、
+// 来源给出空串（缺失）回落默认值、读失败回落默认值并把错误交回。启动日志（装配层）
+// 与启动装载（loadInitial）都走这一个函数，所以「值非法」「缺失」与「读失败」必须能
+// 从返回值上分开——前两者由 Missing / Invalid 标记、后者由 error 标记，三条日志的
+// 级别与字段不同（Requirement 9.5 / 9.6）。
+//
+// 读失败时回落出的原值也是空的，所以 Missing 同样为 true；两种结局的区别只在 error，
+// 调用方必须先判 err（loadInitial 的 switch 就是这个顺序）。
+func TestResolveStartupCron(t *testing.T) {
+	readFailure := errors.New("读设置失败")
+
+	cases := []struct {
+		name        string
+		src         *fakeExprSource
+		wantExpr    string
+		wantMissing bool
+		wantInvalid bool
+		wantErr     error
+	}{
+		{
+			name:     "合法值原样",
+			src:      &fakeExprSource{expr: "30 3 * * 1"},
+			wantExpr: "30 3 * * 1",
+		},
+		{
+			name:        "非法值回落默认值并标记",
+			src:         &fakeExprSource{expr: "0 10 4 * * 6"},
+			wantExpr:    model.DefaultCronExpr,
+			wantInvalid: true,
+		},
+		{
+			name:        "来源给出空串按缺失标记",
+			src:         &fakeExprSource{expr: ""},
+			wantExpr:    model.DefaultCronExpr,
+			wantMissing: true,
+		},
+		{
+			name:        "读失败回落默认值并交回错误",
+			src:         &fakeExprSource{err: readFailure},
+			wantExpr:    model.DefaultCronExpr,
+			wantMissing: true,
+			wantErr:     readFailure,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			startup, err := ResolveStartupCron(t.Context(), tc.src)
+
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("错误 = %v，期望 %v", err, tc.wantErr)
+			}
+			if startup.Expr != tc.wantExpr {
+				t.Fatalf("生效值 = %q，期望 %q", startup.Expr, tc.wantExpr)
+			}
+			if startup.Missing != tc.wantMissing {
+				t.Fatalf("Missing = %v，期望 %v", startup.Missing, tc.wantMissing)
+			}
+			if gotInvalid := startup.Invalid != nil; gotInvalid != tc.wantInvalid {
+				t.Fatalf("Invalid = %v，期望是否有错 %v", startup.Invalid, tc.wantInvalid)
+			}
+			if got := tc.src.calls; got != 1 {
+				t.Fatalf("表达式来源期望被读 1 次，实际 %d", got)
+			}
+		})
+	}
+}
+
 // TestRunFallsBackToDefaultWhenStoredExprInvalid 覆盖启动期存量表达式非法：记一条
 // ERROR 后回到 DefaultCronExpr，循环照常按 10 分钟等待（Requirement 9.6）。
 func TestRunFallsBackToDefaultWhenStoredExprInvalid(t *testing.T) {
@@ -509,6 +577,11 @@ func TestRunFallsBackToDefaultWhenExprMissing(t *testing.T) {
 
 	if req := wait.next(t); req.duration != 10*time.Minute {
 		t.Fatalf("缺失回落后等待 %v，期望 10m", req.duration)
+	}
+	// 缺失走 INFO：文案与级别都钉在这里。分类依据是 Startup.Missing，loadInitial
+	// 不再拿 Raw 反推空白——「缺失」这个分类只在 cronexpr.ResolveStartup 定义一次。
+	if logs := buf.String(); !strings.Contains(logs, "cron 表达式缺失") {
+		t.Fatalf("缺失应记 INFO 说明回落到默认值，实际日志: %s", logs)
 	}
 	if logs := buf.String(); strings.Contains(logs, `"level":"ERROR"`) {
 		t.Fatalf("缺失不应记 ERROR，实际日志: %s", logs)
