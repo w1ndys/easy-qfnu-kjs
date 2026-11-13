@@ -55,6 +55,21 @@ var ErrRunStoreFailed = errors.New("采集轮次读写失败")
 // 旧轮次的学期；按约定这里不重试，由调用方在下一轮重新尝试。
 var ErrRunConflict = errors.New("采集轮次冲突")
 
+// ErrTermStoreFailed 只表示学期日历（term / term_week）的基础设施失败：
+// 开事务、读取已有锚点、事务内 Exec、提交失败。
+// 与两个「不是库故障」的错误分开：ErrTermInvalid 是入参非法（重试不会变好），
+// store.ErrTermAnchorConflict 是「已存日历的锚点与新算值不一致」，
+// 重试同样不会变好，只能保留原日历并结束本轮。
+var ErrTermStoreFailed = errors.New("学期日历读写失败")
+
+// ErrTermInvalid 表示 ReplaceTerm 的入参在开事务之前就被拒绝：学期编号为空、
+// 总周数不在 1..52，或第 1 周周一为零值或不是周一（零值 time.Time{} 的日历日
+// 恰好是周一，必须单独判，否则会被当成合法锚点展开出 0001 年的整学期周历）。
+// 这是调用方的编码错误而不是数据库故障：不建日历、不开事务、一行都不写。
+// 与 ErrTermStoreFailed 分开是为了让上层日志与告警不把「传错了参数」算成仓储故障
+// （后者才值得重试与排查数据库）。
+var ErrTermInvalid = errors.New("学期日历入参非法")
+
 // ErrSettingInvalid 表示设置值未通过纯校验：白名单空编号/重复/空展示名/超条数、
 // 白名单字段超 4096 字节、cron 语法或取值非法、URL 不是 http(s) 绝对地址、
 // 文本项明文超过 4096 字节。

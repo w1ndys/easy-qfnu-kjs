@@ -15,7 +15,7 @@
   - 错误码常量固定在 `collector`（`settings_incomplete`、`auth_failed`、`ocr_failed`、`validation_blocked`），与 `pipeline` 既有的四个结构失败码不重名、不重复写入
   - 单测：正常写、空码写 NULL、`cause` 为 nil 的固定文案、已收口轮次报错
 
-- [ ] 3. 学期日历整体替换
+- [x] 3. 学期日历整体替换
   - `store.ReplaceTerm` 在单事务内 `UPSERT term` → 逐周 `UPSERT term_week(week, monday, in_calendar=true)` → 删 `week > Y` 的残留
   - 锚点守卫：已有日历的第 1 周周一 ≠ 新算值时回滚并返回 `store.ErrTermAnchorConflict`
   - `collector` 侧的锚点纯函数：第 1 周周一 = 采样日所在周周一 − 7×(C−1)，按 `Asia/Shanghai`（固定 +08:00）
