@@ -26,11 +26,11 @@
   - 没有版本行时返回包装 `model.ErrQueryFailed` 的错误，不返回空快照
   - 单测：最大版本选择、两表逐行映射、`ordinal` 排序、空表报错
 
-- [ ] 5. 执行器骨架与启动语义
+- [x] 5. 执行器骨架与启动语义
   - `collector.New(Deps)` 校验必填依赖（`RunCtx`、`Log` 与全部仓储/上游/设置），缺一返回包装 `model.ErrConfigInvalid` 的错误
   - `Start` 先 `StartRunningRun` 再起后台协程并返回 `running`；后台用 `Deps.RunCtx` 而不是请求 ctx
   - 后台 panic 时 `recover` + `FailRun`（无码）+ 一条 ERROR 日志；`ctx` 取消时保持 `running` 不收口
-  - 单测：唯一索引冲突 → `model.ErrRunConflict`；`Start` 在后台完成前返回；取消请求 ctx 后轮次仍跑到终态（CP11）；panic 后轮次 `failed`
+  - 单测：唯一索引冲突 → `model.ErrRunConflict`；`Start` 在后台完成前返回；取消请求 ctx 后后台仍持有 `RunCtx` 并可写终态（替身，CP11；真实终态由第 6–10 项编排用例覆盖）；panic 后轮次 `failed`（含 `FinishRun` 失败时只有一条带 `err` 的 ERROR、不二次收口）
 
 - [ ] 6. 设置、登录与学期/周历阶段
   - 读设置：`Settings.Load` + `Reveal(jw_password)`；任一为空或解封失败 → `settings_incomplete`，原因只点名键、不写值

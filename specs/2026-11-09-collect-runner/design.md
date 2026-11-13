@@ -194,7 +194,7 @@ collector:
 ```
 backend/internal/collector/collector.go        New / Deps / Start / 收口与失败码
 backend/internal/collector/execute.go          execute 的阶段顺序（登录 → 学期 → 窗口 → 两段执行 → 发布）
-backend/internal/collector/fetch.go            Upstream 接口、页面缓存、TaskFetcher、明细抓取
+backend/internal/collector/fetch.go            上游窄接口（upstreamAPI）、页面缓存、TaskFetcher、明细抓取
 backend/internal/collector/candidate.go        内存候选追加器（矩阵 / 明细 / 不可用格 + 按归属过滤）
 backend/internal/collector/window_test.go      窗口与日历锚点的纯函数用例
 backend/internal/collector/collector_test.go   编排顺序、失败收口、错误码（替身）
@@ -212,7 +212,7 @@ backend/cmd/server/main.go                     装配 upstream → collector →
 backend/.golangci.yml                          + collector 包规则
 ```
 
-`collector` 内部按职责分文件，但只有 `Collector` 一个导出类型、`New` 与 `Start` 两个导出方法；其余是包内函数，测试同包。
+`collector` 内部按职责分文件，导出面固定为：`Collector` 类型、`New` 与 `Start` 两个方法、`Deps` 装配结构，以及三个仓储窄接口 `RunLifecycle` / `TermCalendar` / `SnapshotReader`（第 11 项的装配期断言要引用它们）。其余一律包内：`taskReader` / `upstreamAPI` / `settingsSource` 三个窄接口与全部函数都不导出，测试同包。
 
 装配层用 `var _ collector.RunLifecycle = store.CollectRunRepo{}` 这一类断言把「接口方法集与仓储实现」钉在编译期（与 `main.go` 里既有的 `var _ settings.Store = store.SettingsRepo{}`、`var _ auth.AdminStore = store.AdminRepo{}` 同一做法）：`tasklist.md` 第 11 项落实的三条断言分别对应 `RunLifecycle`（`store.CollectRunRepo`）、`TermCalendar`（`store.TermRepo`）、`SnapshotReader`（`store.SnapshotRepo`）。
 
@@ -229,12 +229,12 @@ type Deps struct {
     Snapshots SnapshotReader        // 字典与轴版本快照（store.SnapshotRepo）
     Phases    pipeline.PhaseStore   // 阶段、计数、收口（store.RunPhaseRepo）
     Tasks     pipeline.TaskStore    // 任务与周结果（store.SyncTaskRepo）
-    TaskRead  TaskReader            // 读周矩阵任务状态（store.SyncTaskRepo 的增量）
+    TaskRead  taskReader            // 读周矩阵任务状态（store.SyncTaskRepo 的增量）
     Rooms     pipeline.RoomStore    // 归属快照、冲突计数（store.RoomRepo）
     Reader    publish.Reader        // 发布组装（store.PublishRepo）
     Committer publish.Committer     // 发布事务（store.ReleaseRepo）
-    Settings  SettingsSource        // 白名单、账号、OCR、密码（*settings.Service）
-    Upstream  Upstream              // 教务 HTTP 客户端（*upstream.Client）
+    Settings  settingsSource        // 白名单、账号、OCR、密码（*settings.Service）
+    Upstream  upstreamAPI           // 教务 HTTP 客户端（*upstream.Client）
     RunCtx    context.Context       // 进程生命周期上下文，必填（D9）
     Log       *slog.Logger          // 必填
     Clock     pipeline.Clock        // 当前时刻；nil 退回 time.Now
@@ -248,8 +248,9 @@ func (c *Collector) Start(ctx context.Context, source model.TriggerSource) (runn
 ```
 
 ```go
-// 执行器对存储的四个窄接口。方法集由 store 的既有/新增方法结构匹配，
-// 装配层用 var _ collector.RunLifecycle = store.CollectRunRepo{} 之类的断言钉在编译期。
+// 执行器对存储的四个窄接口。方法集由 store 的既有/新增方法结构匹配；
+// 前三个导出供装配层断言（var _ collector.RunLifecycle = store.CollectRunRepo{}），
+// taskReader 只在包内使用，不进入导出面。
 
 type RunLifecycle interface {
     // StartRunningRun 插入一条 status=running、term 为 NULL 的轮次；
@@ -272,7 +273,7 @@ type SnapshotReader interface {
     LoadCollectSnapshot(ctx context.Context) (store.CollectSnapshot, error)
 }
 
-type TaskReader interface {
+type taskReader interface {
     // LoadWeekMatrixTasks 按 task_id 升序返回本轮全部周矩阵任务（含状态），
     // 供 hydrate 找出「已完成但内存缺页」的楼×周。
     LoadWeekMatrixTasks(ctx context.Context, runID int64) ([]store.SyncTask, error)
@@ -280,8 +281,8 @@ type TaskReader interface {
 ```
 
 ```go
-// 上游只声明执行器真正消费的六个方法；*upstream.Client 结构匹配。
-type Upstream interface {
+// 上游只声明执行器真正消费的六个方法；*upstream.Client 结构匹配。包内接口，不导出。
+type upstreamAPI interface {
     Login(ctx context.Context, opts upstream.LoginOptions) error
     FetchTerm(ctx context.Context) (*upstream.TermSnapshot, error)
     FetchWeekCalendar(ctx context.Context, at time.Time) (*upstream.WeekCalendar, error)
@@ -291,7 +292,8 @@ type Upstream interface {
 }
 
 // 设置只声明读的两个方法：白名单、账号与 OCR 地址来自 Load，密码只有 Reveal 一条路。
-type SettingsSource interface {
+// 包内接口，不导出。
+type settingsSource interface {
     Load(ctx context.Context) (settings.Snapshot, error)
     Reveal(ctx context.Context, key string) (string, error)
 }
@@ -501,8 +503,8 @@ type cellRow struct {
 - **CP8 失败必收口、成功不收口**：任一轮次离开 `running` 时 `finished_at` 非空；失败轮次 `error_code` 属于错误码表或为空；`publish.Commit` 成功之后不再调用任何收口函数（否则撞 `FinishRun` 守卫并报错）。调用方取消/进程退出时轮次保持 `running`，未完成任务保持 `pending`。
 - **CP9 不发布半成品**：只有 `EvaluateRun ∈ {success, partial}` 且 `Validate` 通过才调用 `Commit`；hydrate 缺周、必需任务失败、候选集为空一律不发布，线上 `is_current` 版本不变。
 - **CP10 请求数守恒**：每「楼 × 周」每轮至多一次 `FetchWeekMatrix` 调用（`pages` 守卫 + `upstream` 内部 3 次重试）；hydrate 只补「`done` 且内存缺页」的键，正常轮次为 0 次。
-- **CP11 HTTP 取消不影响轮次**：`Start(ctx)` 的 `ctx` 只用于 `StartRunningRun`；后台协程用 `Deps.RunCtx`，请求结束后继续执行（可测：取消请求 ctx 后轮次仍跑到终态）。
-- **CP12 原始页面不落库**：页面只在 `pages` 缓存与 `collect_run_week.page_sha256` 里；日志字段固定为 `run_id` / `stage` / `building_id` / `week` / `task_id` / `code`，不写页面片段、账号、密码、密文。
+- **CP11 HTTP 取消不影响轮次**：`Start(ctx)` 的 `ctx` 只用于 `StartRunningRun`；后台协程用 `Deps.RunCtx`，请求结束后继续执行（可测：取消请求 ctx 后后台仍持有 `RunCtx` 并可写终态——替身执行体自己收口；真实终态由第 6–10 项编排用例覆盖）。
+- **CP12 原始页面不落库**：页面只在 `pages` 缓存与 `collect_run_week.page_sha256` 里；日志字段固定为 `run_id` / `stage` / `building_id` / `week` / `task_id` / `code`，不写页面片段、账号、密码、密文。`panic` / `err` 是这条规则的唯一例外：`panic` 只记类型名与截断到 200 字符的简短值，`err` 只记错误链的文本；两者都绝不整段照抄可能来自页面的载荷。落库的 `error_message` 仍不写 panic 值。
 
 ## Error Handling
 
@@ -542,7 +544,7 @@ type cellRow struct {
 
 - **纯函数（无库无网）**：窗口与锚点——`WindowFor(9,16)=9..12`、`WindowFor(16,16)=16..16`、`WindowFor(0,16)` 为空、`WindowFor(17,16)` 为空；`anchorMonday(2026-11-04, 9)` = 2026-09-07（第 9 周周一），跨月/跨年各一条；白名单规范化（去空白、去重、保序）与 `Plan` / `Run` 收到同一份序列。
 - **追加器（`candidate_test.go`）**：同一 (楼,周) 写两次只留后一次；同一 (房,天,大节) 的明细写两次只留后一次；`unavailable` 在归属重写后指向快照的楼；没有归属的房号被丢弃并计入 `orphanCells`；导出顺序稳定（同一输入两次导出逐项相等）。
-- **编排（替身，`collector_test.go`）**：用假 `Upstream`、假 `SettingsSource` + **真实** `pipeline`/`publish`/`parser`/`clean` + 内存版存储替身，断言调用顺序（设置 → 登录 → 学期 → 周历 → 替换日历 → 绑学期 → 写窗口 → 快照 → 规划 → 执行 → 发布）；每个失败码各一条：`settings_incomplete`、`auth_failed`、`ocr_failed`、`calendar_invalid`（parser 与锚点各一条）、`validation_blocked`、发布事务失败、hydrate 失败；`Start` 在后台完成前就返回（用 channel 卡住假上游，断言 `Start` 先返回）；取消请求 ctx 后轮次仍跑完（CP11）；panic 后轮次 `failed`。
+- **编排（替身，`collector_test.go`）**：用假上游（`upstreamAPI`）、假设置（`settingsSource`）+ **真实** `pipeline`/`publish`/`parser`/`clean` + 内存版存储替身，断言调用顺序（设置 → 登录 → 学期 → 周历 → 替换日历 → 绑学期 → 写窗口 → 快照 → 规划 → 执行 → 发布）；每个失败码各一条：`settings_incomplete`、`auth_failed`、`ocr_failed`、`calendar_invalid`（parser 与锚点各一条）、`validation_blocked`、发布事务失败、hydrate 失败；`Start` 在后台完成前就返回（用 channel 卡住假上游，断言 `Start` 先返回）；取消请求 ctx 后后台仍持有 `RunCtx` 并可写终态（替身，CP11；真实终态由第 6–10 项编排用例覆盖）；panic 后轮次 `failed`，`FinishRun` 本身失败时仍只有一条带 `err` 的 ERROR、不二次收口。
 - **仓储单测（替身 queryer）**：`StartRunningRun` 的 SQL 只写 `started_at` 与 `status`，唯一索引冲突映射成 `ErrRunConflict`（只认 `collect_run_single_running` 的 23505）；`SetRunTerm` / `SetRunWindow` 的 `WHERE run_id = $1 AND status = 'running'` 与 0 行更新的报错；`ReplaceTerm` 的「先读锚点 → 不一致即回滚」分支与三条写语句（upsert term、逐周 upsert、删 `week > Y`）；`LoadCollectSnapshot` 取最大版本、按 `ordinal` 排序、无版本即报错；`LoadWeekMatrixTasks` 只选 `kind='week_matrix'` 且按 `task_id` 升序。
 - **集成（真实 PostgreSQL 17，`KJS_TEST_DSN` 未设置则跳过）**：一轮 happy path（假上游 + 真实 parser/clean/pipeline/publish）→ 断言 `collect_run` 的窗口/学期/计数/终态/`release_id`/`released_at`、`term_week` 的 16 行与锚点、`release` 与 `observation` 行数、`collect_run_room` 的房号数；归属冲突轮（两楼同房号）→ 候选只含赢家的房号、`attr_conflict_count>0`、`has_attr_conflict=true`、明细任务无一条被丢弃；续跑轮（预置 `running` 轮次 + 若干 `done` 的周矩阵任务 + 已写 `collect_run_week`，内存为空）→ hydrate 补抓后发布成功且观测覆盖窗口内全部周；重复执行同一 run → 不产生重复观测（`publish.Build` 不报错、`observation` 行数与一次执行相同）；明细结构失败 → `partial` 且版本仍发布；必需矩阵全失败 → `failed` 且 `release` 行数不变。
 - **端到端（真实库 + 假上游 HTTP 客户端）**：从 `collector.Start` 起跑到 202 + 轮次终态 + 公开查询可见（复用 `internal/e2e` 的装配与夹具，新增 `e2e/collect_runner_test.go`）。**必须 `-p 1`**：`e2e` 与 `store` 的集成用例都会 `DROP SCHEMA public`（`backend/internal/e2e/collect_pipeline_test.go:13`）。
