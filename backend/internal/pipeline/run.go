@@ -109,3 +109,19 @@ func nowIn(clock Clock) time.Time {
 	}
 	return clock().In(shanghai)
 }
+
+// TermSetter 给已建的 running 轮次补学期。登录前建轮时 term 为 NULL，拿到学期后才调用。
+type TermSetter interface {
+	SetRunTerm(ctx context.Context, runID int64, term string, now time.Time) error
+}
+
+// RecordTerm 只去两侧空白并拒绝空学期，然后落库。
+// 空学期（含纯空白）不调用仓储：collect_run.term 有外键，空串会撞约束，
+// 也和「登录前 term 留 NULL」的口径冲突——缺学期应保持 NULL，而不是写成空串。
+func RecordTerm(ctx context.Context, terms TermSetter, runID int64, term string, clock Clock) error {
+	term = strings.TrimSpace(term)
+	if term == "" {
+		return fmt.Errorf("%w: 缺少学期，无法绑定采集轮次", model.ErrRunStoreFailed)
+	}
+	return terms.SetRunTerm(ctx, runID, term, nowIn(clock))
+}

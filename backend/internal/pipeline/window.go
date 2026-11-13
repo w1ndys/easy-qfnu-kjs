@@ -1,5 +1,13 @@
 package pipeline
 
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
+)
+
 // windowWeeks 是采集窗口最多覆盖的周数：当前周加之后三周，闭区间共 4 周。
 // 窗口上限来自教研口径（Requirement 1.1），不是可以随手调大的批量参数。
 const windowWeeks = 4
@@ -65,4 +73,26 @@ func (w Window) Weeks() []int {
 	}
 
 	return weeks
+}
+
+// WindowStore 把合法窗口写进 collect_run。pipeline 不写 SQL，跨度口径只留在本包。
+type WindowStore interface {
+	SetRunWindow(ctx context.Context, runID int64, start, end, weeksTotal int, now time.Time) error
+}
+
+// RecordWindow 校验窗口非空、跨度不超过 4 周，再落库 window_start/end/weeks_total。
+// 参数名用 windows 而不是 store：避免与包名 store 同名。
+//
+// 空窗与超宽窗口都不落库：空窗应由调用方跳过本轮，超 4 周会让周矩阵超出教研口径。
+// 跨度检查放在 Empty 之后，且只在跨度不超过 4 周时才把 end-start+1 交给仓储，
+// 避免先做加法在 MaxInt 附近回绕，把超宽窗口误写成很小的 weeks_total。
+func RecordWindow(ctx context.Context, windows WindowStore, runID int64, w Window, clock Clock) error {
+	if w.Empty() {
+		return fmt.Errorf("%w: 采集窗口为空，无法写入轮次 %d", model.ErrRunStoreFailed, runID)
+	}
+	// Empty 已保证 Start>=1 且 End>=Start，此时 End-Start 落在 [0, MaxInt-1]，比较本身不溢出。
+	if w.End-w.Start > windowWeeks-1 {
+		return fmt.Errorf("%w: 采集窗口跨度超过 %d 周，无法写入轮次 %d", model.ErrRunStoreFailed, windowWeeks, runID)
+	}
+	return windows.SetRunWindow(ctx, runID, w.Start, w.End, w.End-w.Start+1, nowIn(clock))
 }

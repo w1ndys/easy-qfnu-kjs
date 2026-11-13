@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -329,5 +330,73 @@ func TestStartRunDefaultsToWallClock(t *testing.T) {
 	}
 	if _, offset := runs.staleNow.Zone(); offset != 8*60*60 {
 		t.Fatalf("默认时钟也应换算到 +08:00，实际 %d 秒", offset)
+	}
+}
+
+// termSetterStub 记录 RecordTerm 传给仓储的参数；err 非 nil 时模拟仓储拒绝。
+type termSetterStub struct {
+	calls int
+	runID int64
+	term  string
+	now   time.Time
+	err   error
+}
+
+// SetRunTerm 实现 TermSetter。
+func (s *termSetterStub) SetRunTerm(_ context.Context, runID int64, term string, now time.Time) error {
+	s.calls++
+	s.runID = runID
+	s.term = term
+	s.now = now
+	return s.err
+}
+
+// TestRecordTermRejectsEmptyTerm 覆盖空学期（含纯空白）：不调用仓储，term 保持 NULL 语义。
+func TestRecordTermRejectsEmptyTerm(t *testing.T) {
+	for _, term := range []string{"", "   ", "\t\n"} {
+		terms := &termSetterStub{}
+		err := RecordTerm(context.Background(), terms, 7, term, fixedClock(time.Now()))
+		if !errors.Is(err, model.ErrRunStoreFailed) {
+			t.Fatalf("空学期 %q 应拒绝并包装 ErrRunStoreFailed，实际 %v", term, err)
+		}
+		if !strings.Contains(err.Error(), "学期") {
+			t.Fatalf("错误应点名学期，实际 %v", err)
+		}
+		if terms.calls != 0 {
+			t.Fatalf("空学期不应落库，实际调用 %d 次", terms.calls)
+		}
+	}
+}
+
+// TestRecordTermTrimsAndWrites 覆盖正常路径：去两侧空白后才落库，时刻换算到业务时区。
+func TestRecordTermTrimsAndWrites(t *testing.T) {
+	now := time.Date(2026, 11, 9, 1, 30, 0, 0, time.UTC)
+	terms := &termSetterStub{}
+
+	if err := RecordTerm(context.Background(), terms, 42, "  "+runTestTerm+"\t", fixedClock(now)); err != nil {
+		t.Fatalf("正常学期应落库，实际 %v", err)
+	}
+	if terms.calls != 1 || terms.runID != 42 || terms.term != runTestTerm {
+		t.Fatalf("落库参数应去空白并带轮次编号，实际 %+v", terms)
+	}
+	if _, offset := terms.now.Zone(); offset != 8*60*60 {
+		t.Fatalf("落库时刻应换算到 +08:00，实际 %d 秒", offset)
+	}
+	if !terms.now.Equal(now.In(shanghai)) {
+		t.Fatalf("落库时刻期望 %s，实际 %s", now.In(shanghai), terms.now)
+	}
+}
+
+// TestRecordTermPropagatesStoreError 覆盖仓储拒绝（如轮次已收口）：原样上抛，不吞成成功。
+func TestRecordTermPropagatesStoreError(t *testing.T) {
+	closedErr := fmt.Errorf("%w: 轮次 7 已收口（status=failed），不能再补写学期", model.ErrRunStoreFailed)
+	terms := &termSetterStub{err: closedErr}
+
+	err := RecordTerm(context.Background(), terms, 7, runTestTerm, fixedClock(time.Now()))
+	if !errors.Is(err, closedErr) {
+		t.Fatalf("应保留仓储原因，实际 %v", err)
+	}
+	if terms.calls != 1 {
+		t.Fatalf("守卫由仓储执行，应调用一次，实际 %d 次", terms.calls)
 	}
 }

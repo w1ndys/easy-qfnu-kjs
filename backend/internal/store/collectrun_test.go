@@ -100,6 +100,8 @@ type runQuerierStub struct {
 	rowResults []pgx.Row
 	queryRows  pgx.Rows
 	queryErr   error
+	execTag    pgconn.CommandTag
+	execErr    error
 
 	rowCalls   int
 	rowSQL     []string
@@ -107,6 +109,9 @@ type runQuerierStub struct {
 	queryCalls int
 	querySQL   string
 	queryArgs  []any
+	execCalls  int
+	execSQL    []string
+	execArgs   [][]any
 }
 
 // QueryRow 实现 collectRunQuerier：每次取一条预置结果。
@@ -128,6 +133,17 @@ func (s *runQuerierStub) Query(_ context.Context, sql string, args ...any) (pgx.
 	s.querySQL = sql
 	s.queryArgs = args
 	return s.queryRows, s.queryErr
+}
+
+// Exec 实现 collectRunQuerier：补学期与补窗口是不带 RETURNING 的 UPDATE。
+func (s *runQuerierStub) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	s.execCalls++
+	s.execSQL = append(s.execSQL, sql)
+	s.execArgs = append(s.execArgs, args)
+	if s.execErr != nil {
+		return pgconn.CommandTag{}, s.execErr
+	}
+	return s.execTag, nil
 }
 
 // staleRunRowsStub 是 pgx.Rows 的最小替身，只实现调用方真的会用到的部分。
@@ -522,6 +538,248 @@ func TestFailStaleRunsWrapsIterationFailure(t *testing.T) {
 	}
 	if !rows.closed {
 		t.Fatal("即使遍历失败也必须关闭结果集")
+	}
+}
+
+// collectRunStateRow 回 loadRunState 的两列：status、phase。found 为 false 时模拟轮次不存在。
+func collectRunStateRow(status, phase string, found bool) pgx.Row {
+	if !found {
+		return errRunRow(pgx.ErrNoRows)
+	}
+	return runRowFunc(func(dest ...any) error {
+		if len(dest) != 2 {
+			return fmt.Errorf("期望 2 个扫描目标，实际 %d 个", len(dest))
+		}
+		st, ok := dest[0].(*string)
+		if !ok {
+			return fmt.Errorf("第 1 个目标期望 *string，实际 %T", dest[0])
+		}
+		ph, ok := dest[1].(*string)
+		if !ok {
+			return fmt.Errorf("第 2 个目标期望 *string，实际 %T", dest[1])
+		}
+		*st = status
+		*ph = phase
+		return nil
+	})
+}
+
+// assertRunningGuard 钉住补写语句的 WHERE：只改仍在 running 的那一轮。
+func assertRunningGuard(t *testing.T, sql string) {
+	t.Helper()
+	if !strings.Contains(sql, "WHERE run_id = $1 AND status = 'running'") {
+		t.Fatalf("更新必须带 running 守卫，实际 %q", sql)
+	}
+}
+
+// TestStartRunningRunInsertsNullTerm 覆盖先建轮、学期后绑：INSERT 只写 started_at 与 status。
+func TestStartRunningRunInsertsNullTerm(t *testing.T) {
+	startedAt := time.Date(2026, 11, 9, 8, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	querier := &runQuerierStub{rowResults: []pgx.Row{runningRunRow(t, 7, startedAt)}}
+
+	run, err := StartRunningRun(context.Background(), querier, startedAt)
+	if err != nil {
+		t.Fatalf("创建轮次不应报错，实际 %v", err)
+	}
+	if run.RunID != 7 || !run.StartedAt.Equal(startedAt) || run.Status != "running" {
+		t.Fatalf("轮次不符: %+v", run)
+	}
+	if querier.rowCalls != 1 || querier.queryCalls != 0 {
+		t.Fatalf("成功建轮只应插入一次，row=%d query=%d", querier.rowCalls, querier.queryCalls)
+	}
+	sql := querier.rowSQL[0]
+	if strings.Contains(sql, "term") {
+		t.Fatalf("建轮 SQL 不应写入 term 列，实际 %q", sql)
+	}
+	for _, want := range []string{"started_at", "status", "'running'", "RETURNING run_id, started_at, status"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("建轮 SQL 应包含 %q，实际 %q", want, sql)
+		}
+	}
+	if len(querier.rowArgs[0]) != 1 {
+		t.Fatalf("只应传入 started_at，实际参数 %v", querier.rowArgs[0])
+	}
+	if got := querier.rowArgs[0][0].(time.Time); !got.Equal(startedAt) {
+		t.Fatalf("started_at 期望 %s，实际 %s", startedAt, got)
+	}
+}
+
+// TestStartRunningRunMapsOnlySingleRunningViolation 覆盖冲突口径：
+// 只有 collect_run_single_running 的 23505 映射成 ErrRunConflict，且不复用旧轮次。
+func TestStartRunningRunMapsOnlySingleRunningViolation(t *testing.T) {
+	t.Run("本索引冲突", func(t *testing.T) {
+		querier := &runQuerierStub{rowResults: []pgx.Row{
+			errRunRow(&pgconn.PgError{Code: "23505", ConstraintName: "collect_run_single_running"}),
+		}}
+
+		_, err := StartRunningRun(context.Background(), querier, time.Now())
+		if !errors.Is(err, model.ErrRunConflict) {
+			t.Fatalf("唯一索引冲突应映射成 ErrRunConflict，实际 %v", err)
+		}
+		if errors.Is(err, model.ErrRunStoreFailed) {
+			t.Fatalf("轮次冲突不是读写失败，实际 %v", err)
+		}
+		if querier.rowCalls != 1 || querier.queryCalls != 0 {
+			t.Fatalf("冲突后不应补查或复用，row=%d query=%d", querier.rowCalls, querier.queryCalls)
+		}
+	})
+
+	t.Run("别的唯一约束", func(t *testing.T) {
+		querier := &runQuerierStub{rowResults: []pgx.Row{
+			errRunRow(&pgconn.PgError{Code: "23505", ConstraintName: "collect_run_pkey"}),
+		}}
+
+		_, err := StartRunningRun(context.Background(), querier, time.Now())
+		if !errors.Is(err, model.ErrRunStoreFailed) {
+			t.Fatalf("别的 23505 应包装成 ErrRunStoreFailed，实际 %v", err)
+		}
+		if errors.Is(err, model.ErrRunConflict) {
+			t.Fatalf("别的 23505 不能映射成 ErrRunConflict，实际 %v", err)
+		}
+		if querier.rowCalls != 1 {
+			t.Fatalf("不应补查，实际 %d 次", querier.rowCalls)
+		}
+	})
+
+	t.Run("连接错误", func(t *testing.T) {
+		insertErr := errors.New("连接断开")
+		querier := &runQuerierStub{rowResults: []pgx.Row{errRunRow(insertErr)}}
+
+		_, err := StartRunningRun(context.Background(), querier, time.Now())
+		if !errors.Is(err, model.ErrRunStoreFailed) || !errors.Is(err, insertErr) {
+			t.Fatalf("连接错误应包装成 ErrRunStoreFailed 并保留原因，实际 %v", err)
+		}
+		if errors.Is(err, model.ErrRunConflict) {
+			t.Fatalf("连接错误不能映射成 ErrRunConflict，实际 %v", err)
+		}
+	})
+}
+
+// TestSetRunTermUpdatesRunningRound 钉住补学期的列、守卫与参数顺序。
+func TestSetRunTermUpdatesRunningRound(t *testing.T) {
+	now := time.Date(2026, 11, 9, 9, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	querier := &runQuerierStub{execTag: pgconn.NewCommandTag("UPDATE 1")}
+
+	if err := SetRunTerm(context.Background(), querier, 7, "  "+collectRunTestTerm+"  ", now); err != nil {
+		t.Fatalf("补写学期不应报错，实际 %v", err)
+	}
+	if querier.execCalls != 1 || querier.rowCalls != 0 {
+		t.Fatalf("更新成功不应补读，exec=%d row=%d", querier.execCalls, querier.rowCalls)
+	}
+	sql := querier.execSQL[0]
+	assertRunningGuard(t, sql)
+	for _, want := range []string{"term = $2", "updated_at = $3"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("补学期 SQL 应包含 %q，实际 %q", want, sql)
+		}
+	}
+	args := querier.execArgs[0]
+	if len(args) != 3 || args[0] != int64(7) || args[1] != "  "+collectRunTestTerm+"  " {
+		t.Fatalf("参数顺序应为 run_id、原样学期、时刻，实际 %v", args)
+	}
+	if got := args[2].(time.Time); !got.Equal(now) {
+		t.Fatalf("updated_at 期望 %s，实际 %s", now, got)
+	}
+}
+
+// TestSetRunWindowWritesCallerWeeksTotal 钉住窗口列与参数顺序。
+// weeks_total 必须是调用方传入的值，仓储不按 end-start+1 重算。
+func TestSetRunWindowWritesCallerWeeksTotal(t *testing.T) {
+	now := time.Date(2026, 11, 9, 9, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	querier := &runQuerierStub{execTag: pgconn.NewCommandTag("UPDATE 1")}
+
+	if err := SetRunWindow(context.Background(), querier, 7, 5, 8, 99, now); err != nil {
+		t.Fatalf("写窗口不应报错，实际 %v", err)
+	}
+	sql := querier.execSQL[0]
+	assertRunningGuard(t, sql)
+	for _, want := range []string{"window_start = $2", "window_end = $3", "weeks_total = $4", "updated_at = $5"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("写窗口 SQL 应包含 %q，实际 %q", want, sql)
+		}
+	}
+	args := querier.execArgs[0]
+	if len(args) != 5 || args[0] != int64(7) || args[1] != 5 || args[2] != 8 || args[3] != 99 {
+		t.Fatalf("参数顺序应为 run_id、start、end、weeks_total、时刻，实际 %v", args)
+	}
+	if got := args[4].(time.Time); !got.Equal(now) {
+		t.Fatalf("updated_at 期望 %s，实际 %s", now, got)
+	}
+	if querier.rowCalls != 0 {
+		t.Fatalf("更新成功不应补读，实际 %d 次", querier.rowCalls)
+	}
+}
+
+// TestSetRunTermAndWindowRejectZeroRows 覆盖 0 行更新：补读后区分不存在与已收口。
+func TestSetRunTermAndWindowRejectZeroRows(t *testing.T) {
+	now := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		status string
+		found  bool
+		want   string
+		call   func(q *runQuerierStub) error
+	}{
+		{
+			name: "补学期时轮次不存在", status: "", found: false, want: "不存在",
+			call: func(q *runQuerierStub) error {
+				return SetRunTerm(context.Background(), q, 404, collectRunTestTerm, now)
+			},
+		},
+		{
+			name: "补学期时已收口", status: "success", found: true, want: "已收口",
+			call: func(q *runQuerierStub) error {
+				return SetRunTerm(context.Background(), q, 7, collectRunTestTerm, now)
+			},
+		},
+		{
+			name: "写窗口时轮次不存在", status: "", found: false, want: "不存在",
+			call: func(q *runQuerierStub) error {
+				return SetRunWindow(context.Background(), q, 404, 1, 1, 1, now)
+			},
+		},
+		{
+			name: "写窗口时已收口", status: "failed", found: true, want: "已收口",
+			call: func(q *runQuerierStub) error {
+				return SetRunWindow(context.Background(), q, 7, 1, 4, 4, now)
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			querier := &runQuerierStub{
+				execTag:    pgconn.NewCommandTag("UPDATE 0"),
+				rowResults: []pgx.Row{collectRunStateRow(testCase.status, "finished", testCase.found)},
+			}
+			err := testCase.call(querier)
+			if !errors.Is(err, model.ErrRunStoreFailed) {
+				t.Fatalf("0 行更新应包装成 ErrRunStoreFailed，实际 %v", err)
+			}
+			if !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("错误应说明%s，实际 %v", testCase.want, err)
+			}
+			if querier.execCalls != 1 || querier.rowCalls != 1 {
+				t.Fatalf("0 行后应补读一次，exec=%d row=%d", querier.execCalls, querier.rowCalls)
+			}
+			assertRunningGuard(t, querier.execSQL[0])
+		})
+	}
+}
+
+// TestSetRunTermWrapsExecFailure 覆盖更新语句本身失败，不能误报成轮次冲突。
+func TestSetRunTermWrapsExecFailure(t *testing.T) {
+	execErr := errors.New("连接断开")
+	querier := &runQuerierStub{execErr: execErr}
+
+	err := SetRunTerm(context.Background(), querier, 7, collectRunTestTerm, time.Now())
+	if !errors.Is(err, model.ErrRunStoreFailed) || !errors.Is(err, execErr) {
+		t.Fatalf("应包装成 ErrRunStoreFailed 并保留原因，实际 %v", err)
+	}
+	if errors.Is(err, model.ErrRunConflict) {
+		t.Fatalf("写入失败不是轮次冲突，实际 %v", err)
+	}
+	if querier.rowCalls != 0 {
+		t.Fatalf("语句失败时不应补读，实际 %d 次", querier.rowCalls)
 	}
 }
 

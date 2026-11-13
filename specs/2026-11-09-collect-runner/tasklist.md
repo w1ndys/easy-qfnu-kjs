@@ -4,7 +4,7 @@
 > 每项完成后跑该项涉及包的 `go test -count=1`；第 11 项跑全量门禁。带库用例需要 `KJS_TEST_DSN`，且必须 `-p 1` 串行（`e2e` 与 `store` 都会 `DROP SCHEMA public`）。
 > 本 spec 不写任何 Go 代码，以下条目在实现阶段执行。
 
-- [ ] 1. 建轮、补学期与窗口写入口
+- [x] 1. 建轮、补学期与窗口写入口
   - `store.StartRunningRun` 插入 `status=running`、`term` 为 NULL 的轮次，只认 `collect_run_single_running` 的 23505 并映射 `model.ErrRunConflict`
   - `store.SetRunTerm` / `store.SetRunWindow` 都带 `WHERE run_id = $1 AND status = 'running'` 守卫，0 行更新报错
   - `pipeline.RecordTerm` 拒绝空学期、`pipeline.RecordWindow` 拒绝空窗与跨度 > 4 周的窗口，两者都不落库
