@@ -24,10 +24,11 @@ var errSettingsIncomplete = errors.New("设置项未配齐或无法解封")
 
 // execute 是一轮采集的执行体：从读设置开始，到发布或失败收口为止。
 //
-// 本项（tasklist 第 6 项）交付前四段：读设置 → 登录 → 学期/周历 → 写学期日历并绑定学期。
-// 阶段顺序是固定契约，每一步的位置都有理由：
-//  1. 读设置：账号、OCR 地址在 Load 的明文里，密码只能 Reveal；缺一项就在发第一个
-//     上游请求之前失败，错误码 settings_incomplete；
+// 到本项（tasklist 第 7 项）为止交付前六段：读设置 → 登录 → 学期/周历 → 写学期
+// 日历并绑定学期 → 采集窗口 → 字典与轴快照。阶段顺序是固定契约，每一步的位置
+// 都有理由：
+//  1. 读设置：账号、OCR 地址与白名单来自同一次 Load，密码只能 Reveal；缺一项就在
+//     发第一个上游请求之前失败，错误码 settings_incomplete；
 //  2. 登录：密码错误与验证码耗尽各有固定错误码，网络/超时按 design 的口径不编码；
 //  3. 阶段 calendar：学期与周历是这一阶段的内容，先推进再请求，面板看到的进度与
 //     实际动作一致（阶段只前进，见 CP2）；
@@ -36,10 +37,15 @@ var errSettingsIncomplete = errors.New("设置项未配齐或无法解封")
 //  5. 学期日历：ReplaceTerm 在单事务内整体替换；锚点冲突返回 calendar_invalid 且
 //     不改任何一行（design 第 4 节）。必须在绑定学期之前——collect_run.term 的外键
 //     指向 term，先绑学期会撞外键；
-//  6. 绑定学期：pipeline.RecordTerm 只去两侧空白并拒绝空学期。
+//  6. 绑定学期：pipeline.RecordTerm 只去两侧空白并拒绝空学期；
+//  7. 采集窗口：WindowFor(C, Y) 是窗口的唯一来源；空窗直接把本轮收口成 skipped，
+//     不写窗口也不发请求（Requirement 2.3）；非空窗经 pipeline.RecordWindow 落库，
+//     窗口之外的一周都不会被请求（CP1）；
+//  8. 字典与轴快照：必须在第一个矩阵请求之前取到，取不到就失败（design 第 5 节）。
 //
-// design 的执行顺序还有「窗口 → 字典与轴 → hydrate → 两段执行 → 发布」，由第 7 项起
-// 在本函数末尾接续；本项到此返回 nil，轮次保持 running。
+// design 的执行顺序还有「楼列表（advisory）→ hydrate → 两段执行 → 发布」，由第 8 项起
+// 在本函数末尾接续；本项到此返回 nil，轮次保持 running——窗口已钉住；快照本项只验证
+// 可读（取不到就失败），快照内容由第 8 项持有并传递。
 //
 // 每一个失败点都在本函数内收口，并把原因返回给 run() 记 WARN：执行体自己收口、
 // run() 不补刀，两层都写终态会撞 FinishRun 的 status='running' 守卫（CP8）。
@@ -48,7 +54,7 @@ func (c *Collector) execute(ctx context.Context, runID int64) error {
 	// 两次 clock() 恰好在跨零点/跨周边界时会让「当前周」与「第 1 周周一」互相矛盾。
 	now := c.clock()
 
-	opts, err := c.loadLoginOptions(ctx)
+	rs, err := c.loadRoundSettings(ctx)
 	if err != nil {
 		if errors.Is(err, errSettingsIncomplete) {
 			return c.failRun(ctx, runID, codeSettingsIncomplete, err)
@@ -57,7 +63,7 @@ func (c *Collector) execute(ctx context.Context, runID int64) error {
 		return c.failRun(ctx, runID, "", err)
 	}
 
-	if err := c.upstream.Login(ctx, opts); err != nil {
+	if err := c.upstream.Login(ctx, rs.Login); err != nil {
 		switch {
 		// 先判密码错误：凭据问题重试与重登录都不会变好（Requirement 10.2）。
 		case errors.Is(err, model.ErrUpstreamAuthFailed):
@@ -99,10 +105,103 @@ func (c *Collector) execute(ctx context.Context, runID int64) error {
 		return c.failRun(ctx, runID, "", err)
 	}
 
+	// 采集窗口只由 WindowFor 一处算出，写入 collect_run 的也就是同一个值（CP1）。
+	// window 在这一项只用于落库与空窗判定；第 8 项的两次 Plan 复用同一个值。
+	window := pipeline.WindowFor(currentWeek, totalWeeks)
+	if done, err := c.writeWindow(ctx, runID, window); err != nil || done {
+		return err
+	}
+
+	// 字典与轴必须在发出第一个矩阵请求之前钉住：没有版本行时 clean 会把每一格都判成
+	// unknown、parser.Rows 会直接报轴不可用，两者都该在请求之前失败，不写业务码
+	// （design 第 5 节、错误码表的「快照」行）。
+	//
+	// 快照的内容（dict / axis 与两个版本号）由第 8 项的矩阵抓取与第 10 项的发布消费；
+	// 这一项只落实「取不到就失败」这一步，因此这里丢弃返回值——下一项会把同一个
+	// 调用改成接收快照，不再多读一次。
+	if _, err := c.snapshots.LoadCollectSnapshot(ctx); err != nil {
+		return c.failRun(ctx, runID, "", err)
+	}
+
 	return nil
 }
 
-// loadLoginOptions 读一次设置，拼出登录入参。
+// writeWindow 把本轮窗口写进 collect_run；空窗直接收口 skipped（Requirement 2.2–2.3）。
+//
+// 返回 done 为 true 表示本轮已经收口结束，调用方不要继续后面的阶段：空窗没有可采的周，
+// 也就不该写窗口列（pipeline.RecordWindow 拒绝空窗）与任何任务。收口本身失败（含
+// ctx 已取消）时 done 仍为 false——库里还没写成终态，这一轮并没有真正结束。
+//
+// 空窗在本轮的正常输入下不可达——parser.WeekText 保证 1 ≤ C ≤ Y，而
+// WindowFor(C, Y) 在 1 ≤ C ≤ Y 时恒非空。它是防线而不是主路径：周历口径或
+// WindowFor 的边界一旦变化，这里把轮次收口成 skipped，而不是带着非法窗口往下跑。
+// 也正因为走不到，这条分支的用例直接喂空窗口给本函数（execute 用的是真实 parser，
+// 造不出空窗）。
+//
+// 空窗用 FinishRun 收口而不是 CloseRun：本轮没有任务表，CloseRun 的失败分层会把
+// 「零必需任务」判成 failed（phase.go 的 decideOutcome）。
+func (c *Collector) writeWindow(ctx context.Context, runID int64, window pipeline.Window) (bool, error) {
+	if window.Empty() {
+		if err := c.finishSkipped(ctx, runID); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if err := pipeline.RecordWindow(ctx, c.runs, runID, window, c.clock); err != nil {
+		return false, c.failRun(ctx, runID, "", err)
+	}
+	return false, nil
+}
+
+// finishSkipped 把「没有可采的周」的一轮收口为 skipped。
+//
+// skipped 不是失败：不写 error_code 与 error_message（两列交给 store 的 NULLIF 折成
+// NULL），只写 status、phase=finished 与 finished_at。收口时刻与其它落库时刻同一口径，
+// 换算到业务时区（与 pipeline.nowIn 一致）。
+//
+// 与 failRun 一样先判 ctx：调用方取消或进程退出时轮次保持 running，未完成的任务留给
+// 下一次执行（Requirement 10.4、CP8）；收口写库本身失败时把原因一起返回，
+// run() 会记一条 WARN，库里则仍是 running。
+func (c *Collector) finishSkipped(ctx context.Context, runID int64) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err := c.phases.FinishRun(ctx, store.RunFinish{
+		RunID:      runID,
+		Status:     string(pipeline.StatusSkipped),
+		FinishedAt: c.clock().In(shanghai),
+	}); err != nil {
+		return fmt.Errorf("轮次 %d 空窗收口失败: %w", runID, err)
+	}
+	return nil
+}
+
+// roundSettings 是一轮执行从设置里要拿的两样东西：登录入参与规范化后的白名单。
+//
+// 两样来自同一次 Settings.Load（Requirement 4.1）：登录用的账号与规划/执行用的
+// 白名单是同一份设置快照，不会出现「登录用了一份账号、规划用了另一份白名单」。
+// 密码不在这里——它只能经 Reveal 取出，拿不到密文（design「依赖方向」）。
+//
+// 本项（tasklist 第 7 项）只负责把白名单读出来并按 Requirement 4.2 规范化；
+// 规划与执行（第 8 项）用 ids() 取同一份有序序列交给 Plan 与 Run。
+type roundSettings struct {
+	Login     upstream.LoginOptions
+	Buildings []model.Building // 编号已 trim、按首次出现去重、顺序即裁决顺序
+}
+
+// ids 返回规划与执行共用的楼编号序列（Requirement 4.2）。
+//
+// 返回的是新切片，调用方可以随意持有；顺序与 Buildings 一致，所以
+// pipeline.Plan 的规划顺序、pipeline.Run 的归属裁决顺序与发布时的展示名永远对得上。
+func (s roundSettings) ids() []string {
+	ids := make([]string, 0, len(s.Buildings))
+	for _, building := range s.Buildings {
+		ids = append(ids, building.ID)
+	}
+	return ids
+}
+
+// loadRoundSettings 读一次设置，拼出登录入参与规范化后的白名单。
 //
 // 账号与 OCR 地址的明文就在 Load 返回的快照里，密码只有 Reveal 一条路：执行器拿不到
 // 密文，也不 import secret（design「依赖方向」）。三项任一为空或密码解不开都算配置
@@ -115,10 +214,10 @@ func (c *Collector) execute(ctx context.Context, runID int64) error {
 // 返回的错误分两类：errSettingsIncomplete（可映射 settings_incomplete）与 Load 自身的
 // 基础设施错误（不编码）。Reveal 的错误文本不拼进原因——它可能带上密钥或密文的细节，
 // 而这一类失败的原因只需要点名键。
-func (c *Collector) loadLoginOptions(ctx context.Context) (upstream.LoginOptions, error) {
+func (c *Collector) loadRoundSettings(ctx context.Context) (roundSettings, error) {
 	snapshot, err := c.settings.Load(ctx)
 	if err != nil {
-		return upstream.LoginOptions{}, err
+		return roundSettings{}, err
 	}
 
 	missing := make([]string, 0, 3)
@@ -140,14 +239,47 @@ func (c *Collector) loadLoginOptions(ctx context.Context) (upstream.LoginOptions
 	}
 
 	if len(missing) > 0 {
-		return upstream.LoginOptions{}, fmt.Errorf("%w：%s", errSettingsIncomplete, strings.Join(missing, "、"))
+		return roundSettings{}, fmt.Errorf("%w：%s", errSettingsIncomplete, strings.Join(missing, "、"))
 	}
 
-	return upstream.LoginOptions{
-		Username:   username,
-		Password:   password,
-		OCRBaseURL: ocrBaseURL,
+	return roundSettings{
+		Login: upstream.LoginOptions{
+			Username:   username,
+			Password:   password,
+			OCRBaseURL: ocrBaseURL,
+		},
+		// 白名单与登录入参在同一次 Load 里读出；设置不完整的那一轮会在这里之前失败，
+		// 所以这条分支只在配置齐备时到达。规范化后的序列留给第 8 项的规划与执行。
+		Buildings: normalizeBuildings(snapshot.Whitelist),
 	}, nil
+}
+
+// normalizeBuildings 规范化白名单：楼编号去两侧空白、按首次出现去重、保持提交顺序
+// （Requirement 4.2）。
+//
+// 顺序是业务语义而不是展示细节：它同时是规划顺序、归属冲突的裁决顺序（白名单里
+// 靠前的楼优先）与发布快照的展示顺序，所以既不能排序，也不能把后出现的重复项挪到
+// 前面。展示名不参与去重判定，原样保留：房号归属只认编号，名字只用于展示。
+//
+// 编号 trim 后为空时保留该条目，不在这里静默丢弃：设置保存时已经拒绝空编号
+// （admin-settings-sync），库里出现空编号只可能是手工写库；pipeline.Run 的
+// normalizeWhitelist 会拒绝空编号并让该轮失败，比悄悄少采一栋楼更容易被发现。
+func normalizeBuildings(entries []model.Building) []model.Building {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(entries))
+	buildings := make([]model.Building, 0, len(entries))
+	for _, building := range entries {
+		building.ID = strings.TrimSpace(building.ID)
+		if _, ok := seen[building.ID]; ok {
+			continue
+		}
+		seen[building.ID] = struct{}{}
+		buildings = append(buildings, building)
+	}
+	return buildings
 }
 
 // readCalendar 读学期页与周历页，返回 parser 口径的学期编号、当前教学周 C 与总周数 Y。

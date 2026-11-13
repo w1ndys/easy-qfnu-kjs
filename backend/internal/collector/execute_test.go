@@ -48,6 +48,13 @@ type replacement struct {
 	FirstMonday time.Time
 }
 
+// windowWrite 是一次 SetRunWindow 入参：窗口三列由 pipeline.RecordWindow 算好再落库。
+type windowWrite struct {
+	Start      int
+	End        int
+	WeeksTotal int
+}
+
 // execFake 在 stub 之上替换本项会调到的注入点，其余方法继续沿用 stub 的 panic：
 // 将来若 execute 提前用到了第 7 项起才该用的依赖，用例会炸在调用点，而不是拿到零值
 // 后悄悄通过。所有替换方法都同步记录到达顺序，供「执行顺序」断言使用。
@@ -82,6 +89,16 @@ type execFake struct {
 	termSets   []string // SetRunTerm 收到的学期
 	termSetErr error    // SetRunTerm 的错误
 
+	// windows 是本轮写进 collect_run 的窗口，按到达顺序；windowErr 覆盖「窗口写库
+	// 失败」这条分支（空窗在到达写库之前就收口了，不会写窗口）。
+	windows   []windowWrite
+	windowErr error
+
+	// collectSnapshot 是 LoadCollectSnapshot 的返回；collectSnapshotErr 覆盖
+	// 「字典与轴没有版本行」这条执行器在发第一个矩阵请求之前的失败点。
+	collectSnapshot    store.CollectSnapshot
+	collectSnapshotErr error
+
 	phase    string // 当前阶段，随 SetRunPhase 前进
 	phaseErr error  // SetRunPhase 的错误
 }
@@ -95,6 +112,10 @@ func newExecuteFake() *execFake {
 			JWUsername:    "teacher-" + settingsSentinel,
 			JWPasswordSet: true,
 			OCRBaseURL:    "http://ocr-" + settingsSentinel + ".test",
+			Whitelist: []model.Building{
+				{ID: "Q10", Name: "综合楼"},
+				{ID: "Q11", Name: "实验楼"},
+			},
 		},
 		secrets: map[string]string{
 			model.SettingJWPassword: "pw-" + settingsSentinel,
@@ -110,9 +131,24 @@ func newExecuteFake() *execFake {
 			TotalWeeks: 16,
 			Raw:        weekPageFixture,
 		},
-		calendars: map[string]termCalendar{},
-		phase:     string(pipeline.PhaseLogin),
+		calendars:       map[string]termCalendar{},
+		collectSnapshot: matrixFixtureSnapshot(),
+		phase:           string(pipeline.PhaseLogin),
 	}
+}
+
+func (f *execFake) SetRunWindow(_ context.Context, _ int64, start, end, weeksTotal int, _ time.Time) error {
+	f.record("window")
+	if f.windowErr != nil {
+		return f.windowErr
+	}
+	f.windows = append(f.windows, windowWrite{Start: start, End: end, WeeksTotal: weeksTotal})
+	return nil
+}
+
+func (f *execFake) LoadCollectSnapshot(_ context.Context) (store.CollectSnapshot, error) {
+	f.record("snapshot")
+	return f.collectSnapshot, f.collectSnapshotErr
 }
 
 func (f *execFake) record(event string) { f.events = append(f.events, event) }
@@ -315,7 +351,7 @@ func TestExecuteFailsWithSettingsIncomplete(t *testing.T) {
 			wantAbsent:  []string{model.SettingJWPassword},
 		},
 		{
-			// 多键一次点名：管理员「修一个、跑一次」是最费时间的路径，loadLoginOptions
+			// 多键一次点名：管理员「修一个、跑一次」是最费时间的路径，loadRoundSettings
 			// 必须在同一条原因里把缺的键都写出来，而不是遇到第一个就返回。
 			name: "账号与 OCR 同时为空",
 			mutate: func(f *execFake) {
@@ -793,7 +829,7 @@ func TestExecuteFailsWithoutCodeWhenTermBindFails(t *testing.T) {
 // 锚点由 parser 的 C 与同一个执行时刻推出，学期与总周数原样落库，成功轮次不收口。
 func TestExecuteBindsTermAfterWritingCalendar(t *testing.T) {
 	f := newExecuteFake()
-	// 账号与 OCR 地址故意带前后空白：loadLoginOptions 会再 trim 一次，登录入参必须是
+	// 账号与 OCR 地址故意带前后空白：loadRoundSettings 会再 trim 一次，登录入参必须是
 	// trim 后的值；密码是秘密项、按原样传入，不受这次 trim 影响——所以也让密码带上
 	// 前后空白，用同一串进参钉住「密码不被 trim」。
 	f.snapshot.JWUsername = "  teacher-" + settingsSentinel + "  "
@@ -816,6 +852,8 @@ func TestExecuteBindsTermAfterWritingCalendar(t *testing.T) {
 		"fetch_week",
 		"replace_term",
 		"bind_term",
+		"window",
+		"snapshot",
 	}
 	if !slices.Equal(f.events, wantEvents) {
 		t.Fatalf("阶段顺序应为 %v，实际 %v", wantEvents, f.events)
@@ -839,6 +877,11 @@ func TestExecuteBindsTermAfterWritingCalendar(t *testing.T) {
 	}
 	if f.phase != string(pipeline.PhaseCalendar) {
 		t.Fatalf("阶段应推进到 calendar，实际 %q", f.phase)
+	}
+
+	// 窗口由周历口径 C=9 / Y=16 求得 9..12，落库的 weeks_total 是闭区间跨度 4。
+	if want := []windowWrite{{Start: 9, End: 12, WeeksTotal: 4}}; !slices.Equal(f.windows, want) {
+		t.Fatalf("窗口入参期望 %+v，实际 %+v", want, f.windows)
 	}
 
 	// 登录入参是 trim 后的值：上面故意给账号与 OCR 地址加了前后空白；密码原样传入，
@@ -875,11 +918,322 @@ func TestExecuteKeepsRunRunningWhenContextCanceled(t *testing.T) {
 	}
 }
 
+// TestWriteWindowSkipsRunOnEmptyWindow 覆盖 Requirement 2.3 与 CP1 的空窗分支：
+// 窗口为空时本轮直接收口 skipped，不写窗口三列、不发任何请求、不收错误码。
+//
+// 空窗在完整 execute 里不可达（parser.WeekText 保证 1 ≤ C ≤ Y，WindowFor 此时恒非空），
+// 所以这里按「写窗口」这一步单测：窗口由 pipeline.WindowFor(9, 8) 现算，保证被测的是
+// WindowFor 与 writeWindow 的组合，而不是手写的零值窗口。
+func TestWriteWindowSkipsRunOnEmptyWindow(t *testing.T) {
+	f := newExecuteFake()
+	c := newExecutor(t, f)
+
+	window := pipeline.WindowFor(9, 8)
+	if !window.Empty() {
+		t.Fatalf("WindowFor(9, 8) 应是空窗，实际 %+v", window)
+	}
+
+	done, err := c.writeWindow(context.Background(), executeRunID, window)
+	if err != nil {
+		t.Fatalf("空窗收口不应返回错误，实际 %v", err)
+	}
+	if !done {
+		t.Fatal("空窗应结束本轮（done=true）")
+	}
+
+	finish := singleFinish(t, f)
+	if finish.RunID != executeRunID {
+		t.Fatalf("收口的轮次应为 %d，实际 %d", executeRunID, finish.RunID)
+	}
+	if finish.Status != string(pipeline.StatusSkipped) {
+		t.Fatalf("空窗终态应为 skipped，实际 %q", finish.Status)
+	}
+	if finish.ErrorCode != "" || finish.ErrorMessage != "" {
+		t.Fatalf("skipped 不是失败，不应写错误码与原因，实际 code=%q message=%q",
+			finish.ErrorCode, finish.ErrorMessage)
+	}
+	if !finish.FinishedAt.Equal(executeNow) {
+		t.Fatalf("收口时刻应取注入的时钟 %v，实际 %v", executeNow, finish.FinishedAt)
+	}
+
+	if len(f.windows) != 0 {
+		t.Fatalf("空窗不应写窗口三列，实际 %+v", f.windows)
+	}
+	if slices.Contains(f.events, "snapshot") {
+		t.Fatalf("空窗不应继续读字典与轴，实际调用序列 %v", f.events)
+	}
+}
+
+// TestWriteWindowLeavesRunRunningWhenCanceled 覆盖空窗收口的 ctx 守卫（Requirement 10.4、
+// CP8）：调用方取消或进程退出时轮次保持 running，不写终态，留给下一次执行。
+//
+// writeWindow 的 done 只在终态真的写成功后才为 true；取消时返回 false + context.Canceled，
+// 调用方据此停止后续阶段，而库里这一轮还在 running。
+func TestWriteWindowLeavesRunRunningWhenCanceled(t *testing.T) {
+	f := newExecuteFake()
+	c := newExecutor(t, f)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done, err := c.writeWindow(ctx, executeRunID, pipeline.WindowFor(9, 8))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后应返回 context.Canceled，实际 %v", err)
+	}
+	if done {
+		t.Fatal("终态没写成时 done 必须为 false")
+	}
+	if finishes := f.finishCalls(); len(finishes) != 0 {
+		t.Fatalf("取消后不应收口（轮次应保持 running），实际收口 %+v", finishes)
+	}
+}
+
+// TestWriteWindowReportsErrorWhenFinishFails 覆盖空窗收口的「收口本身失败」分支：
+// FinishRun 写终态失败时 writeWindow 必须把原因返回、done 保持 false，且只尝试收口
+// 一次——重试只会再撞一次 FinishRun 的 status='running' 守卫，也不会改写已经写下的
+// 终态。调用方拿到 error 后停止后续阶段，库里这一轮仍是 running。
+func TestWriteWindowReportsErrorWhenFinishFails(t *testing.T) {
+	f := newExecuteFake()
+	f.finishErr = errors.New("写终态时数据库连接已断开")
+	c := newExecutor(t, f)
+
+	done, err := c.writeWindow(context.Background(), executeRunID, pipeline.WindowFor(9, 8))
+	if err == nil {
+		t.Fatal("空窗收口失败时 writeWindow 应返回错误，供 run() 记 WARN")
+	}
+	if done {
+		t.Fatal("终态没写成时 done 必须为 false（这一轮并没有真正结束）")
+	}
+	if !strings.Contains(err.Error(), "空窗收口失败") {
+		t.Fatalf("错误应说明空窗收口本身失败，实际 %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "写终态时数据库连接已断开") {
+		t.Fatalf("错误应保留收口失败的原因，实际 %q", err.Error())
+	}
+
+	// 只尝试一次：stub 在返回错误之前就记下这次调用，所以「条数」就是尝试次数。
+	if finishes := f.finishCalls(); len(finishes) != 1 {
+		t.Fatalf("收口失败不重试，应只尝试一次 FinishRun，实际 %d 次：%+v", len(finishes), finishes)
+	}
+	if len(f.windows) != 0 {
+		t.Fatalf("空窗不应写窗口三列，实际 %+v", f.windows)
+	}
+}
+
+// TestWriteWindowFailsRunWhenWriteFails 覆盖窗口落库失败：failed、不写业务码，
+// 原因取仓储文案。窗口写库失败与快照失败同属「基础设施失败不编码」。
+func TestWriteWindowFailsRunWhenWriteFails(t *testing.T) {
+	f := newExecuteFake()
+	f.windowErr = errors.New("写窗口时数据库连接已断开")
+	c := newExecutor(t, f)
+
+	done, err := c.writeWindow(context.Background(), executeRunID, pipeline.WindowFor(9, 16))
+	if err == nil {
+		t.Fatal("窗口写库失败时 writeWindow 应返回错误")
+	}
+	if done {
+		t.Fatal("窗口写库失败不表示本轮已按 skipped 结束")
+	}
+
+	finish := singleFinish(t, f)
+	assertFailedFinish(t, finish, "")
+	if !strings.Contains(finish.ErrorMessage, "写窗口时数据库连接已断开") {
+		t.Fatalf("原因应取仓储错误文案，实际 %q", finish.ErrorMessage)
+	}
+}
+
+// TestExecuteFailsWithoutCodeWhenSnapshotReadFails 覆盖 design 错误码表的「快照」行：
+// dict / axis 没有版本行时 failed、error_code 为空、原因取仓储文案，且队列里不会出现
+// 任何矩阵请求——窗口已经写好，失败发生在发出第一个上游请求之前。
+func TestExecuteFailsWithoutCodeWhenSnapshotReadFails(t *testing.T) {
+	f := newExecuteFake()
+	f.collectSnapshotErr = fmt.Errorf("%w: 字典表没有版本行，无法采集", model.ErrQueryFailed)
+
+	if err := runExecute(t, f); err == nil {
+		t.Fatal("快照读取失败时执行体应返回错误")
+	}
+
+	finish := singleFinish(t, f)
+	assertFailedFinish(t, finish, "")
+	if !strings.Contains(finish.ErrorMessage, "字典表没有版本行") {
+		t.Fatalf("原因应取仓储错误文案，实际 %q", finish.ErrorMessage)
+	}
+
+	// 窗口已落在快照之前：快照失败不该把已钉住的窗口撤掉，也不该再往前发请求。
+	if want := []windowWrite{{Start: 9, End: 12, WeeksTotal: 4}}; !slices.Equal(f.windows, want) {
+		t.Fatalf("快照失败前应已写窗口 %+v，实际 %+v", want, f.windows)
+	}
+	if last := f.events[len(f.events)-1]; last != "snapshot" {
+		t.Fatalf("快照失败应是本项最后一步，实际调用序列 %v", f.events)
+	}
+}
+
+// TestLoadRoundSettingsNormalizesWhitelist 覆盖 Requirement 4.1–4.2：白名单与登录入参
+// 来自同一次 Settings.Load；楼编号去两侧空白、按首次出现去重、保持提交顺序，
+// 且 ids() 给出的规划/执行序列与规范化后的条目同序。
+func TestLoadRoundSettingsNormalizesWhitelist(t *testing.T) {
+	f := newExecuteFake()
+	f.snapshot.Whitelist = []model.Building{
+		{ID: "  Q10  ", Name: "综合楼"},
+		{ID: "Q11", Name: "实验楼"},
+		{ID: " Q10 ", Name: "重复条目"},
+		{ID: "Q03", Name: "文史楼"},
+	}
+	c := newExecutor(t, f)
+
+	rs, err := c.loadRoundSettings(context.Background())
+	if err != nil {
+		t.Fatalf("设置齐备时不应报错，实际 %v", err)
+	}
+
+	wantIDs := []string{"Q10", "Q11", "Q03"}
+	if got := rs.ids(); !slices.Equal(got, wantIDs) {
+		t.Fatalf("规范化后的楼编号期望 %v，实际 %v", wantIDs, got)
+	}
+	if len(rs.Buildings) != len(wantIDs) {
+		t.Fatalf("白名单应有 %d 条，实际 %d 条：%+v", len(wantIDs), len(rs.Buildings), rs.Buildings)
+	}
+	if rs.Buildings[0].Name != "综合楼" {
+		t.Fatalf("首次出现的展示名应保留，实际 %q", rs.Buildings[0].Name)
+	}
+
+	// 一次调用只读一次设置：登录入参与白名单来自同一份快照，不能各读一次各拿一份。
+	loads := 0
+	for _, event := range f.events {
+		if event == "load" {
+			loads++
+		}
+	}
+	if loads != 1 {
+		t.Fatalf("读一轮设置应只 Load 一次，实际 %d 次（%v）", loads, f.events)
+	}
+}
+
+// TestNormalizeBuildings 表驱动钉住白名单规范化的三条规则：trim、按首次出现去重、
+// 保持提交顺序；空列表与空编号两种边界也在这里固定下来。
+func TestNormalizeBuildings(t *testing.T) {
+	cases := []struct {
+		name      string
+		entries   []model.Building
+		wantIDs   []string
+		wantNames []string
+	}{
+		{
+			name: "去空白、去重、保序",
+			entries: []model.Building{
+				{ID: " Q10 ", Name: "综合楼"},
+				{ID: "Q11", Name: "实验楼"},
+				{ID: "Q10", Name: "重复条目"},
+				{ID: "\tQ03\n", Name: "文史楼"},
+			},
+			wantIDs:   []string{"Q10", "Q11", "Q03"},
+			wantNames: []string{"综合楼", "实验楼", "文史楼"},
+		},
+		{
+			name:    "空名单",
+			entries: nil,
+			wantIDs: nil,
+		},
+		{
+			// 空编号保留：设置保存时已经拒绝空编号，库里出现它只可能是手工写库，
+			// 交给 pipeline.Run 的 normalizeWhitelist 拒绝并让该轮失败。
+			name:      "trim 后为空的编号保留给下游拒绝",
+			entries:   []model.Building{{ID: "   ", Name: "坏条目"}},
+			wantIDs:   []string{""},
+			wantNames: []string{"坏条目"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeBuildings(tc.entries)
+			ids := make([]string, 0, len(got))
+			names := make([]string, 0, len(got))
+			for _, building := range got {
+				ids = append(ids, building.ID)
+				names = append(names, building.Name)
+			}
+			if !slices.Equal(ids, tc.wantIDs) {
+				t.Fatalf("楼编号期望 %v，实际 %v", tc.wantIDs, ids)
+			}
+			if !slices.Equal(names, tc.wantNames) {
+				t.Fatalf("展示名期望 %v，实际 %v", tc.wantNames, names)
+			}
+		})
+	}
+}
+
+// TestEmptyBuildingIDFailsRun 钉住空编号的去向，只覆盖三件事：保留、下游拒绝、收口口径。
+// normalizeBuildings 不替下游静默丢弃 trim 后为空的编号，而是原样保留；直接调用
+// pipeline.Run 时，入口的 normalizeWhitelist 拒绝它；执行器则按无码失败收口整轮，
+// 原因点名「空的教学楼编号」。
+//
+// 这三段是本函数手工接起来的，不是执行体真的跑到了第 8 项：execute 目前到快照为止就
+// 返回，「白名单 → pipeline.Run」的接续属于第 8 项。所以这里钉的是三段各自的形状，
+// 端到端等第 8 项——空编号在真实执行体里应当让整轮 failed，但那条路径现在还没有入口。
+//
+// 空编号只可能来自手工写库（设置保存端已拒绝），所以显式失败比悄悄少采一栋楼更容易
+// 被发现；这条用例把「保留」与「下游拒绝并收口」两段接起来，避免任何一段被改掉时
+// 另一方仍默默通过。
+func TestEmptyBuildingIDFailsRun(t *testing.T) {
+	f := newExecuteFake()
+	f.snapshot.Whitelist = []model.Building{
+		{ID: "Q10", Name: "综合楼"},
+		{ID: "   ", Name: "手工写入的空编号楼"},
+	}
+	c := newExecutor(t, f)
+
+	rs, err := c.loadRoundSettings(context.Background())
+	if err != nil {
+		t.Fatalf("设置齐备时不应报错，实际 %v", err)
+	}
+	wantIDs := []string{"Q10", ""}
+	if ids := rs.ids(); !slices.Equal(ids, wantIDs) {
+		t.Fatalf("空编号应原样保留给下游拒绝，期望 %v，实际 %v", wantIDs, ids)
+	}
+
+	// 第 8 项的调用形状：规范化后的白名单直接交给 pipeline.Run。替身若被落任务或
+	// 推进阶段会 panic，所以「一条任务都没写」由下面的到达序列一起证明。
+	planned := []pipeline.Task{{Kind: pipeline.TaskWeekMatrix, Required: true, BuildingID: "Q10", Week: 9}}
+	_, runErr := pipeline.Run(context.Background(), executeRunID, rs.ids(), planned, pipeline.RunDeps{
+		Phases: f,
+		Tasks:  f,
+		Rooms:  f,
+		Fetch: func(context.Context, pipeline.Task) (pipeline.TaskFetch, error) {
+			return pipeline.TaskFetch{}, nil
+		},
+		Clock: c.clock,
+	})
+	if runErr == nil {
+		t.Fatal("空编号应让 pipeline.Run 拒绝整轮")
+	}
+	if !strings.Contains(runErr.Error(), "空的教学楼编号") {
+		t.Fatalf("拒绝原因应点名空编号，实际 %q", runErr.Error())
+	}
+	if want := []string{"load", "reveal:" + model.SettingJWPassword}; !slices.Equal(f.events, want) {
+		t.Fatalf("拒绝应发生在任何落库/推进之前，实际到达序列 %v", f.events)
+	}
+
+	// 执行器对 pipeline 编排错误的收口口径：failed + 无业务码，原因原样落库。
+	if err := c.failRun(context.Background(), executeRunID, "", runErr); err == nil {
+		t.Fatal("失败收口应把原始错误返回给 run() 记 WARN")
+	}
+	finish := singleFinish(t, f)
+	assertFailedFinish(t, finish, "")
+	if finish.ErrorMessage != runErr.Error() {
+		t.Fatalf("失败原因应原样落库，期望 %q，实际 %q", runErr.Error(), finish.ErrorMessage)
+	}
+	if !strings.Contains(finish.ErrorMessage, "空的教学楼编号") {
+		t.Fatalf("落库原因应点名空编号，实际 %q", finish.ErrorMessage)
+	}
+}
+
 // 编译期确认替身覆盖本项会用到的注入点：少一个方法时这里先报错。
 var (
 	_ settingsSource      = (*execFake)(nil)
 	_ upstreamAPI         = (*execFake)(nil)
 	_ TermCalendar        = (*execFake)(nil)
 	_ RunLifecycle        = (*execFake)(nil)
+	_ SnapshotReader      = (*execFake)(nil)
 	_ pipeline.PhaseStore = (*execFake)(nil)
 )

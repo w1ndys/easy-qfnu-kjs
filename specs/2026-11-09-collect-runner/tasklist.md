@@ -38,9 +38,11 @@
   - 学期/周历：`FetchTerm`/`FetchWeekCalendar` + `parser.TermText`/`parser.WeekText` 双口径；任一不一致或锚点冲突 → `pipeline.FailCalendar`（`calendar_invalid`）
   - 单测：五条失败路径各一条，断言终态、错误码与「学期日历未被改动」
 
-- [ ] 7. 矩阵抓取与内存候选
+- [x] 7. 窗口、快照与矩阵抓取（含内存候选）
+  - 前置：`WindowFor(C, Y)` → `pipeline.RecordWindow`（空窗 `skipped` 收口）；`Snapshots.LoadCollectSnapshot` 取字典与轴，失败即 `failed`
+  - 前置单测：空窗收口为 `skipped`、快照读取失败收口为 `failed`
   - `TaskFetcher` 闭包：`FetchWeekMatrix` → `parser.Rows` → 逐格 `clean.State` → 写入 `pages[(楼,周)]`（整片覆盖）
-  - 页面缓存同时充当「每 (楼,周) 每轮至多一次请求」的守卫（CP10），并把 `Page` 原样带回给 `pipeline.Run` 算 sha256
+  - 页面缓存守住「同一进程内成功页面每键至多一份」（CP10 的缓存侧），并把 `Page` 原样带回给 `pipeline.Run` 算 sha256；一轮内至多一次请求还依赖 pipeline 不重试失败任务
   - 不可用格：`Available == false`（含未知与复合）记入 `unavailable[(房,天,大节)]`，窗口内任一周不可用即算一格
   - 单测：同一 (楼,周) 抓两次只产生一份候选；不可用格去重跨周生效；结构失败原样返回给 `pipeline` 走任务失败路径
 
