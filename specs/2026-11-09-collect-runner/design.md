@@ -380,9 +380,9 @@ type Config struct {
 8. **字典与轴**：`Snapshots.LoadCollectSnapshot`。
 9. **楼列表**（advisory）：`FetchBuildings(upstream.CampusQufu)`；失败只记 WARN；白名单里不在列表内的楼逐个记 WARN。这一步对采集结果没有贡献，所以**不阻断**（见「待确认事项」4）。
 10. **hydrate（续跑才命中）**：`TaskRead.LoadWeekMatrixTasks` 取 `done` 的 `(楼, 周)`，凡页面缓存里没有的补抓一次（只累计内存候选：不写 `collect_run_week`、不改 `sync_task`）。放在第一段之前，阶段因此仍停在 `week_matrix`，进度条与实际动作一致；补抓失败 → `FailRun` 并返回。
-11. **规划第一段**：`plan1 := pipeline.Plan(window, buildings, nil)`。`StatusBlocked` → `FinishRun(blocked, whitelist_empty)`（防御；runner 已经挡过空白名单，但白名单可能在两次读之间被清空）；`StatusSkipped` → `FinishRun(skipped)`。
+11. **规划第一段**：`plan1 := pipeline.Plan(window, buildings, nil)`。`StatusBlocked` 有两条来源，必须分开收口：白名单为空 → `FinishRun(blocked, whitelist_empty)`（防御；runner 已经挡过空白名单，但白名单可能在两次读之间被清空）；窗口跨度非法 → `FailRun("", err)`，即 failed + 空错误码（它是调用方没走 `WindowFor` 传进来的窗口，不属于任何业务失败层，不编业务码）。`StatusSkipped` → `FinishRun(skipped)`。
 12. **执行第一段**：`pipeline.Run(ctx, runID, buildings, plan1.Tasks, deps)`，`Fetch` 是执行器的闭包（矩阵页 + 清洗 + 累计）。已 `done` 的周矩阵在这里被跳过，它们的候选由第 10 步补上。
-13. **收口判定一**：`pipeline.EvaluateRun(ctx, phases, runID, progress1.Dropped())`（第一段没有明细任务，丢弃数恒为 0，仍按同一口径传）。`failed` → `CloseRun` 并返回，**不再下钻明细**（Requirement 10.7：必需矩阵已经失败时继续跑 70 分钟明细没有意义）。
+13. **收口判定一**：`pipeline.EvaluateRun(ctx, phases, runID, progress1.Dropped())`（第一段不规划明细任务，丢弃数恒为 0，仍按同一口径传；但续跑时 `pipeline.Run` 会执行库里遗留的 pending 明细任务，它们在第一段就下钻，成功/失败与计数同样进入这次判定）。`failed` → `CloseRun` 并返回，**不再下钻明细**（Requirement 10.7：必需矩阵已经失败时继续跑 70 分钟明细没有意义）。
 14. **规划第二段**：`unavailable` 由内存候选导出（已按归属快照重写楼），`plan2 := Plan(window, buildings, unavailable)`。这是纯函数调用，不产生请求。
 15. **执行第二段**：`pipeline.Run`，`dropped := progress.Dropped()`。第二段里周矩阵任务全部 `done` → 跳过，`Completed` 只统计明细。
 16. **收口判定二**：`EvaluateRun(ctx, phases, runID, dropped)`。
@@ -504,7 +504,7 @@ type cellRow struct {
 - **CP9 不发布半成品**：只有 `EvaluateRun ∈ {success, partial}` 且 `Validate` 通过才调用 `Commit`；hydrate 缺周、必需任务失败、候选集为空一律不发布，线上 `is_current` 版本不变。
 - **CP10 请求数守恒**：每「楼 × 周」每轮至多一次 `FetchWeekMatrix` 调用（`pages` 守卫 + `upstream` 内部 3 次重试）；hydrate 只补「`done` 且内存缺页」的键，正常轮次为 0 次。
 - **CP11 HTTP 取消不影响轮次**：`Start(ctx)` 的 `ctx` 只用于 `StartRunningRun`；后台协程用 `Deps.RunCtx`，请求结束后继续执行（可测：取消请求 ctx 后后台仍持有 `RunCtx` 并可写终态——替身执行体自己收口；真实终态由第 6–10 项编排用例覆盖）。
-- **CP12 原始页面不落库**：页面只在 `pages` 缓存与 `collect_run_week.page_sha256` 里；日志字段固定为 `run_id` / `stage` / `building_id` / `week` / `task_id` / `code`，不写页面片段、账号、密码、密文。`panic` / `err` 是这条规则的唯一例外：`panic` 只记类型名与截断到 200 字符的简短值，`err` 只记错误链的文本；两者都绝不整段照抄可能来自页面的载荷。落库的 `error_message` 仍不写 panic 值。
+- **CP12 原始页面不落库**：页面只在 `pages` 缓存与 `collect_run_week.page_sha256` 里；日志字段固定为 `run_id` / `stage` / `building_id` / `week` / `task_id` / `code` / `orphan_cells`，不写页面片段、账号、密码、密文。`panic` / `err` 是这条规则的唯一例外：`panic` 只记类型名与截断到 200 字符的简短值，`err` 只记错误链的文本；两者都绝不整段照抄可能来自页面的载荷。落库的 `error_message` 仍不写 panic 值。
 
 ## Error Handling
 

@@ -824,9 +824,15 @@ func TestExecuteFailsWithoutCodeWhenTermBindFails(t *testing.T) {
 	}
 }
 
-// TestExecuteBindsTermAfterWritingCalendar 覆盖 happy path 的阶段顺序与取值：
-// 读设置 → 解封密码 → 登录 → 推进阶段 → 学期页 → 周历页 → 写日历 → 绑定学期；
-// 锚点由 parser 的 C 与同一个执行时刻推出，学期与总周数原样落库，成功轮次不收口。
+// TestExecuteBindsTermAfterWritingCalendar 覆盖 happy path 前半段的阶段顺序与取值：
+// 读设置 → 解封密码 → 登录 → 推进阶段 → 学期页 → 周历页 → 写日历 → 绑定学期 →
+// 写窗口 → 读快照。锚点由 parser 的 C 与同一个执行时刻推出，学期与总周数原样落库，
+// 成功时不收口。
+//
+// 本项把执行体拆成 prepare（到快照为止）与 runStages（两段执行）之后，本用例直接
+// 调 prepare：它测的是「两段执行之前的事实都已钉住」，两段执行的顺序由
+// TestExecuteTwoStagesInOrder 覆盖。prepare 不再替后续阶段收口，所以「零次收口」
+// 依旧成立。
 func TestExecuteBindsTermAfterWritingCalendar(t *testing.T) {
 	f := newExecuteFake()
 	// 账号与 OCR 地址故意带前后空白：loadRoundSettings 会再 trim 一次，登录入参必须是
@@ -836,8 +842,13 @@ func TestExecuteBindsTermAfterWritingCalendar(t *testing.T) {
 	f.snapshot.OCRBaseURL = "  http://ocr-" + settingsSentinel + ".test  "
 	f.secrets[model.SettingJWPassword] = "  pw-" + settingsSentinel + "  "
 
-	if err := runExecute(t, f); err != nil {
-		t.Fatalf("正常路径 execute 不应返回错误，实际 %v", err)
+	c := newExecutor(t, f)
+	setup, err := c.prepare(context.Background(), executeRunID)
+	if err != nil {
+		t.Fatalf("正常路径 prepare 不应返回错误，实际 %v", err)
+	}
+	if setup.finished {
+		t.Fatal("非空窗不应在 prepare 里收口结束")
 	}
 	if finishes := f.finishCalls(); len(finishes) != 0 {
 		t.Fatalf("学期日历写成功后本项不应收口（后续阶段还要继续），实际收口 %+v", finishes)
@@ -879,9 +890,22 @@ func TestExecuteBindsTermAfterWritingCalendar(t *testing.T) {
 		t.Fatalf("阶段应推进到 calendar，实际 %q", f.phase)
 	}
 
-	// 窗口由周历口径 C=9 / Y=16 求得 9..12，落库的 weeks_total 是闭区间跨度 4。
+	// 窗口由周历口径 C=9 / Y=16 求得 9..12，落库的 weeks_total 是闭区间跨度 4；
+	// prepare 交给 runStages 的必须是同一个窗口（单一来源，CP1）。
 	if want := []windowWrite{{Start: 9, End: 12, WeeksTotal: 4}}; !slices.Equal(f.windows, want) {
 		t.Fatalf("窗口入参期望 %+v，实际 %+v", want, f.windows)
+	}
+	if want := pipeline.WindowFor(9, 16); setup.window != want {
+		t.Fatalf("setup 里的窗口期望 %+v，实际 %+v", want, setup.window)
+	}
+	// 明细请求必填的节次模式与学期来自同一次学期页解析，不能在快照之后丢掉。
+	if setup.term != "2026-2027-1" || setup.kbjcmsid != "01" {
+		t.Fatalf("setup 里的学期/节次模式期望 {2026-2027-1, 01}，实际 {%q, %q}",
+			setup.term, setup.kbjcmsid)
+	}
+	if setup.snapshot.DictVersion != f.collectSnapshot.DictVersion ||
+		setup.snapshot.AxisVersion != f.collectSnapshot.AxisVersion {
+		t.Fatalf("setup 应持有快照的版本号，实际 %+v", setup.snapshot)
 	}
 
 	// 登录入参是 trim 后的值：上面故意给账号与 OCR 地址加了前后空白；密码原样传入，

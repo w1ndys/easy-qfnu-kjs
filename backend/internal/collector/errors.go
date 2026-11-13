@@ -7,11 +7,17 @@ package collector
 
 // 写进 collect_run.error_code 的执行器错误码（本 spec design 的「错误码」表）。
 //
-// 只有执行器自己判定的失败层用这四个码：学期/周历失败固定走 pipeline.FailCalendar
+// 前四个是执行器自己判定的失败层：学期/周历失败固定走 pipeline.FailCalendar
 // 的 calendar_invalid，网络、超时、发布事务失败不写码。取值必须与 pipeline 既有的
 // 四个结构失败码（calendar_invalid、matrix_structure_invalid、
-// detail_structure_invalid、axis_changed）以及 stale_run / whitelist_empty 都不同：
+// detail_structure_invalid、axis_changed）以及 stale_run 都不同：
 // 同一个值出现在两条写入路径上，管理端就没法按码判断失败发生在哪一层。
+//
+// codeWhitelistEmpty 是唯一的例外，而且是刻意保留的：whitelist_empty 的主写入者是
+// store.StartBlockedRun（runner 在 Start 前判空白名单），执行器的 Plan 防御路径
+// （runner 判过之后设置又被清空）写的是同一个码、同一个语义「白名单为空，未发起
+// 采集」，design 错误码表把这一行同时给了两处。这里复用而不是另编一个码，是为了让
+// 面板按 whitelist_empty 一次筛出全部空白名单轮次。
 //
 // 不重复写入也是这条约束的一部分：轮次里的 error_code 有两条写入路径，语义不同。
 // pipeline.RecordRunErrorCode 只保留第一个，后到的码不覆盖先到的：
@@ -26,4 +32,5 @@ const (
 	codeAuthFailed         = "auth_failed"         // 上游判定教务密码错误，重试与重登录都不会变好
 	codeOCRFailed          = "ocr_failed"          // 验证码识别耗尽重试
 	codeValidationBlocked  = "validation_blocked"  // 候选集为空或发布前校验拦截
+	codeWhitelistEmpty     = "whitelist_empty"     // 空白名单（与 store.StartBlockedRun 同码同义）
 )

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -24,9 +25,9 @@ var errSettingsIncomplete = errors.New("设置项未配齐或无法解封")
 
 // execute 是一轮采集的执行体：从读设置开始，到发布或失败收口为止。
 //
-// 到本项（tasklist 第 7 项）为止交付前六段：读设置 → 登录 → 学期/周历 → 写学期
-// 日历并绑定学期 → 采集窗口 → 字典与轴快照。阶段顺序是固定契约，每一步的位置
-// 都有理由：
+// 到本项（tasklist 第 8 项）为止，execute 覆盖下面第 1–9 步：读设置 → 登录 →
+// 学期/周历 → 写学期日历并绑定学期 → 采集窗口 → 字典与轴快照 → 两段式 Plan/Run
+// （周矩阵 → 明细）。阶段顺序是固定契约，每一步的位置都有理由：
 //  1. 读设置：账号、OCR 地址与白名单来自同一次 Load，密码只能 Reveal；缺一项就在
 //     发第一个上游请求之前失败，错误码 settings_incomplete；
 //  2. 登录：密码错误与验证码耗尽各有固定错误码，网络/超时按 design 的口径不编码；
@@ -41,15 +42,47 @@ var errSettingsIncomplete = errors.New("设置项未配齐或无法解封")
 //  7. 采集窗口：WindowFor(C, Y) 是窗口的唯一来源；空窗直接把本轮收口成 skipped，
 //     不写窗口也不发请求（Requirement 2.3）；非空窗经 pipeline.RecordWindow 落库，
 //     窗口之外的一周都不会被请求（CP1）；
-//  8. 字典与轴快照：必须在第一个矩阵请求之前取到，取不到就失败（design 第 5 节）。
+//  8. 字典与轴快照：必须在第一个矩阵请求之前取到，取不到就失败（design 第 5 节）；
+//  9. 两段式执行：第一段周矩阵、第二段占用说明，中间用第一段的结果规划明细，并在
+//     必需矩阵已失败时直接收口跳过明细（Requirement 5、6、7、10.7）。
 //
-// design 的执行顺序还有「楼列表（advisory）→ hydrate → 两段执行 → 发布」，由第 8 项起
-// 在本函数末尾接续；本项到此返回 nil，轮次保持 running——窗口已钉住；快照本项只验证
-// 可读（取不到就失败），快照内容由第 8 项持有并传递。
+// design 的执行顺序还有「楼列表（advisory）→ hydrate → ... → 发布」，分别由第 9 项
+// 与第 10 项在本函数后面接续；本项在第二段收口判定之后返回，success/partial 的
+// 发布留给第 10 项。
 //
 // 每一个失败点都在本函数内收口，并把原因返回给 run() 记 WARN：执行体自己收口、
 // run() 不补刀，两层都写终态会撞 FinishRun 的 status='running' 守卫（CP8）。
 func (c *Collector) execute(ctx context.Context, runID int64) error {
+	setup, err := c.prepare(ctx, runID)
+	if err != nil || setup.finished {
+		return err
+	}
+	return c.runStages(ctx, runID, setup)
+}
+
+// roundSetup 是两段式执行开始前已经确定下来的全部事实：窗口、白名单、学期、
+// 节次模式与字典/轴快照。
+//
+// 一次性交给 runStages 而不是让它在用到时再读：这些值必须在第一个矩阵请求之前
+// 钉住（窗口 CP1、快照 design 第 5 节），分成几步读会让「规划用的窗口」与
+// 「落库的窗口」有机会不一致。finished 表示本轮已经在 prepare 里按 skipped
+// 收口（空窗），runStages 不应再被执行。
+type roundSetup struct {
+	window   pipeline.Window       // 本轮采集窗口
+	settings roundSettings         // 登录入参与规范化白名单
+	term     string                // parser 口径的学期编号
+	kbjcmsid string                // 学期页下发的节次模式 id，明细请求必填
+	snapshot store.CollectSnapshot // 字典与轴快照
+	finished bool                  // 空窗已收口 skipped
+}
+
+// prepare 跑完两段式执行之前的全部阶段：设置 → 登录 → 学期/周历 → 学期日历 →
+// 绑定学期 → 采集窗口 → 字典与轴快照。
+//
+// 每一步失败都在这里收口并把原因返回给 run() 记 WARN；空窗直接把本轮收口成
+// skipped 并让 finished=true，调用方不再进入两段执行。阶段顺序与理由见 execute
+// 的注释。
+func (c *Collector) prepare(ctx context.Context, runID int64) (roundSetup, error) {
 	// 本轮只取一次执行时刻：FetchWeekCalendar 的 rq 与日历锚点必须来自同一个时刻，
 	// 两次 clock() 恰好在跨零点/跨周边界时会让「当前周」与「第 1 周周一」互相矛盾。
 	now := c.clock()
@@ -57,37 +90,37 @@ func (c *Collector) execute(ctx context.Context, runID int64) error {
 	rs, err := c.loadRoundSettings(ctx)
 	if err != nil {
 		if errors.Is(err, errSettingsIncomplete) {
-			return c.failRun(ctx, runID, codeSettingsIncomplete, err)
+			return roundSetup{}, c.failRun(ctx, runID, codeSettingsIncomplete, err)
 		}
 		// 设置读不出来是基础设施失败，不是「没配账号」：不写码，原因照原样落库。
-		return c.failRun(ctx, runID, "", err)
+		return roundSetup{}, c.failRun(ctx, runID, "", err)
 	}
 
 	if err := c.upstream.Login(ctx, rs.Login); err != nil {
 		switch {
 		// 先判密码错误：凭据问题重试与重登录都不会变好（Requirement 10.2）。
 		case errors.Is(err, model.ErrUpstreamAuthFailed):
-			return c.failRun(ctx, runID, codeAuthFailed, err)
+			return roundSetup{}, c.failRun(ctx, runID, codeAuthFailed, err)
 		case errors.Is(err, model.ErrUpstreamOCRFailed):
-			return c.failRun(ctx, runID, codeOCRFailed, err)
+			return roundSetup{}, c.failRun(ctx, runID, codeOCRFailed, err)
 		default:
 			// 网络、超时、扫码服务不可达、配置非法：没有对应的业务码，不编一个
 			// （design「非结构失败不编码」）。
-			return c.failRun(ctx, runID, "", err)
+			return roundSetup{}, c.failRun(ctx, runID, "", err)
 		}
 	}
 
 	if err := pipeline.AdvancePhase(ctx, c.phases, runID, pipeline.PhaseCalendar, c.clock); err != nil {
-		return c.failRun(ctx, runID, "", err)
+		return roundSetup{}, c.failRun(ctx, runID, "", err)
 	}
 
-	term, currentWeek, totalWeeks, err := c.readCalendar(ctx, now)
+	term, kbjcmsid, currentWeek, totalWeeks, err := c.readCalendar(ctx, now)
 	if err != nil {
 		if errors.Is(err, model.ErrUpstreamCalendarInvalid) {
 			// 文本非法与双口径不一致都归这里：同一份页面自相矛盾，重试不会变好。
-			return c.failCalendar(ctx, runID, err)
+			return roundSetup{}, c.failCalendar(ctx, runID, err)
 		}
-		return c.failRun(ctx, runID, "", err)
+		return roundSetup{}, c.failRun(ctx, runID, "", err)
 	}
 
 	// 锚点由 parser 的当前周 C 反推：第 1 周周一 = 采样日所在周周一 − 7×(C−1)。
@@ -95,34 +128,207 @@ func (c *Collector) execute(ctx context.Context, runID int64) error {
 		if errors.Is(err, store.ErrTermAnchorConflict) {
 			// 锚点冲突保留原日历并结束本轮：静默改锚点会让已发布版本的周次
 			// 从此指向错误的日期（design 第 4 节）。
-			return c.failCalendar(ctx, runID, err)
+			return roundSetup{}, c.failCalendar(ctx, runID, err)
 		}
 		// 事务已回滚，日历不变；写库失败不编业务码。
-		return c.failRun(ctx, runID, "", err)
+		return roundSetup{}, c.failRun(ctx, runID, "", err)
 	}
 
 	if err := pipeline.RecordTerm(ctx, c.runs, runID, term, c.clock); err != nil {
-		return c.failRun(ctx, runID, "", err)
+		return roundSetup{}, c.failRun(ctx, runID, "", err)
 	}
 
 	// 采集窗口只由 WindowFor 一处算出，写入 collect_run 的也就是同一个值（CP1）。
-	// window 在这一项只用于落库与空窗判定；第 8 项的两次 Plan 复用同一个值。
+	// 两段 Plan 复用同一个 window：第二段不会拿到一个与已落库窗口不同的范围。
 	window := pipeline.WindowFor(currentWeek, totalWeeks)
-	if done, err := c.writeWindow(ctx, runID, window); err != nil || done {
-		return err
+	done, err := c.writeWindow(ctx, runID, window)
+	if err != nil {
+		return roundSetup{}, err
+	}
+	if done {
+		return roundSetup{finished: true}, nil
 	}
 
 	// 字典与轴必须在发出第一个矩阵请求之前钉住：没有版本行时 clean 会把每一格都判成
 	// unknown、parser.Rows 会直接报轴不可用，两者都该在请求之前失败，不写业务码
 	// （design 第 5 节、错误码表的「快照」行）。
 	//
-	// 快照的内容（dict / axis 与两个版本号）由第 8 项的矩阵抓取与第 10 项的发布消费；
-	// 这一项只落实「取不到就失败」这一步，因此这里丢弃返回值——下一项会把同一个
-	// 调用改成接收快照，不再多读一次。
-	if _, err := c.snapshots.LoadCollectSnapshot(ctx); err != nil {
+	// 快照从本项开始被持有：矩阵抓取用它做 parser.Rows 与 clean.State，明细抓取用它做
+	// clean.State；第 10 项的发布还会用两个版本号组装 RunInput。一次读、一路传，
+	// 不在两个抓取器里各读一次（两次读之间版本可能变化）。
+	snapshot, err := c.snapshots.LoadCollectSnapshot(ctx)
+	if err != nil {
+		return roundSetup{}, c.failRun(ctx, runID, "", err)
+	}
+
+	return roundSetup{
+		window:   window,
+		settings: rs,
+		term:     term,
+		kbjcmsid: kbjcmsid,
+		snapshot: snapshot,
+	}, nil
+}
+
+// runStages 是两段式编排：Plan1 → Run1 → EvaluateRun → Plan2 → Run2 → EvaluateRun。
+//
+// 两段之间的顺序是固定的，每一步都有理由：
+//  1. 第一段用 Plan(window, 楼, nil) 只规划周矩阵：不可用格只有抓完矩阵才知道，
+//     而 Plan 的第三个参数必须由调用方给出（design D3）；
+//  2. 第一段执行完立刻 EvaluateRun：必需矩阵已有失败时，继续跑 70 分钟的明细没有
+//     意义，直接 CloseRun 收口 failed 并跳过全部明细（Requirement 10.7）；
+//  3. 第二段规划前从 collect_run_room 读回本轮归属（D5）：不可用格只记了
+//     「房号 × 星期 × 大节」，归属楼要在这里按快照重写，明细任务才不会在
+//     pipeline.Run 的归属过滤里被丢弃（Requirement 5.3）；
+//  4. 第二段用 Plan2 的任务执行明细，收口判定与第一段同一口径（CP7）：交给
+//     EvaluateRun 的是 RunProgress.Dropped()，库里没有这批丢弃任务的 failed 行；
+//  5. failed 才 CloseRun；success / partial 由第 10 项的发布事务写终态，
+//     本项不提前收口——发布成功后不再调用任何收口函数（CP8）。
+//
+// 两段共用同一个任务抓取器（taskFetcher 按 task.Kind 分派），不按段各给一个闭包：
+// pipeline.Run 每次调用都会执行库里该段已有的全部同类任务，第一段可能拿到上一轮
+// 续跑留下的 pending 明细任务，它们必须被正常下钻，而不是被一个只认周矩阵的闭包
+// 拒成永久 failed（Requirement 8.1、10.4）。抓取器只认任务种类，不认「现在是第几段」。
+func (c *Collector) runStages(
+	ctx context.Context,
+	runID int64,
+	setup roundSetup,
+) error {
+	candidates := newBank()
+	buildings := setup.settings.ids()
+	fetch := c.taskFetcher(setup.term, setup.kbjcmsid, setup.snapshot, candidates)
+
+	plan1 := pipeline.Plan(setup.window, buildings, nil)
+	switch plan1.Status {
+	case pipeline.StatusSkipped:
+		// 空窗在 prepare 的 writeWindow 已收口；这里是同一条口径的防线：
+		// 规划说本轮没有任务时不该再落任务表或推进阶段。
+		return c.finishSkipped(ctx, runID)
+	case pipeline.StatusBlocked:
+		// 防御而非主路径，且 blocked 有两条来源，必须分开收口：
+		// 白名单为空走 design Error Handling 表的 whitelist_empty 行（固定码 + 固定
+		// 文案，与 store.StartBlockedRun 同一句话）；窗口跨度非法是另一回事——它是
+		// 调用方传了没走 WindowFor 的窗口，不属于任何业务失败层，不编业务码，用一条
+		// 点明窗口的独立原因收口。两者都不发任何请求。
+		if len(buildings) == 0 {
+			return c.finishBlocked(ctx, runID)
+		}
+		return c.failRun(ctx, runID, "", fmt.Errorf(
+			"采集窗口 %d–%d 跨度非法，未发起采集", setup.window.Start, setup.window.End))
+	}
+
+	progress1, err := pipeline.Run(ctx, runID, buildings, plan1.Tasks, c.runDeps(fetch))
+	if err != nil {
 		return c.failRun(ctx, runID, "", err)
 	}
 
+	status1, _, err := pipeline.EvaluateRun(ctx, c.phases, runID, progress1.Dropped())
+	if err != nil {
+		return c.failRun(ctx, runID, "", err)
+	}
+	if status1 == pipeline.StatusFailed {
+		return c.closeRun(ctx, runID, progress1.Dropped())
+	}
+
+	rooms, err := c.rooms.LoadRunRooms(ctx, runID)
+	if err != nil {
+		return c.failRun(ctx, runID, "", err)
+	}
+	unavailable := candidates.unavailableCells(rooms)
+
+	// 无归属的格只记一条 WARN，不阻断：Requirement 8.5 把它定为诊断计数，
+	// 该不该让本轮失败由第二段的失败分层决定。只带计数，不带房号列表——
+	// 一条 WARN 里塞几十个房号既读不完，也会把「哪间房」这种观测细节写进日志（CP12）。
+	if candidates.orphanCells > 0 {
+		c.log.Warn("collect_run_orphan_cells",
+			slog.Int64("run_id", runID),
+			slog.Int("orphan_cells", candidates.orphanCells),
+		)
+	}
+
+	plan2 := pipeline.Plan(setup.window, buildings, unavailable)
+	progress2, err := pipeline.Run(ctx, runID, buildings, plan2.Tasks, c.runDeps(fetch))
+	if err != nil {
+		return c.failRun(ctx, runID, "", err)
+	}
+
+	dropped := progress2.Dropped()
+	status2, _, err := pipeline.EvaluateRun(ctx, c.phases, runID, dropped)
+	if err != nil {
+		return c.failRun(ctx, runID, "", err)
+	}
+	if status2 == pipeline.StatusFailed {
+		return c.closeRun(ctx, runID, dropped)
+	}
+
+	// status2 是 success 或 partial：两者都进入发布，由第 10 项接续
+	// （AdvancePhase(validate) → Build → Validate → Commit）。本项到此返回，
+	// 轮次保持 running，不提前收口。
+	return nil
+}
+
+// runDeps 组装一段 pipeline.Run 需要的依赖：任务、归属、阶段三个仓储与时钟，
+// Fetch 由调用方指定——两段用的是同一个 taskFetcher（按任务种类分派），
+// 这里保留形参是为了让「Fetch 是注入点」这件事在签名上仍然成立。
+func (c *Collector) runDeps(fetch pipeline.TaskFetcher) pipeline.RunDeps {
+	return pipeline.RunDeps{
+		Tasks:  c.tasks,
+		Rooms:  c.rooms,
+		Phases: c.phases,
+		Fetch:  fetch,
+		Clock:  c.clock,
+	}
+}
+
+// closeRun 在发布之前按失败分层收口一轮（Requirement 8.1–8.2）。
+//
+// dropped 必须与刚交给 EvaluateRun 的是同一个值：库里没有这批被归属过滤丢弃的
+// 明细任务，收口只看 sync_task 会把「明细全被丢弃」记成 success（CP7）。
+//
+// ctx 已结束时不收口：调用方取消或进程退出要求轮次保持 running，未完成任务留给
+// 下一次执行（Requirement 10.4、CP8）。收口本身失败时返回错误供 run() 记 WARN，
+// 不重试——终态只会被写一次，重试只会再撞 FinishRun 的 status='running' 守卫。
+func (c *Collector) closeRun(ctx context.Context, runID int64, dropped pipeline.DroppedTasks) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if _, err := pipeline.CloseRun(ctx, c.phases, runID, dropped, c.clock); err != nil {
+		return fmt.Errorf("轮次 %d 失败收口失败: %w", runID, err)
+	}
+	return nil
+}
+
+// whitelistEmptyReason 是 blocked 轮次的固定原因，与 runner 的 whitelistEmptyReason
+// 逐字相同：同一个业务事实（白名单为空、未发起采集）在两条写入路径上应给人看同一句话。
+// runner 的常量未导出，collector 不能引用，所以这里复制一份；两处都由 design 的错误码
+// 表约束，改名时一起改。
+const whitelistEmptyReason = "教学楼白名单为空，未发起采集"
+
+// finishBlocked 把「白名单为空」的一轮收口为 blocked（design Error Handling 表的
+// whitelist_empty 行：规划阶段白名单为空（防御）→ blocked + whitelist_empty，
+// 文案与 runner 相同）。
+//
+// 错误码与原因复刻 runner / store 的固定口径：runner 在 Start 前已经判过空白名单并建
+// blocked 轮次，走到这里只可能是两次读之间设置被清空。这个码与 store.StartBlockedRun
+// 写的是同一个值（design 错误码表），语义也相同——「白名单为空，未发起采集」。
+//
+// 它只处理「白名单为空」这一种 blocked：窗口跨度非法是 Plan 的另一条 blocked 来源，
+// 没有对应的错误码，由调用方另行收口，不借用这一句白名单文案。
+//
+// 与 finishSkipped 一样先判 ctx：取消/退出时轮次保持 running，不收口。
+func (c *Collector) finishBlocked(ctx context.Context, runID int64) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err := c.phases.FinishRun(ctx, store.RunFinish{
+		RunID:        runID,
+		Status:       string(pipeline.StatusBlocked),
+		ErrorCode:    codeWhitelistEmpty,
+		ErrorMessage: whitelistEmptyReason,
+		FinishedAt:   c.clock().In(shanghai),
+	}); err != nil {
+		return fmt.Errorf("轮次 %d 空白名单收口失败: %w", runID, err)
+	}
 	return nil
 }
 
@@ -282,7 +488,8 @@ func normalizeBuildings(entries []model.Building) []model.Building {
 	return buildings
 }
 
-// readCalendar 读学期页与周历页，返回 parser 口径的学期编号、当前教学周 C 与总周数 Y。
+// readCalendar 读学期页与周历页，返回 parser 口径的学期编号、节次模式 kbjcmsid、
+// 当前教学周 C 与总周数 Y。
 //
 // 两页都拿两份结果：upstream 的最小提取（FetchTerm / FetchWeekCalendar 带回的字段）
 // 与 parser 对同一份正文的解析。parser 是权威口径（design 第 4 步），上游的最小提取
@@ -290,22 +497,26 @@ func normalizeBuildings(entries []model.Building) []model.Building {
 // 下拉里还留着旧学期编号），此时不替页面裁决，按 calendar_invalid 结束本轮——
 // 猜错学期会把整轮观测写进错误的学期。
 //
+// kbjcmsid 与学期一起返回：它是明细请求的必填参数（upstream.OccupancyDetailParams），
+// 每次登录/学期都可能变；只在学期页解析一次、一路传给明细抓取器，不在明细阶段
+// 重新请求学期页（那会多一次往返，还可能读到不同的节次模式）。
+//
 // 返回的错误有三类：parser 的 ErrTermTextInvalid / ErrWeekTextInvalid、上游自己的
 // ErrUpstreamCalendarInvalid（缺学期编号、kbjcmsid 或周次越界），以及网络/会话错误。
 // 前两类都归属 model.ErrUpstreamCalendarInvalid，由调用方统一走 FailCalendar；
 // 第三类没有业务码。错误文案只点名哪一项不一致或缺失，不带页面正文（CP12）。
-func (c *Collector) readCalendar(ctx context.Context, at time.Time) (string, int, int, error) {
+func (c *Collector) readCalendar(ctx context.Context, at time.Time) (string, string, int, int, error) {
 	termSnapshot, err := c.upstream.FetchTerm(ctx)
 	if err != nil {
-		return "", 0, 0, err
+		return "", "", 0, 0, err
 	}
 
 	term, kbjcmsid, err := parser.TermText([]byte(termSnapshot.Raw))
 	if err != nil {
-		return "", 0, 0, err
+		return "", "", 0, 0, err
 	}
 	if term != termSnapshot.Term {
-		return "", 0, 0, fmt.Errorf("%w: 学期编号的最小提取 %q 与 parser 口径 %q 不一致",
+		return "", "", 0, 0, fmt.Errorf("%w: 学期编号的最小提取 %q 与 parser 口径 %q 不一致",
 			model.ErrUpstreamCalendarInvalid, termSnapshot.Term, term)
 	}
 	// kbjcmsid 也算比较项，不是可有可无的附带字段：它是明细请求的必填参数
@@ -314,23 +525,23 @@ func (c *Collector) readCalendar(ctx context.Context, at time.Time) (string, int
 	// 请求错位，所以和学期编号一样按 calendar_invalid 结束，而不是以 parser 为准
 	// 静默覆盖。
 	if kbjcmsid != termSnapshot.KBJCMSID {
-		return "", 0, 0, fmt.Errorf("%w: kbjcmsid 的最小提取 %q 与 parser 口径 %q 不一致",
+		return "", "", 0, 0, fmt.Errorf("%w: kbjcmsid 的最小提取 %q 与 parser 口径 %q 不一致",
 			model.ErrUpstreamCalendarInvalid, termSnapshot.KBJCMSID, kbjcmsid)
 	}
 
 	weekCalendar, err := c.upstream.FetchWeekCalendar(ctx, at)
 	if err != nil {
-		return "", 0, 0, err
+		return "", "", 0, 0, err
 	}
 
 	currentWeek, totalWeeks, err := parser.WeekText([]byte(weekCalendar.Raw))
 	if err != nil {
-		return "", 0, 0, err
+		return "", "", 0, 0, err
 	}
 	if currentWeek != weekCalendar.Week || totalWeeks != weekCalendar.TotalWeeks {
-		return "", 0, 0, fmt.Errorf("%w: 周历的最小提取（第 %d 周 / %d 周）与 parser 口径（第 %d 周 / %d 周）不一致",
+		return "", "", 0, 0, fmt.Errorf("%w: 周历的最小提取（第 %d 周 / %d 周）与 parser 口径（第 %d 周 / %d 周）不一致",
 			model.ErrUpstreamCalendarInvalid, weekCalendar.Week, weekCalendar.TotalWeeks, currentWeek, totalWeeks)
 	}
 
-	return term, currentWeek, totalWeeks, nil
+	return term, kbjcmsid, currentWeek, totalWeeks, nil
 }

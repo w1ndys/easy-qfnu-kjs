@@ -46,7 +46,7 @@
   - 不可用格：`Available == false`（含未知与复合）记入 `unavailable[(房,天,大节)]`，窗口内任一周不可用即算一格
   - 单测：同一 (楼,周) 抓两次只产生一份候选；不可用格去重跨周生效；结构失败原样返回给 `pipeline` 走任务失败路径
 
-- [ ] 8. 两段式 Plan → Run 与明细抓取
+- [x] 8. 两段式 Plan → Run 与明细抓取
   - 第一段 `Plan(window, 楼, nil)` → `Run`；第一段后 `EvaluateRun` 为 `failed` 时立即 `CloseRun` 并跳过明细（Requirement 10.7）
   - 第二段：从 `unavailable` 导出 `[]pipeline.Cell`，归属楼取 `collect_run_room`（`LoadRunRooms`），无归属的房号丢弃并计入 `orphanCells`
   - 明细：`FetchOccupancyDetail` → `parser.Occupancy` → `clean.State`，四项字段写入 `details[(房,天,大节)]`（整片覆盖）

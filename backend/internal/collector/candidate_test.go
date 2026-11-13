@@ -2,9 +2,12 @@ package collector
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/pipeline"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
 )
 
 // matrixRoomAt 造一条 parser 口径的房号行；states 是「状态格序号 → 原文」，
@@ -186,5 +189,87 @@ func TestProjectCellsWithoutRooms(t *testing.T) {
 	cells := projectCells(nil, matrixFixtureDict())
 	if len(cells) != 0 {
 		t.Fatalf("没有房号行时应返回空格子，实际 %d 个", len(cells))
+	}
+}
+
+// TestStoreDetailReplacesWholeCell 覆盖 Requirement 7.4 与 D4/CP5：同一格写两次
+// 明细只剩后一次，空响应也整片覆盖（该格没有说明是有效结果，不能留着旧说明）。
+func TestStoreDetailReplacesWholeCell(t *testing.T) {
+	candidates := newBank()
+	dict := matrixFixtureDict()
+	key := cellKey{RoomID: "R0001", Weekday: 1, Block: "0102"}
+
+	first := candidates.storeDetail(key, []model.OccupancyEntry{
+		{StateRaw: "◆", Course: "高等数学", WeekRange: "1-16", TimeFlag: "单双周"},
+		{StateRaw: "空闲", Course: "自习", WeekRange: "17"},
+	}, dict)
+	if len(first) != 2 {
+		t.Fatalf("一次响应有两条说明时应全部保留（Requirement 7.2），实际 %d 条", len(first))
+	}
+	if first[0].State.StateKey != "class" || first[0].State.Available {
+		t.Fatalf("◆ 应投影成不可用的 class，实际 %+v", first[0].State)
+	}
+	if first[1].State.StateKey != model.StateKeyFree || !first[1].State.Available {
+		t.Fatalf("空闲应投影成可用的 free，实际 %+v", first[1].State)
+	}
+
+	second := candidates.storeDetail(key, []model.OccupancyEntry{
+		{StateRaw: "空闲", Course: "临时调整", WeekRange: "9-10", TimeFlag: "双周"},
+	}, dict)
+	if len(second) != 1 || len(candidates.details[key]) != 1 {
+		t.Fatalf("同一格重放应整片覆盖，实际 %d 条：%+v", len(candidates.details[key]), candidates.details[key])
+	}
+	if got := candidates.details[key][0]; got.Course != "临时调整" || got.WeekRange != "9-10" || got.TimeFlag != "双周" {
+		t.Fatalf("覆盖后应只留后一次响应的四项字段，实际 %+v", got)
+	}
+
+	// 空响应表示「该格没有说明」，也是有效结果：必须覆盖掉旧说明。
+	candidates.storeDetail(key, nil, dict)
+	if rows, ok := candidates.details[key]; !ok || len(rows) != 0 {
+		t.Fatalf("空响应应覆盖成 0 条（键保留），实际 ok=%v rows=%+v", ok, rows)
+	}
+}
+
+// TestUnavailableCellsRewritesBuildingAndCountsOrphans 覆盖 design 未决项 2、
+// Requirement 5.3 与 8.5：不可用格的楼必须取本轮 collect_run_room 的快照，
+// 不是矩阵响应所在的楼；没有归属的房号整格丢弃并计入 orphanCells（只计数不失败）。
+// 导出顺序固定为 (房号, 星期, 大节) 升序，重复导出逐项相等。
+func TestUnavailableCellsRewritesBuildingAndCountsOrphans(t *testing.T) {
+	candidates := newBank()
+	// 页面来自 Q10，但快照把 R0001 归给 Q11；R0002 没有归属。
+	candidates.storeMatrix(weekKey{BuildingID: "Q10", Week: 9}, []byte("page"), []model.MatrixRoom{
+		matrixRoomAt("R0002", map[int]string{0: "◆"}),
+		matrixRoomAt("R0001", map[int]string{0: "◆", 1: "◆"}),
+	}, matrixFixtureDict())
+
+	rooms := []store.RunRoom{{RoomID: "R0001", BuildingID: "Q11"}}
+	cells := candidates.unavailableCells(rooms)
+	want := []pipeline.Cell{
+		{BuildingID: "Q11", RoomID: "R0001", Weekday: 1, Block: "0102"},
+		{BuildingID: "Q11", RoomID: "R0001", Weekday: 1, Block: "030405"},
+	}
+	if !slices.Equal(cells, want) {
+		t.Fatalf("导出应把楼重写成快照的 Q11、丢弃无归属的 R0002，期望 %+v，实际 %+v", want, cells)
+	}
+	if candidates.orphanCells != 1 {
+		t.Fatalf("无归属的房号应丢弃并计入 orphanCells（1 格），实际 %d", candidates.orphanCells)
+	}
+
+	// 同一份候选重复导出的结果必须逐项相等，且 orphanCells 不累加。
+	again := candidates.unavailableCells(rooms)
+	if !slices.Equal(again, want) {
+		t.Fatalf("重复导出应逐项相等，第一次 %+v，第二次 %+v", want, again)
+	}
+	if candidates.orphanCells != 1 {
+		t.Fatalf("重复导出不应累加 orphanCells，实际 %d", candidates.orphanCells)
+	}
+
+	// 没有任何归属快照时全部丢弃，不失败、返回空切片。
+	candidates.orphanCells = 0
+	if got := candidates.unavailableCells(nil); len(got) != 0 {
+		t.Fatalf("没有归属时不应导出任何格，实际 %+v", got)
+	}
+	if candidates.orphanCells != 3 {
+		t.Fatalf("没有归属时三格都应计入 orphanCells，实际 %d", candidates.orphanCells)
 	}
 }

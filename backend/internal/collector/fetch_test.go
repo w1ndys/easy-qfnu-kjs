@@ -148,12 +148,13 @@ func (u *matrixUpstream) FetchWeekMatrix(_ context.Context, params upstream.Week
 	return body, nil
 }
 
-// newMatrixFetcher 组装「只有上游」的执行器并返回周矩阵抓取闭包。
+// newTaskFetcher 组装「只有上游」的执行器并返回统一的任务抓取闭包。
 // 抓取器只读 c.upstream 与注入的快照/候选，其余依赖不参与，所以不必走 New。
-func newMatrixFetcher(t *testing.T, u *matrixUpstream, snapshot store.CollectSnapshot, candidates *bank) pipeline.TaskFetcher {
+// 用例按任务种类走分派，不直接调矩阵/明细两条私有路径——它们的入口就是这层分派。
+func newTaskFetcher(t *testing.T, u upstreamAPI, snapshot store.CollectSnapshot, candidates *bank) pipeline.TaskFetcher {
 	t.Helper()
 	c := &Collector{upstream: u}
-	return c.weekMatrixTaskFetcher("2026-2027-1", snapshot, candidates)
+	return c.taskFetcher("2026-2027-1", "01", snapshot, candidates)
 }
 
 // matrixTask 造一条周矩阵任务。
@@ -204,7 +205,7 @@ func TestWeekMatrixFetcherCachesPagePerBuildingWeek(t *testing.T) {
 	})))
 	u := &matrixUpstream{bodies: map[upstream.WeekMatrixParams][]byte{params: body}}
 	candidates := newBank()
-	fetch := newMatrixFetcher(t, u, matrixFixtureSnapshot(), candidates)
+	fetch := newTaskFetcher(t, u, matrixFixtureSnapshot(), candidates)
 
 	task := matrixTask("Q10", 9)
 	first, err := fetch(context.Background(), task)
@@ -279,7 +280,7 @@ func TestWeekMatrixFetcherDedupesUnavailableAcrossWeeks(t *testing.T) {
 		week10: []byte(matrixFixturePage(matrixDataRow("R0001", map[int]string{0: "◆", 2: "空闲", 3: "", 5: "◆"}))),
 	}}
 	candidates := newBank()
-	fetch := newMatrixFetcher(t, u, matrixFixtureSnapshot(), candidates)
+	fetch := newTaskFetcher(t, u, matrixFixtureSnapshot(), candidates)
 
 	for _, task := range []pipeline.Task{matrixTask("Q10", 9), matrixTask("Q10", 10)} {
 		if _, err := fetch(context.Background(), task); err != nil {
@@ -349,7 +350,7 @@ func TestWeekMatrixFetcherReturnsStructureError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			u := &matrixUpstream{bodies: map[upstream.WeekMatrixParams][]byte{params: []byte(tc.body)}}
 			candidates := newBank()
-			fetch := newMatrixFetcher(t, u, tc.snapshot, candidates)
+			fetch := newTaskFetcher(t, u, tc.snapshot, candidates)
 
 			_, err := fetch(context.Background(), matrixTask("Q10", 9))
 			if !errors.Is(err, tc.want) {
@@ -373,24 +374,82 @@ func TestWeekMatrixFetcherReturnsStructureError(t *testing.T) {
 	}
 }
 
-// TestWeekMatrixFetcherRejectsOtherTaskKinds 钉住抓取闭包的边界：它只服务周矩阵段，
-// 混进明细任务说明两段式编排接错了，应该直接报错而不是拿矩阵参数去打一次上游。
-func TestWeekMatrixFetcherRejectsOtherTaskKinds(t *testing.T) {
-	u := &matrixUpstream{}
-	fetch := newMatrixFetcher(t, u, matrixFixtureSnapshot(), newBank())
+// dispatchUpstream 同时实现矩阵与明细两条上游路径，供「按种类分派」的用例观测
+// 每个任务实际走了哪条路径。内嵌 upstreamAPI 只为凑齐方法集：分派之外的任何
+// 上游能力一旦被碰会因 nil 而 panic。
+type dispatchUpstream struct {
+	upstreamAPI
+	matrixBody  []byte
+	detailBody  []byte
+	matrixCalls []upstream.WeekMatrixParams
+	detailCalls []upstream.OccupancyDetailParams
+}
 
-	_, err := fetch(context.Background(), pipeline.Task{
-		Kind:       pipeline.TaskCellDetail,
-		BuildingID: "Q10",
-		RoomID:     "R0001",
-		Weekday:    1,
-		Block:      "0102",
-	})
-	if err == nil {
-		t.Fatal("明细任务不应交给周矩阵抓取器")
+// FetchWeekMatrix 返回预置的矩阵正文并记入参。
+func (u *dispatchUpstream) FetchWeekMatrix(_ context.Context, params upstream.WeekMatrixParams) ([]byte, error) {
+	u.matrixCalls = append(u.matrixCalls, params)
+	return u.matrixBody, nil
+}
+
+// FetchOccupancyDetail 返回预置的明细正文并记入参。
+func (u *dispatchUpstream) FetchOccupancyDetail(_ context.Context, params upstream.OccupancyDetailParams) ([]byte, error) {
+	u.detailCalls = append(u.detailCalls, params)
+	return u.detailBody, nil
+}
+
+// TestTaskFetcherDispatchesByKind 钉住统一抓取器的分派：周矩阵任务走矩阵路径、
+// 占用说明任务走明细路径、未知种类明确报错且不碰任何上游。
+//
+// 这条用例替代了「两个闭包各自拒绝对方的任务」——按段各给一个闭包的旧形状会让
+// 第一段拿到库里遗留的 pending 明细任务时把它拒成永久 failed（Requirement 8.1、
+// 10.4），分派后同一个闭包在任何一段都能把两种任务各走各的路。
+func TestTaskFetcherDispatchesByKind(t *testing.T) {
+	matrixBody := []byte(matrixFixturePage(matrixDataRow("R0001", nil)))
+	detailBody := detailFixturePage(detailFieldRow("教室状态：", "空闲"))
+	u := &dispatchUpstream{matrixBody: matrixBody, detailBody: detailBody}
+	candidates := newBank()
+	fetch := newTaskFetcher(t, u, matrixFixtureSnapshot(), candidates)
+
+	fetched, err := fetch(context.Background(), matrixTask("Q10", 9))
+	if err != nil {
+		t.Fatalf("周矩阵任务应走矩阵路径，实际 err=%v", err)
 	}
-	if len(u.calls) != 0 {
-		t.Fatalf("拒绝的任务不应请求上游，实际 %d 次", len(u.calls))
+	wantMatrix := upstream.WeekMatrixParams{Term: "2026-2027-1", BuildingID: "Q10", Week: 9}
+	if len(u.matrixCalls) != 1 || u.matrixCalls[0] != wantMatrix {
+		t.Fatalf("矩阵入参期望 %+v，实际 %+v", wantMatrix, u.matrixCalls)
+	}
+	if len(u.detailCalls) != 0 {
+		t.Fatalf("矩阵任务不应碰明细上游，实际 %+v", u.detailCalls)
+	}
+	if !bytes.Equal(fetched.Page, matrixBody) {
+		t.Fatal("矩阵正文应原样带回（pipeline 要用它算 sha256）")
+	}
+
+	if _, err := fetch(context.Background(), detailTask("R0001", 1, "0102")); err != nil {
+		t.Fatalf("明细任务应走明细路径，实际 err=%v", err)
+	}
+	wantDetail := upstream.OccupancyDetailParams{
+		Term: "2026-2027-1", KBJCMSID: "01",
+		RoomID: "R0001", Weekday: 1, BigSlot: "0102",
+	}
+	if len(u.detailCalls) != 1 || u.detailCalls[0] != wantDetail {
+		t.Fatalf("明细入参期望 %+v，实际 %+v", wantDetail, u.detailCalls)
+	}
+	if len(u.matrixCalls) != 1 {
+		t.Fatalf("明细任务不应碰矩阵上游，实际 %+v", u.matrixCalls)
+	}
+	if len(candidates.pages) != 1 || len(candidates.details) != 1 {
+		t.Fatalf("两条路径应各留一份候选，实际 pages=%d details=%d",
+			len(candidates.pages), len(candidates.details))
+	}
+
+	// 未知种类：明确报错，且两种上游都不请求。
+	if _, err := fetch(context.Background(), pipeline.Task{Kind: pipeline.TaskKind("unknown")}); err == nil {
+		t.Fatal("未知任务种类应报错")
+	}
+	if len(u.matrixCalls) != 1 || len(u.detailCalls) != 1 {
+		t.Fatalf("未知种类不应请求上游，实际矩阵 %d 次、明细 %d 次",
+			len(u.matrixCalls), len(u.detailCalls))
 	}
 }
 
@@ -402,7 +461,7 @@ func TestWeekMatrixFetcherAcceptsHeaderOnlyPage(t *testing.T) {
 	body := []byte(matrixFixturePage())
 	u := &matrixUpstream{bodies: map[upstream.WeekMatrixParams][]byte{params: body}}
 	candidates := newBank()
-	fetch := newMatrixFetcher(t, u, matrixFixtureSnapshot(), candidates)
+	fetch := newTaskFetcher(t, u, matrixFixtureSnapshot(), candidates)
 
 	fetched, err := fetch(context.Background(), matrixTask("Q99", 9))
 	if err != nil {
@@ -431,7 +490,7 @@ func TestWeekMatrixFetcherPropagatesUpstreamError(t *testing.T) {
 	upstreamErr := fmt.Errorf("%w: 读取第 9 周矩阵超时", model.ErrUpstreamFailed)
 	u := &matrixUpstream{errs: map[upstream.WeekMatrixParams]error{params: upstreamErr}}
 	candidates := newBank()
-	fetch := newMatrixFetcher(t, u, matrixFixtureSnapshot(), candidates)
+	fetch := newTaskFetcher(t, u, matrixFixtureSnapshot(), candidates)
 
 	_, err := fetch(context.Background(), matrixTask("Q10", 9))
 	if !errors.Is(err, model.ErrUpstreamFailed) {
@@ -461,5 +520,159 @@ func TestMatrixFixtureCoversSeedOrder(t *testing.T) {
 	row := matrixDataRow("R0001", nil)
 	if got, want := strings.Count(row, "<td"), 1+7*len(matrixFixtureBlocks); got != want {
 		t.Fatalf("数据行应有 %d 个 td，实际 %d 个", want, got)
+	}
+}
+
+// detailUpstream 是只实现 FetchOccupancyDetail 的假上游：按调用次序回放预置正文或
+// 错误，并记下每次入参。内嵌 upstreamAPI 只为凑齐方法集——明细路径一旦碰别的上游
+// 能力就会因 nil 而 panic。
+type detailUpstream struct {
+	upstreamAPI
+	bodies [][]byte
+	errs   []error
+	calls  []upstream.OccupancyDetailParams
+}
+
+// FetchOccupancyDetail 返回第 index 次预置结果；没预置时按夹具缺口报错，
+// 免得「忘了预置」被当成一次普通网络失败混过去。
+func (u *detailUpstream) FetchOccupancyDetail(_ context.Context, params upstream.OccupancyDetailParams) ([]byte, error) {
+	index := len(u.calls)
+	u.calls = append(u.calls, params)
+	if index < len(u.errs) && u.errs[index] != nil {
+		return nil, u.errs[index]
+	}
+	if index < len(u.bodies) {
+		return u.bodies[index], nil
+	}
+	return nil, fmt.Errorf("测试未预置第 %d 次明细响应（%+v）", index+1, params)
+}
+
+// detailTask 造一条占用说明任务。BuildingID 只是规划产物，明细请求本身不用它。
+func detailTask(roomID string, weekday int, block string) pipeline.Task {
+	return pipeline.Task{
+		Kind:       pipeline.TaskCellDetail,
+		Required:   false,
+		BuildingID: "Q10",
+		RoomID:     roomID,
+		Weekday:    weekday,
+		Block:      block,
+	}
+}
+
+// detailFixturePage 拼一张明细页（标题表 + 表单里的三列字段行），结构与 parser 的夹具一致。
+// 这是本包唯一一份明细页夹具：抓取器用例与两段式编排用例都复用它，避免两份结构各改一半。
+func detailFixturePage(fieldRows ...string) []byte {
+	var b strings.Builder
+	b.WriteString(`<html><body>`)
+	b.WriteString(`<table id="tab1"><tr><td class="toolstitle">教室占用情况</td></tr></table>`)
+	b.WriteString(`<form action="/jsxsd/jspyfa/selectJx02"><table border="1"><tr><td><table border="0">`)
+	for _, row := range fieldRows {
+		b.WriteString(row)
+	}
+	b.WriteString(`</table></td></tr></table></form></body></html>`)
+	return []byte(b.String())
+}
+
+// detailFieldRow 拼一行合法字段：标签 / 空列 / 值。
+func detailFieldRow(label, value string) string {
+	return `<tr><td width="173" align="right">` + label + `</td>` +
+		`<td width="9"></td><td width="560">` + value + `</td></tr>`
+}
+
+// TestCellDetailFetcherStoresFourFieldsAndOverwrites 覆盖 Requirement 7.1–7.4：
+// 明细页经 parser.Occupancy → clean.State 后，四项字段（状态、课程、周次范围、
+// 时间标志）写进 details[(房,天,大节)]；同一格重放整片覆盖，不追加第二份。
+func TestCellDetailFetcherStoresFourFieldsAndOverwrites(t *testing.T) {
+	firstPage := detailFixturePage(
+		detailFieldRow("教室状态：", "◆"),
+		detailFieldRow("课程：", "高等数学"),
+		detailFieldRow("周次：", "1-16"),
+		detailFieldRow("时间标志：", "单双周"),
+		detailFieldRow("教室状态：", "空闲"),
+		detailFieldRow("课程：", "自习"),
+		detailFieldRow("周次：", "17"),
+		detailFieldRow("时间标志：", ""),
+	)
+	secondPage := detailFixturePage(
+		detailFieldRow("教室状态：", "空闲"),
+		detailFieldRow("课程：", "临时调整"),
+		detailFieldRow("周次：", "9-10"),
+		detailFieldRow("时间标志：", "双周"),
+	)
+
+	params := upstream.OccupancyDetailParams{
+		Term:     "2026-2027-1",
+		KBJCMSID: "01",
+		RoomID:   "R0001",
+		Weekday:  1,
+		BigSlot:  "0102",
+	}
+	u := &detailUpstream{bodies: [][]byte{firstPage, secondPage}}
+	candidates := newBank()
+	fetch := newTaskFetcher(t, u, matrixFixtureSnapshot(), candidates)
+
+	fetched, err := fetch(context.Background(), detailTask("R0001", 1, "0102"))
+	if err != nil {
+		t.Fatalf("第一次明细抓取应成功，实际 err=%v", err)
+	}
+	if len(fetched.Page) != 0 || len(fetched.Rooms) != 0 {
+		t.Fatalf("明细抓取不应把正文或房号行交给执行循环，实际 %+v", fetched)
+	}
+	if len(u.calls) != 1 || u.calls[0] != params {
+		t.Fatalf("明细入参期望 %+v，实际 %+v", params, u.calls)
+	}
+
+	key := cellKey{RoomID: "R0001", Weekday: 1, Block: "0102"}
+	rows := candidates.details[key]
+	if len(rows) != 2 {
+		t.Fatalf("一格的两条说明都应保留（Requirement 7.2），实际 %d 条：%+v", len(rows), rows)
+	}
+	if rows[0].State.StateKey != "class" || rows[0].State.Available {
+		t.Fatalf("◆ 应投影成不可用的 class，实际 %+v", rows[0].State)
+	}
+	if rows[0].State.RawText != "◆" {
+		t.Fatalf("状态原文应原样保留，实际 %q", rows[0].State.RawText)
+	}
+	if rows[0].Course != "高等数学" || rows[0].WeekRange != "1-16" || rows[0].TimeFlag != "单双周" {
+		t.Fatalf("四项字段应原样写入，实际 %+v", rows[0])
+	}
+	if rows[1].State.StateKey != model.StateKeyFree || !rows[1].State.Available {
+		t.Fatalf("空闲应投影成可用的 free，实际 %+v", rows[1].State)
+	}
+
+	// 同一格第二次抓取：整片覆盖，不追加。
+	if _, err := fetch(context.Background(), detailTask("R0001", 1, "0102")); err != nil {
+		t.Fatalf("第二次明细抓取应成功，实际 err=%v", err)
+	}
+	rows = candidates.details[key]
+	if len(rows) != 1 {
+		t.Fatalf("同一格重放应整片覆盖，实际留下 %d 条：%+v", len(rows), rows)
+	}
+	if rows[0].Course != "临时调整" || rows[0].WeekRange != "9-10" || rows[0].TimeFlag != "双周" {
+		t.Fatalf("重放应只留后一次响应，实际 %+v", rows[0])
+	}
+}
+
+// TestCellDetailFetcherReturnsStructureError 覆盖 Requirement 7.3：明细页连标题表都
+// 没有时原样返回 parser 的结构失败哨兵，且什么都不写进 details（坏结果不能冒充已抓）。
+func TestCellDetailFetcherReturnsStructureError(t *testing.T) {
+	u := &detailUpstream{bodies: [][]byte{[]byte(`<html><body>不是明细页</body></html>`)}}
+	candidates := newBank()
+	fetch := newTaskFetcher(t, u, matrixFixtureSnapshot(), candidates)
+
+	_, err := fetch(context.Background(), detailTask("R0002", 2, "030405"))
+	if !errors.Is(err, parser.ErrDetailStructureInvalid) {
+		t.Fatalf("结构失败应原样返回 ErrDetailStructureInvalid，实际 %v", err)
+	}
+	if len(candidates.details) != 0 {
+		t.Fatalf("结构失败时不应写入明细候选，实际 %+v", candidates.details)
+	}
+
+	// 坏页面不进缓存：再抓一次仍会请求上游。
+	if _, err := fetch(context.Background(), detailTask("R0002", 2, "030405")); err == nil {
+		t.Fatal("结构失败后重复抓取仍应失败")
+	}
+	if len(u.calls) != 2 {
+		t.Fatalf("坏页面不应被当成已抓，期望重试仍请求上游（2 次），实际 %d 次", len(u.calls))
 	}
 }
