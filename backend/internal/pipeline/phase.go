@@ -414,3 +414,39 @@ func FailCalendar(ctx context.Context, phases PhaseStore, runID int64, cause err
 		FinishedAt:   nowIn(clock),
 	})
 }
+
+// failRunDefaultMessage 是 FailRun 在 cause 为 nil 时写进 error_message 的固定说明：
+// 只给错误码、没有原始错误可引用时，库里仍要有一条可读原因，不把空串落库。
+const failRunDefaultMessage = "采集执行失败，未提供失败原因"
+
+// FailRun 把一轮按失败收口：status=failed、phase=finished、finished_at、可空的
+// error_code 与原因（本 spec design 的「错误码」表）。
+//
+// 与 FailCalendar 的区别只在于错误码由调用方给：学期/周历失败固定
+// calendar_invalid，仍走 FailCalendar；这里给的是执行器判定的失败层
+// （settings_incomplete / auth_failed / ocr_failed / validation_blocked），
+// 网络、超时、发布事务失败这类没有对应业务码，传空串。
+//
+// code 两侧空白先去掉：空串（含纯空白）交给 store.FinishRun 的 NULLIF
+// 折成 NULL，与「非结构失败不编码」同一口径，也不在库里留一个只有空白的码。
+// cause 的原因原样写进 error_message；cause 为 nil 时写固定说明，不把空原因落库。
+//
+// 已收口的轮次由 store.FinishRun 的 status='running' 守卫挡住并报错：本函数不吞
+// 这个错误，也不在失败时改写第一次写下的终态。
+func FailRun(ctx context.Context, phases PhaseStore, runID int64, code string, cause error, clock Clock) error {
+	if phases == nil {
+		return errors.New("pipeline: 缺少阶段仓储")
+	}
+
+	message := failRunDefaultMessage
+	if cause != nil {
+		message = cause.Error()
+	}
+	return phases.FinishRun(ctx, store.RunFinish{
+		RunID:        runID,
+		Status:       string(StatusFailed),
+		ErrorCode:    strings.TrimSpace(code),
+		ErrorMessage: message,
+		FinishedAt:   nowIn(clock),
+	})
+}

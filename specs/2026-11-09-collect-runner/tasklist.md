@@ -10,7 +10,7 @@
   - `pipeline.RecordTerm` 拒绝空学期、`pipeline.RecordWindow` 拒绝空窗与跨度 > 4 周的窗口，两者都不落库
   - 单测：替身 queryer 钉住三条 SQL 的列与守卫；`RecordWindow` 的 5 个边界（空窗、4 周、5 周、已收口、正常）
 
-- [ ] 2. 失败收口与错误码
+- [x] 2. 失败收口与错误码
   - `pipeline.FailRun(ctx, phases, runID, code, cause, clock)` 写 `failed` / `phase=finished` / `finished_at` / `error_code`（空串折 NULL）/ `error_message`（`cause` 为 nil 时固定文案）
   - 错误码常量固定在 `collector`（`settings_incomplete`、`auth_failed`、`ocr_failed`、`validation_blocked`），与 `pipeline` 既有的四个结构失败码不重名、不重复写入
   - 单测：正常写、空码写 NULL、`cause` 为 nil 的固定文案、已收口轮次报错

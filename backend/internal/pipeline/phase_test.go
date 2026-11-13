@@ -662,6 +662,112 @@ func TestFailCalendarRequiresPhaseStore(t *testing.T) {
 	}
 }
 
+// TestFailRunWritesFailedTerminalState 覆盖任务原文第一句的「正常写」：终态 failed、
+// 轮次编号、错误码、cause 原文与收口时刻都交给仓储；phase=finished 与空码折 NULL
+// 由 store.FinishRun 的 SQL 负责，不在 Go 侧重写一遍。
+func TestFailRunWritesFailedTerminalState(t *testing.T) {
+	now := shanghaiMorning()
+	cause := errors.New("账号或密码未配置")
+	phases := &phaseStoreStub{}
+
+	if err := FailRun(context.Background(), phases, 9, "settings_incomplete", cause, fixedClock(now)); err != nil {
+		t.Fatalf("失败收口不应报错，实际 %v", err)
+	}
+	if phases.finish == nil {
+		t.Fatal("失败收口必须写终态")
+	}
+	finish := *phases.finish
+	if finish.RunID != 9 || finish.Status != string(StatusFailed) {
+		t.Fatalf("终态入参不符: %+v", finish)
+	}
+	if finish.ErrorCode != "settings_incomplete" {
+		t.Fatalf("error_code 期望 settings_incomplete，实际 %q", finish.ErrorCode)
+	}
+	if finish.ErrorMessage != cause.Error() {
+		t.Fatalf("失败原因应原样落库，期望 %q，实际 %q", cause.Error(), finish.ErrorMessage)
+	}
+	if !finish.FinishedAt.Equal(now) {
+		t.Fatalf("收口时刻期望 %s，实际 %s", now, finish.FinishedAt)
+	}
+}
+
+// TestFailRunWritesEmptyCodeAsNull 覆盖任务原文的「空串折 NULL」：空串与纯空白都
+// 只交给仓储一个空码（store.FinishRun 的 NULLIF 把它写成 NULL），不编一个码，
+// 也不让空白字符串混进 collect_run.error_code。
+func TestFailRunWritesEmptyCodeAsNull(t *testing.T) {
+	cases := []struct {
+		name string
+		code string
+	}{
+		{name: "空串", code: ""},
+		{name: "纯空白", code: "  \t"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			phases := &phaseStoreStub{}
+			err := FailRun(context.Background(), phases, 9, testCase.code, errors.New("发布事务失败"), fixedClock(shanghaiMorning()))
+			if err != nil {
+				t.Fatalf("无码失败收口不应报错，实际 %v", err)
+			}
+			if phases.finish == nil {
+				t.Fatal("无码失败也必须写终态")
+			}
+			if phases.finish.ErrorCode != "" {
+				t.Fatalf("码 %q 应收成空串交给 NULLIF，实际 %q", testCase.code, phases.finish.ErrorCode)
+			}
+		})
+	}
+}
+
+// TestFailRunWritesFallbackMessageWithoutCause 覆盖 cause 为 nil 的固定文案：
+// 不把空原因落库；错误码仍照传（只判出失败层、没有原始错误可引用时走这条）。
+func TestFailRunWritesFallbackMessageWithoutCause(t *testing.T) {
+	phases := &phaseStoreStub{}
+
+	if err := FailRun(context.Background(), phases, 9, "validation_blocked", nil, fixedClock(shanghaiMorning())); err != nil {
+		t.Fatalf("失败收口不应报错，实际 %v", err)
+	}
+	if phases.finish == nil {
+		t.Fatal("失败收口必须写终态")
+	}
+	finish := *phases.finish
+	if finish.ErrorMessage != failRunDefaultMessage {
+		t.Fatalf("cause 为 nil 应写固定文案 %q，实际 %q", failRunDefaultMessage, finish.ErrorMessage)
+	}
+	if finish.ErrorCode != "validation_blocked" {
+		t.Fatalf("错误码应照传，实际 %q", finish.ErrorCode)
+	}
+}
+
+// TestFailRunReportsAlreadyFinalizedRun 覆盖任务原文的「已收口轮次报错」：
+// 守卫在 store.FinishRun（WHERE status='running'），替身把它返回的错误原样上抛；
+// FailRun 必须让调用方看到这个错误，不吞成 nil，也不在失败后补写第二次终态。
+func TestFailRunReportsAlreadyFinalizedRun(t *testing.T) {
+	closed := fmt.Errorf("%w: 轮次 9 已收口（status=success），不能重复收口", model.ErrRunStoreFailed)
+	phases := &phaseStoreStub{finishErr: closed}
+
+	err := FailRun(context.Background(), phases, 9, "auth_failed", errors.New("密码错误"), fixedClock(shanghaiMorning()))
+	if !errors.Is(err, model.ErrRunStoreFailed) {
+		t.Fatalf("已收口应返回包装 ErrRunStoreFailed 的错误，实际 %v", err)
+	}
+	if !strings.Contains(err.Error(), "已收口") {
+		t.Fatalf("错误应说明轮次已收口，实际 %v", err)
+	}
+	if phases.finishCalls != 1 {
+		t.Fatalf("收口尝试应只有一次、失败后不重试，实际 %d 次", phases.finishCalls)
+	}
+}
+
+// TestFailRunRequiresPhaseStore 覆盖装配错误：没有阶段仓储时立即返回错误。
+// 守卫必须在调用 FinishRun 之前生效：nil 接口上调用方法会直接 panic，
+// 用例能跑到断言且拿到非 nil 错误，就证明仓储一次都没被调用、也没有 panic。
+func TestFailRunRequiresPhaseStore(t *testing.T) {
+	err := FailRun(context.Background(), nil, 9, "auth_failed", errors.New("密码错误"), fixedClock(shanghaiMorning()))
+	if err == nil {
+		t.Fatal("缺阶段仓储时应返回错误，且不 panic")
+	}
+}
+
 // TestRunAdvancesPhasesInOrder 覆盖任务原文第二句：执行循环把阶段从周矩阵推进到
 // 占用说明，时刻取注入时钟；阶段与任务落库共用一条事件流（minor 8），
 // 断言 week_matrix 在首条矩阵任务之前、cell_detail 在首条明细之前。

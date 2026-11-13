@@ -32,12 +32,13 @@ var (
 // 阶段写入默认不混进 taskStoreStub 的 events：两段任务的调用顺序断言不受影响；
 // 需要断言「阶段推进与任务落库的相对顺序」的用例把 events 指到同一个切片上。
 type phaseStoreStub struct {
-	phases  []phaseCall
-	codes   []errorCodeCall
-	summary store.RunTaskSummary
-	finish  *store.RunFinish
-	current Phase
-	status  string // collect_run.status；空串按 running 处理
+	phases      []phaseCall
+	codes       []errorCodeCall
+	summary     store.RunTaskSummary
+	finish      *store.RunFinish
+	finishCalls int // 收口尝试次数，供「已收口只报错、不重试」的用例断言
+	current     Phase
+	status      string // collect_run.status；空串按 running 处理
 
 	events *[]string // 与 taskStoreStub 共用的事件流；nil 时只记在 phases 里
 
@@ -113,6 +114,7 @@ func (s *phaseStoreStub) LoadRunTaskSummary(_ context.Context, _ int64) (store.R
 // FinishRun 实现 PhaseStore。
 func (s *phaseStoreStub) FinishRun(_ context.Context, finish store.RunFinish) error {
 	s.finish = &finish
+	s.finishCalls++
 	return s.finishErr
 }
 
