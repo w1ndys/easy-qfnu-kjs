@@ -312,6 +312,44 @@ func (c *Collector) failOnPanic(runID int64, cause any) {
 	c.log.Error("collect_run_panic", attrs...)
 }
 
+// failRun 把一轮按失败收口（status=failed、phase=finished、finished_at、错误码与原因），
+// 并把原因返回给 run() 记一条 WARN。
+//
+// code 为空串表示「不属于任何业务失败层」：网络、超时、写库失败都不编码，由
+// pipeline.FailRun 交给 store.FinishRun 的 NULLIF 折成 NULL（design「非结构失败不编码」）。
+//
+// ctx 已经结束时不收口：调用方取消或进程退出要求轮次保持 running，未完成任务留给
+// 下一次执行（Requirement 10.4、CP8）。先判一次 ctx 还有第二个理由——同一个 ctx 下的
+// 收口写库也必然失败，不判就会把「被取消」记成一条误导性的收口失败。
+//
+// 收口本身失败时把两个原因都带上：终态没写成是排障的一等事实，原始失败也不能丢。
+// 这里不重试第二次收口——终态只会被写一次，重试只会再撞一次 FinishRun 的
+// status='running' 守卫。
+func (c *Collector) failRun(ctx context.Context, runID int64, code string, cause error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err := pipeline.FailRun(ctx, c.phases, runID, code, cause, c.clock); err != nil {
+		return fmt.Errorf("轮次 %d 收口失败（原始失败：%w）: %w", runID, cause, err)
+	}
+	return cause
+}
+
+// failCalendar 是学期/周历失败唯一的收口入口：failed + error_code=calendar_invalid。
+//
+// 与 failRun 分开是因为 design 把这条码固定给 pipeline.FailCalendar：同一个码两条写入
+// 路径（FailRun 的覆盖写入与 FailCalendar 的固定写入）会让文案与默认消息迟早分叉。
+// 取消/退出时同样不收口，理由见 failRun。
+func (c *Collector) failCalendar(ctx context.Context, runID int64, cause error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err := pipeline.FailCalendar(ctx, c.phases, runID, cause, c.clock); err != nil {
+		return fmt.Errorf("轮次 %d 日历失败收口失败（原始失败：%w）: %w", runID, cause, err)
+	}
+	return cause
+}
+
 // panicLogValue 把 recover 到的值折成一行可安全落日志的文本：类型名 + 值的字符串形式，
 // 值超过 maxPanicLogRunes 个字符时按 rune 截断。
 //
