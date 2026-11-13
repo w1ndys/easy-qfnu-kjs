@@ -21,7 +21,7 @@
   - `collector` 侧的锚点纯函数：第 1 周周一 = 采样日所在周周一 − 7×(C−1)，按 `Asia/Shanghai`（固定 +08:00）
   - 集成（真实库）：首次写入 16 周、重复写入行数与日期不变、学期缩短时删掉尾部、锚点冲突时零变更
 
-- [ ] 4. 字典与轴快照读取
+- [x] 4. 字典与轴快照读取
   - `store.LoadCollectSnapshot` 取 `dict` / `axis` 的最大版本，返回 `DictVersion`、`model.Dict`（Symbols + States）、`AxisVersion`、`[]model.AxisNode`（按 `ordinal` 升序）
   - 没有版本行时返回包装 `model.ErrQueryFailed` 的错误，不返回空快照
   - 单测：最大版本选择、两表逐行映射、`ordinal` 排序、空表报错
