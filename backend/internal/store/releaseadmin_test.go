@@ -135,6 +135,18 @@ func assignReleaseAdminValue(dest any, value any) error {
 			return fmt.Errorf("期望 time.Time 或 nil，实际 %T", value)
 		}
 		*d = &v
+	case **string:
+		// 可空字符串列（分页明细的 from_state / to_state / 归属字段）：nil 落成 nil
+		// 指针，非 nil 分配一个新指针，断言时用 reflect.DeepEqual 比较指向的值。
+		if value == nil {
+			*d = nil
+			return nil
+		}
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("期望 string 或 nil，实际 %T", value)
+		}
+		*d = &v
 	default:
 		return fmt.Errorf("目标类型 %T 不被替身支持", dest)
 	}
@@ -663,18 +675,33 @@ func TestLoadReleaseDetailScanErrorWraps(t *testing.T) {
 	}
 }
 
-// releaseDiffQuerierStub 是 releaseDiffQuerier 的替身：按 SQL 常量分派「两侧版本头」
-// 与「汇总」两类单行读，并记下调用顺序与参数。
+// releaseDiffQuerierStub 是 releaseDiffQuerier 的替身：按 SQL 常量分派「两侧版本头」、
+// 「汇总」与「三类分页」读，并记下调用顺序与参数。
 //
 // heads 按 release_id 回放：键不存在时回 pgx.ErrNoRows，这样「缺一版」走的是与真实库
 // 完全相同的那条分支，不需要在测试里伪造一个特例。
+//
+// page* 只保留最后一次分页调用：一个用例只会命中一个小节，区分「哪个 SQL 被调用」
+// 比记录一串调用更有用（同时被调用两个小节就是 bug）。三类 rows 为 nil 时回放空行集，
+// 这样只断言汇总的老用例不必为分页再铺一份数据。
 type releaseDiffQuerierStub struct {
 	heads   map[string]pgx.Row // 按 release_id 回放版本头；缺键即「这一版不存在」
 	summary pgx.Row            // 汇总单行
 
+	cells     pgx.Rows // section=cells 的一页
+	cellsErr  error
+	rooms     pgx.Rows // section=rooms 的一页
+	roomsErr  error
+	buildings pgx.Rows // section=buildings 的一页
+	bldErr    error
+
 	headIDs     []string // 依次收到的版本头参数，用来断言 from 先于 to
 	summaryArgs []any    // 汇总语句收到的参数，顺序为 (from 轴版本, from 版, to 轴版本, to 版)
 	summaryRead bool     // 汇总是否被读过：缺一版时它必须一次都不被读
+
+	pageSQL  string // 最后一次分页调用的 SQL 常量值
+	pageArgs []any  // 最后一次分页调用的参数
+	pageRead bool   // 分页是否被读过：缺一版或汇总失败时它必须一次都不被读
 }
 
 // QueryRow 按 SQL 常量分派：两侧头与汇总都是单行读。
@@ -697,9 +724,35 @@ func (s *releaseDiffQuerierStub) QueryRow(_ context.Context, sql string, args ..
 	}
 }
 
-// releaseDiffTxStub 是 pgx.Tx 的替身：事务体内的单行读转发给查询替身，Rollback 由
-// Diff 的 defer 调用（只读事务也靠它结束快照并归还连接），其余方法嵌入接口、调用
-// 即 panic，避免替身放行被测路径之外的行为。
+// Query 按 SQL 常量分派三类分页；记录最后一次的 SQL 与参数。
+func (s *releaseDiffQuerierStub) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+	s.pageSQL = sql
+	s.pageArgs = append([]any(nil), args...)
+	s.pageRead = true
+	switch sql {
+	case releaseDiffCellsPageSQL:
+		if s.cells == nil {
+			return &releaseAdminRowsStub{}, s.cellsErr
+		}
+		return s.cells, s.cellsErr
+	case releaseDiffRoomsPageSQL:
+		if s.rooms == nil {
+			return &releaseAdminRowsStub{}, s.roomsErr
+		}
+		return s.rooms, s.roomsErr
+	case releaseDiffBuildingsPageSQL:
+		if s.buildings == nil {
+			return &releaseAdminRowsStub{}, s.bldErr
+		}
+		return s.buildings, s.bldErr
+	default:
+		panic("未知的多行读语句")
+	}
+}
+
+// releaseDiffTxStub 是 pgx.Tx 的替身：事务体内的读转发给查询替身，Rollback 由
+// Diff 的 defer 调用（只读事务也靠它结束快照并归还连接），其余方法嵌入接口、
+// 调用即 panic，避免替身放行被测路径之外的行为。
 type releaseDiffTxStub struct {
 	pgx.Tx
 	querier    *releaseDiffQuerierStub
@@ -709,6 +762,11 @@ type releaseDiffTxStub struct {
 // QueryRow 转发给查询替身，服务两侧头与汇总。
 func (s *releaseDiffTxStub) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return s.querier.QueryRow(ctx, sql, args...)
+}
+
+// Query 转发给查询替身，服务三类分页。
+func (s *releaseDiffTxStub) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return s.querier.Query(ctx, sql, args...)
 }
 
 // Rollback 记下收尾调用；只读事务不需要提交，回滚与提交等价。
@@ -843,9 +901,9 @@ func TestReleaseDiffSQLClauses(t *testing.T) {
 }
 
 // TestReleaseAdminRepoDiffOpensRepeatableReadReadOnlyTx 覆盖对比的事务外观：
-// REPEATABLE READ 让两侧头与汇总看同一快照（CP7），READ ONLY 让误写直接失败（CP2）；
-// 顺序固定为「from 头 → to 头 → 汇总」，汇总参数取自读回的头而不是外部入参，
-// 结束后 Rollback 收尾。
+// REPEATABLE READ 让两侧头、汇总与分页明细看同一快照（CP7），READ ONLY 让误写直接
+// 失败（CP2）；顺序固定为「from 头 → to 头 → 汇总 → 分页」，汇总参数取自读回的头
+// 而不是外部入参，分页也走同一个事务（而不是回到连接池另开一次读），结束后 Rollback 收尾。
 func TestReleaseAdminRepoDiffOpensRepeatableReadReadOnlyTx(t *testing.T) {
 	from, to := releaseDiffFromSide(), releaseDiffToSide()
 	querier := &releaseDiffQuerierStub{
@@ -878,6 +936,18 @@ func TestReleaseAdminRepoDiffOpensRepeatableReadReadOnlyTx(t *testing.T) {
 	if fmt.Sprint(querier.summaryArgs) != fmt.Sprint(wantArgs) {
 		t.Fatalf("汇总参数应取自两侧头（轴版本, 版本, 轴版本, 版本），got %v want %v",
 			querier.summaryArgs, wantArgs)
+	}
+	// 分页明细也必须走同一个事务：回到连接池另开一次读就会换快照（CP7）。
+	// 缺省参数按 cells/all/50/0 下推。
+	if !querier.pageRead {
+		t.Fatal("汇总之后必须读所选小节的分页")
+	}
+	if querier.pageSQL != releaseDiffCellsPageSQL {
+		t.Fatalf("缺省 section 应读 cells 分页，实际 %q", querier.pageSQL)
+	}
+	wantPageArgs := []any{from.AxisVersion, from.ReleaseID, to.AxisVersion, to.ReleaseID, "all", 50, 0}
+	if fmt.Sprint(querier.pageArgs) != fmt.Sprint(wantPageArgs) {
+		t.Fatalf("分页参数不符: got %v want %v", querier.pageArgs, wantPageArgs)
 	}
 
 	if pool.txOptions.IsoLevel != pgx.RepeatableRead {
@@ -1085,5 +1155,562 @@ func TestReleaseAdminRepoDiffSummaryScanErrorWraps(t *testing.T) {
 	}
 	if !reflect.DeepEqual(diff, ReleaseDiff{}) {
 		t.Fatalf("失败时应返回零值，实际 %+v", diff)
+	}
+}
+
+// releaseAdminPtr 返回字符串指针，用来构造可空字段的期望值；同包的
+// releaseadmin_integration_test.go 也用它拼两版夹具的期望行。
+//
+// 不能直接对字面量取址：每次取址都是不同指针，断言必须比较指向的值而不是地址，
+// 因此期望值也走 reflect.DeepEqual（它会递归比较指针指向的内容）。
+func releaseAdminPtr(value string) *string { return &value }
+
+// releaseDiffCellValues 是 cells 分页一行的值序列，列序与 releaseDiffCellsPageSQL 一致。
+func releaseDiffCellValues(row DiffCellRow) []any {
+	var fromState, toState, fromBuilding, toBuilding any
+	if row.FromState != nil {
+		fromState = *row.FromState
+	}
+	if row.ToState != nil {
+		toState = *row.ToState
+	}
+	if row.FromBuilding != nil {
+		fromBuilding = *row.FromBuilding
+	}
+	if row.ToBuilding != nil {
+		toBuilding = *row.ToBuilding
+	}
+	return []any{
+		string(row.Kind), row.RoomID, int16(row.Week), int16(row.Weekday), row.Block,
+		fromState, toState, row.RoomName, fromBuilding, toBuilding,
+	}
+}
+
+// releaseDiffRoomValues 是 rooms 分页一行的值序列，列序与 releaseDiffRoomsPageSQL 一致。
+func releaseDiffRoomValues(row DiffRoomRow) []any {
+	var fromBuilding, fromName, toBuilding, toName any
+	if row.FromBuilding != nil {
+		fromBuilding = *row.FromBuilding
+	}
+	if row.FromBuildingName != nil {
+		fromName = *row.FromBuildingName
+	}
+	if row.ToBuilding != nil {
+		toBuilding = *row.ToBuilding
+	}
+	if row.ToBuildingName != nil {
+		toName = *row.ToBuildingName
+	}
+	return []any{
+		string(row.Kind), row.RoomID, row.RoomName,
+		fromBuilding, fromName, toBuilding, toName,
+	}
+}
+
+// releaseDiffBuildingValues 是 buildings 分页一行的值序列，列序与
+// releaseDiffBuildingsPageSQL 的 `SELECT p.*, room_name` 一致。
+func releaseDiffBuildingValues(row DiffBuildingRow) []any {
+	return []any{
+		row.RoomID,
+		row.FromBuilding, row.FromBuildingName,
+		row.ToBuilding, row.ToBuildingName,
+		row.RoomName,
+	}
+}
+
+// releaseDiffPageSummaryRow 是一条合法的汇总单行，默认值供分页用例铺底。
+func releaseDiffPageSummaryRow() []any {
+	return releaseDiffSummaryRow(1, 2, 4, 2, 1, 0, 0, 1, 1, 2, 6, 1)
+}
+
+// TestReleaseDiffPageSQLClauses 锁定三节分页语句的共同口径：
+// 固定排序键、LIMIT/OFFSET、分页语句不数行（total 由汇总推导，CP6）。
+func TestReleaseDiffPageSQLClauses(t *testing.T) {
+	// cells 复用折叠 CTE（与汇总同一口径），且只取差异行、kind 走参数等值过滤。
+	if !strings.HasPrefix(releaseDiffCellsPageSQL, releaseDiffFoldCTE) {
+		t.Fatal("cells 分页必须以同一段折叠 CTE 开头")
+	}
+	cellsClauses := []string{
+		"kind <> 'same'",                         // 未变格不进明细
+		"$5 = 'all'",                             // kind=all 不过滤
+		"kind = $5",                              // 其余取值等值过滤
+		"ORDER BY room_id, week, weekday, block", // 页内固定排序键
+		"ORDER BY p.room_id, p.week, p.weekday, p.block",   // JOIN 后重排，翻页才稳定
+		"LIMIT $6 OFFSET $7",                               // 页大小与偏移
+		"COALESCE(r.name, '') AS room_name",                // 教室目录缺行时给空串
+		"ON fb.release_id = $2 AND fb.room_id = p.room_id", // from 侧归属楼
+		"ON tb.release_id = $4 AND tb.room_id = p.room_id", // to 侧归属楼
+	}
+	for _, clause := range cellsClauses {
+		if !strings.Contains(releaseDiffCellsPageSQL, clause) {
+			t.Fatalf("cells 分页缺少 %q:\n%s", clause, releaseDiffCellsPageSQL)
+		}
+	}
+
+	roomsClauses := []string{
+		"FROM f FULL JOIN t USING (room_id)",
+		"$3 = 'added'   AND f.room_id IS NULL",
+		"$3 = 'removed' AND t.room_id IS NULL",
+		"ORDER BY room_id",
+		"ORDER BY p.room_id",
+		"LIMIT $4 OFFSET $5",
+	}
+	for _, clause := range roomsClauses {
+		if !strings.Contains(releaseDiffRoomsPageSQL, clause) {
+			t.Fatalf("rooms 分页缺少 %q:\n%s", clause, releaseDiffRoomsPageSQL)
+		}
+	}
+
+	buildingClauses := []string{
+		"FROM f JOIN t USING (room_id)",
+		"f.building_id <> t.building_id",
+		"ORDER BY f.room_id",
+		"ORDER BY p.room_id",
+		"LIMIT $3 OFFSET $4",
+	}
+	for _, clause := range buildingClauses {
+		if !strings.Contains(releaseDiffBuildingsPageSQL, clause) {
+			t.Fatalf("buildings 分页缺少 %q:\n%s", clause, releaseDiffBuildingsPageSQL)
+		}
+	}
+
+	// 三节都必须是单条语句，且都不带 count(*)：total 由 DiffTotal 从汇总推导。
+	for name, sql := range map[string]string{
+		"cells":     releaseDiffCellsPageSQL,
+		"rooms":     releaseDiffRoomsPageSQL,
+		"buildings": releaseDiffBuildingsPageSQL,
+	} {
+		if strings.Contains(sql, ";") {
+			t.Fatalf("%s 分页必须是单条语句，不能带分号:\n%s", name, sql)
+		}
+		if strings.Contains(strings.ToLower(sql), "count(") {
+			t.Fatalf("%s 分页不应再数行（total 从汇总推导）:\n%s", name, sql)
+		}
+		if got := strings.Count(sql, "\nSELECT "); got != 1 {
+			t.Fatalf("%s 分页只应有一个顶层 SELECT，实际 %d 个:\n%s", name, got, sql)
+		}
+	}
+}
+
+// TestDiffTotalDerivation 覆盖 total 的推导矩阵：三节 × 各自的合法 kind，
+// 以及零值按缺省（cells / all）与未识别组合返回 0。
+func TestDiffTotalDerivation(t *testing.T) {
+	summary := ReleaseDiffSummary{
+		Cells: DiffCellsSummary{Added: 11, Removed: 22, Changed: 33, Total: 66},
+		Rooms: DiffRoomsSummary{Added: 4, Removed: 5, Shared: 100, BuildingChanged: 6},
+	}
+
+	cases := []struct {
+		name    string
+		section DiffSection
+		kind    DiffKind
+		want    int
+	}{
+		{"缺省小节取 cells", "", "", 66}, // 零值即缺省
+		{"cells/all", DiffSectionCells, DiffKindAll, 66},
+		{"cells/added", DiffSectionCells, DiffKindAdded, 11},
+		{"cells/removed", DiffSectionCells, DiffKindRemoved, 22},
+		{"cells/changed", DiffSectionCells, DiffKindChanged, 33},
+		{"rooms/all", DiffSectionRooms, DiffKindAll, 9}, // added + removed，不含 shared
+		{"rooms/added", DiffSectionRooms, DiffKindAdded, 4},
+		{"rooms/removed", DiffSectionRooms, DiffKindRemoved, 5},
+		{"buildings/all", DiffSectionBuildings, DiffKindAll, 6},
+		{"buildings/changed", DiffSectionBuildings, DiffKindChanged, 6}, // all 与 changed 同集合
+		// 以下组合由 api 参数门挡掉（Requirement 4.5）；仓储返回 0 暴露上游 bug，
+		// 不静默按 all 或 cells 解释。
+		{"rooms/changed 非法", DiffSectionRooms, DiffKindChanged, 0},
+		{"buildings/added 非法", DiffSectionBuildings, DiffKindAdded, 0},
+		{"buildings/removed 非法", DiffSectionBuildings, DiffKindRemoved, 0},
+		{"未知小节", DiffSection("blocks"), DiffKindAll, 0},
+		{"未知类别", DiffSectionCells, DiffKind("same"), 0},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := DiffTotal(testCase.section, testCase.kind, summary); got != testCase.want {
+				t.Fatalf("DiffTotal(%q, %q) = %d，期望 %d",
+					testCase.section, testCase.kind, got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestLoadReleaseDiffSectionRouting 覆盖三节分派与参数编号：
+// 每个 section 只发自己的那条分页语句，参数按该语句的编号拼接；
+// 未选中的两个切片保持非 nil 空切片（序列化输出 []）。
+func TestLoadReleaseDiffSectionRouting(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+
+	cases := []struct {
+		name     string
+		section  DiffSection
+		kind     DiffKind
+		limit    int
+		offset   int
+		wantSQL  string
+		wantArgs []any
+	}{
+		{
+			name: "缺省参数落到 cells/all/50/0",
+			// section、kind、limit 全零，offset 本就是 0
+			wantSQL:  releaseDiffCellsPageSQL,
+			wantArgs: []any{from.AxisVersion, from.ReleaseID, to.AxisVersion, to.ReleaseID, "all", 50, 0},
+		},
+		{
+			name:    "cells 带类别与偏移",
+			section: DiffSectionCells, kind: DiffKindChanged, limit: 7, offset: 3,
+			wantSQL:  releaseDiffCellsPageSQL,
+			wantArgs: []any{from.AxisVersion, from.ReleaseID, to.AxisVersion, to.ReleaseID, "changed", 7, 3},
+		},
+		{
+			name:    "rooms 只读归属快照",
+			section: DiffSectionRooms, kind: DiffKindRemoved, limit: 5, offset: 2,
+			wantSQL:  releaseDiffRoomsPageSQL,
+			wantArgs: []any{from.ReleaseID, to.ReleaseID, "removed", 5, 2},
+		},
+		{
+			name:    "buildings 不带 kind",
+			section: DiffSectionBuildings, kind: DiffKindChanged, limit: 9, offset: 1,
+			wantSQL:  releaseDiffBuildingsPageSQL,
+			wantArgs: []any{from.ReleaseID, to.ReleaseID, 9, 1},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			cell := DiffCellRow{Kind: DiffKindAdded, RoomID: "r1", RoomName: "F1",
+				Week: 9, Weekday: 1, Block: "0102",
+				ToState: releaseAdminPtr("free"), ToBuilding: releaseAdminPtr("Q10")}
+			room := DiffRoomRow{Kind: DiffKindAdded, RoomID: "r2", RoomName: "F2",
+				ToBuilding: releaseAdminPtr("Q10"), ToBuildingName: releaseAdminPtr("综合教学楼")}
+			building := DiffBuildingRow{RoomID: "r3", RoomName: "F3",
+				FromBuilding: "Q10", FromBuildingName: "综合教学楼",
+				ToBuilding: "Q03", ToBuildingName: "老文史楼"}
+			querier := &releaseDiffQuerierStub{
+				heads: map[string]pgx.Row{
+					from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+					to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+				},
+				summary:   &releaseAdminRowStub{values: releaseDiffPageSummaryRow()},
+				cells:     &releaseAdminRowsStub{rows: [][]any{releaseDiffCellValues(cell)}},
+				rooms:     &releaseAdminRowsStub{rows: [][]any{releaseDiffRoomValues(room)}},
+				buildings: &releaseAdminRowsStub{rows: [][]any{releaseDiffBuildingValues(building)}},
+			}
+
+			diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+				From: from.ReleaseID, To: to.ReleaseID,
+				Section: testCase.section, Kind: testCase.kind,
+				Limit: testCase.limit, Offset: testCase.offset,
+			})
+			if err != nil {
+				t.Fatalf("对比失败: %v", err)
+			}
+			if querier.pageSQL != testCase.wantSQL {
+				t.Fatalf("分页应走 %q，实际 %q", testCase.wantSQL, querier.pageSQL)
+			}
+			if fmt.Sprint(querier.pageArgs) != fmt.Sprint(testCase.wantArgs) {
+				t.Fatalf("分页参数不符:\n got %v\nwant %v", querier.pageArgs, testCase.wantArgs)
+			}
+
+			// 只有被选中的小节有行；另外两个是空切片而不是 nil。
+			section := testCase.section
+			if section == "" {
+				section = DiffSectionCells // 零值缺省与 normalized 一致
+			}
+			wantCells, wantRooms, wantBuildings := 0, 0, 0
+			switch section {
+			case DiffSectionCells:
+				wantCells = 1
+			case DiffSectionRooms:
+				wantRooms = 1
+			case DiffSectionBuildings:
+				wantBuildings = 1
+			}
+			if len(diff.Cells) != wantCells {
+				t.Fatalf("cells 切片应有 %d 行，实际 %+v", wantCells, diff.Cells)
+			}
+			if len(diff.Rooms) != wantRooms {
+				t.Fatalf("rooms 切片应有 %d 行，实际 %+v", wantRooms, diff.Rooms)
+			}
+			if len(diff.Buildings) != wantBuildings {
+				t.Fatalf("buildings 切片应有 %d 行，实际 %+v", wantBuildings, diff.Buildings)
+			}
+			if diff.Cells == nil || diff.Rooms == nil || diff.Buildings == nil {
+				t.Fatalf("三个切片必须非 nil: cells=%v rooms=%v buildings=%v",
+					diff.Cells, diff.Rooms, diff.Buildings)
+			}
+		})
+	}
+}
+
+// TestLoadReleaseDiffCellsPageScan 覆盖 cells 分页的列序与可空列：
+// 新增格没有 from_state / from_building，消失格没有 to_state / to_building，
+// 变化格两侧都有；kind / week / weekday / block 与房名逐列断言。
+func TestLoadReleaseDiffCellsPageScan(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	want := []DiffCellRow{
+		{ // 变化格：两侧都出现
+			Kind: DiffKindChanged, RoomID: "r203", RoomName: "F203",
+			Week: 9, Weekday: 1, Block: "0102",
+			FromState:    releaseAdminPtr("free"),
+			ToState:      releaseAdminPtr("class"),
+			FromBuilding: releaseAdminPtr("Q10"),
+			ToBuilding:   releaseAdminPtr("Q10"),
+		},
+		{ // 新增格：只有 to 侧
+			Kind: DiffKindAdded, RoomID: "r208", RoomName: "F208",
+			Week: 9, Weekday: 2, Block: "0809",
+			ToState:    releaseAdminPtr("composite"),
+			ToBuilding: releaseAdminPtr("Q10"),
+		},
+		{ // 消失格：只有 from 侧
+			Kind: DiffKindRemoved, RoomID: "r202", RoomName: "",
+			Week: 10, Weekday: 3, Block: "101112",
+			FromState:    releaseAdminPtr("unknown"),
+			FromBuilding: releaseAdminPtr("Q03"),
+		},
+	}
+	rows := make([][]any, 0, len(want))
+	for _, row := range want {
+		rows = append(rows, releaseDiffCellValues(row))
+	}
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary: &releaseAdminRowStub{values: releaseDiffPageSummaryRow()},
+		cells:   &releaseAdminRowsStub{rows: rows},
+	}
+	cellRows := querier.cells.(*releaseAdminRowsStub)
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID, To: to.ReleaseID,
+		Section: DiffSectionCells, Kind: DiffKindAll, Limit: 3, Offset: 0,
+	})
+	if err != nil {
+		t.Fatalf("对比失败: %v", err)
+	}
+	if !reflect.DeepEqual(diff.Cells, want) {
+		t.Fatalf("cells 扫描不符:\n got %+v\nwant %+v", diff.Cells, want)
+	}
+	if !cellRows.closed {
+		t.Fatal("cells 行集读完必须关闭")
+	}
+}
+
+// TestLoadReleaseDiffRoomsPageScan 覆盖 rooms 分页的列序与四个可空归属字段：
+// 新增房 from_* 为 nil，消失房 to_* 为 nil。
+func TestLoadReleaseDiffRoomsPageScan(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	want := []DiffRoomRow{
+		{
+			Kind: DiffKindRemoved, RoomID: "r202", RoomName: "F202",
+			FromBuilding: releaseAdminPtr("Q10"), FromBuildingName: releaseAdminPtr("综合教学楼"),
+		},
+		{
+			Kind: DiffKindAdded, RoomID: "r208", RoomName: "F208",
+			ToBuilding: releaseAdminPtr("Q10"), ToBuildingName: releaseAdminPtr("综合教学楼"),
+		},
+	}
+	rows := make([][]any, 0, len(want))
+	for _, row := range want {
+		rows = append(rows, releaseDiffRoomValues(row))
+	}
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary: &releaseAdminRowStub{values: releaseDiffPageSummaryRow()},
+		rooms:   &releaseAdminRowsStub{rows: rows},
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID, To: to.ReleaseID,
+		Section: DiffSectionRooms, Kind: DiffKindAll, Limit: 2, Offset: 0,
+	})
+	if err != nil {
+		t.Fatalf("对比失败: %v", err)
+	}
+	if !reflect.DeepEqual(diff.Rooms, want) {
+		t.Fatalf("rooms 扫描不符:\n got %+v\nwant %+v", diff.Rooms, want)
+	}
+}
+
+// TestLoadReleaseDiffBuildingsPageScan 覆盖 buildings 分页的列序：四个归属字段都非空，
+// 房名在最后一列。
+func TestLoadReleaseDiffBuildingsPageScan(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	want := []DiffBuildingRow{
+		{RoomID: "r204", RoomName: "F204",
+			FromBuilding: "Q10", FromBuildingName: "综合教学楼",
+			ToBuilding: "Q03", ToBuildingName: "老文史楼"},
+	}
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary:   &releaseAdminRowStub{values: releaseDiffPageSummaryRow()},
+		buildings: &releaseAdminRowsStub{rows: [][]any{releaseDiffBuildingValues(want[0])}},
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID, To: to.ReleaseID,
+		Section: DiffSectionBuildings, Kind: DiffKindChanged, Limit: 1, Offset: 0,
+	})
+	if err != nil {
+		t.Fatalf("对比失败: %v", err)
+	}
+	if !reflect.DeepEqual(diff.Buildings, want) {
+		t.Fatalf("buildings 扫描不符:\n got %+v\nwant %+v", diff.Buildings, want)
+	}
+}
+
+// TestLoadReleaseDiffEmptyPageIsEmptySlice 覆盖 offset 翻过末页：分页行集为空，
+// 选中切片仍是非 nil 空切片，total 由汇总推导不随页为空而变化。
+func TestLoadReleaseDiffEmptyPageIsEmptySlice(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary: &releaseAdminRowStub{values: releaseDiffPageSummaryRow()},
+		cells:   &releaseAdminRowsStub{}, // 空页
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID, To: to.ReleaseID,
+		Section: DiffSectionCells, Kind: DiffKindAll, Limit: 50, Offset: 100,
+	})
+	if err != nil {
+		t.Fatalf("对比失败: %v", err)
+	}
+	if diff.Cells == nil {
+		t.Fatal("空页应返回空切片而不是 nil")
+	}
+	if len(diff.Cells) != 0 {
+		t.Fatalf("翻过末页不应有行: %+v", diff.Cells)
+	}
+	if got := DiffTotal(DiffSectionCells, DiffKindAll, diff.Summary); got != diff.Summary.Cells.Total {
+		t.Fatalf("total 应来自汇总、不随页为空变化: got %d want %d",
+			got, diff.Summary.Cells.Total)
+	}
+}
+
+// TestLoadReleaseDiffUnknownSectionFails 覆盖未知 section：不发分页语句，返回包着
+// model.ErrQueryFailed 的错误与零值（合法取值由 api 参数门保证）。
+func TestLoadReleaseDiffUnknownSectionFails(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary: &releaseAdminRowStub{values: releaseDiffPageSummaryRow()},
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID, To: to.ReleaseID,
+		Section: DiffSection("blocks"),
+	})
+	if !errors.Is(err, model.ErrQueryFailed) {
+		t.Fatalf("期望包装 model.ErrQueryFailed，实际 err=%v", err)
+	}
+	if !reflect.DeepEqual(diff, ReleaseDiff{}) {
+		t.Fatalf("失败时应返回零值，实际 %+v", diff)
+	}
+	if querier.pageRead {
+		t.Fatal("未知小节不应发任何分页语句")
+	}
+}
+
+// TestLoadReleaseDiffPageQueryErrorWraps 覆盖分页读库失败：包 model.ErrQueryFailed，
+// 不返回半份结果。
+func TestLoadReleaseDiffPageQueryErrorWraps(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary:  &releaseAdminRowStub{values: releaseDiffPageSummaryRow()},
+		cellsErr: errors.New("连接断了"),
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID, To: to.ReleaseID, Section: DiffSectionCells,
+	})
+	if !errors.Is(err, model.ErrQueryFailed) {
+		t.Fatalf("期望包装 model.ErrQueryFailed，实际 err=%v", err)
+	}
+	if !reflect.DeepEqual(diff, ReleaseDiff{}) {
+		t.Fatalf("失败时应返回零值，实际 %+v", diff)
+	}
+}
+
+// TestLoadReleaseDiffPageScanErrorWraps 覆盖分页扫描失败：包 model.ErrQueryFailed，
+// 行集照常关闭，不返回半页。
+func TestLoadReleaseDiffPageScanErrorWraps(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	rows := &releaseAdminRowsStub{
+		rows:    [][]any{releaseDiffRoomValues(DiffRoomRow{Kind: DiffKindAdded, RoomID: "r208"})},
+		scanErr: errors.New("列不可解"),
+	}
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary: &releaseAdminRowStub{values: releaseDiffPageSummaryRow()},
+		rooms:   rows,
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID, To: to.ReleaseID, Section: DiffSectionRooms,
+	})
+	if !errors.Is(err, model.ErrQueryFailed) {
+		t.Fatalf("期望包装 model.ErrQueryFailed，实际 err=%v", err)
+	}
+	if !reflect.DeepEqual(diff, ReleaseDiff{}) {
+		t.Fatalf("失败时应返回零值，实际 %+v", diff)
+	}
+	if !rows.closed {
+		t.Fatal("扫描失败也要关闭行集")
+	}
+}
+
+// TestLoadReleaseDiffPageRowsErrorWraps 覆盖分页遍历到一半失败：已取到的行是残的，
+// 整体报错，不交半页。
+func TestLoadReleaseDiffPageRowsErrorWraps(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	rows := &releaseAdminRowsStub{
+		rows: [][]any{releaseDiffBuildingValues(DiffBuildingRow{
+			RoomID: "r204", FromBuilding: "Q10", FromBuildingName: "综合教学楼",
+			ToBuilding: "Q03", ToBuildingName: "老文史楼", RoomName: "F204",
+		})},
+		err: errors.New("遍历中连接断了"),
+	}
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary:   &releaseAdminRowStub{values: releaseDiffPageSummaryRow()},
+		buildings: rows,
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID, To: to.ReleaseID, Section: DiffSectionBuildings,
+	})
+	if !errors.Is(err, model.ErrQueryFailed) {
+		t.Fatalf("期望包装 model.ErrQueryFailed，实际 err=%v", err)
+	}
+	if !reflect.DeepEqual(diff, ReleaseDiff{}) {
+		t.Fatalf("失败时应返回零值，实际 %+v", diff)
+	}
+	if !rows.closed {
+		t.Fatal("遍历失败也要关闭行集")
 	}
 }

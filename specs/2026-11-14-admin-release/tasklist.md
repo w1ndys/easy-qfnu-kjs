@@ -17,7 +17,7 @@
   - 夹具覆盖五类差异（新增格 / 消失格 / 状态变化 / 未变格 / 归属变化）与一个块内不一致的格，逐项断言计数；交换 `from` / `to` 断言 added↔removed、changed 不变
   - 不同 `term` 的两版返回 `same_term=false` 且照常给出差异；`axis_version` 不同仍按 `block` 编码比较
 
-- [ ] 3. 对比明细分页
+- [x] 3. 对比明细分页
   - `Diff` 按 `section`（`cells` / `rooms` / `buildings`）返回对应小节；`cells` 支持 `kind=all|added|removed|changed`，`rooms` 支持 `all|added|removed`，`buildings` 只接受 `all|changed`
   - 排序键固定（cells：`room_id, week, weekday, block`；rooms / buildings：`room_id`），`limit` 1–200 默认 50、`offset ≥ 0`；`total` 从同一快照的汇总推导，不在分页语句里再 `count(*)`
   - `offset` 超过末页返回空 `items` 且 `total` 不变；同一请求重复执行返回同一页

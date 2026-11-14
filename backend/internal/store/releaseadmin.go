@@ -132,27 +132,196 @@ type ReleaseDiffSummary struct {
 	SameTerm           bool             // 两侧 term 相同；不同也照常给差异（Requirement 3.4）
 }
 
+// DiffSection 是 GET /api/admin/releases/diff 的明细小节。
+//
+// 三个小节的数据源不同：cells 是两版观测折叠后的格差异（最重，一次两侧折叠），
+// rooms / buildings 只读归属快照（release_room_building，几千行）。缺省是 cells
+// （Requirement 4.1），由 api 层解析；仓储对零值同样按 cells 处理，直接调用不会
+// 退化成「什么都不返回」。
+type DiffSection string
+
+// 三节小节的取值与请求参数一一对应；api 的参数门按这三个值判定合法性。
+const (
+	DiffSectionCells     DiffSection = "cells"     // 格差异：房号 × 周 × 星期 × 大节
+	DiffSectionRooms     DiffSection = "rooms"     // 归属快照的房号增删
+	DiffSectionBuildings DiffSection = "buildings" // 归属快照里换了楼的房号
+)
+
+// DiffKind 是明细小节的类别过滤，也是每一行的类别标记。
+//
+// 合法组合由 section 决定：cells 接受四个取值；rooms 没有 changed（房号要么存在
+// 要么不存在）；buildings 只有 changed，但入参也接受 all（等价于不过滤，响应回显
+// all）。组合校验在 api 层（Requirement 4.5），仓储只把 kind 原样交给 SQL 做等值
+// 过滤，不在这里重写一遍组合矩阵。
+type DiffKind string
+
+// 四个类别取值；各小节允许的子集不同，见 DiffKind 的说明。
+const (
+	DiffKindAll     DiffKind = "all"     // 不做类别过滤
+	DiffKindAdded   DiffKind = "added"   // 只在 to 侧
+	DiffKindRemoved DiffKind = "removed" // 只在 from 侧
+	DiffKindChanged DiffKind = "changed" // 两侧都有但值不同
+)
+
+// diffLimitDefault 是省略 limit 时的页大小。
+//
+// 1–200 的合法区间与 offset ≥ 0 由 api 参数门判定（Requirement 4.5，design
+// 「管理 API 契约」的约束段）；仓储只处理「零值即缺省」这一种情况，不把越界值
+// 悄悄改成合法值——那样会把上游参数 bug 藏起来。
+const diffLimitDefault = 50
+
 // ReleaseDiffParams 是一次对比请求的参数。
 //
-// 当前只有两侧版本标识：分页与按小节取明细（section / kind / limit / offset）
-// 由 tasklist 第 3 项补到本类型上。From 与 To 的形状校验、两者是否相同、缺参，
-// 全部由 api 层在查库之前判定（Requirement 3.5，CP14），仓储只如实读两版；
-// 万一收到相同的两个版本，结果是一次「全 same」的空差异（added/removed/changed
-// 都是 0），不会报错也不会把同一版读两遍之外多做别的事。
+// From 与 To 的形状校验、两者是否相同、缺参，全部由 api 层在查库之前判定
+// （Requirement 3.5，CP14），仓储只如实读两版；万一收到相同的两个版本，结果是一次
+// 「全 same」的空差异（added/removed/changed 都是 0），不会报错，也不会把同一版
+// 读两遍之外多做别的事。
+//
+// Section / Kind / Limit / Offset 决定明细小节的那一页：三个零值分别按 cells、all、
+// 50 处理（见 normalized），offset 零值本来就是 0。合法的 section/kind 组合、
+// limit 1–200 与 offset ≥ 0 由 api 在查库前挡掉（Requirement 4.5），仓储不重复校验。
 type ReleaseDiffParams struct {
-	From string // 对比基准（旧版本）的 release_id
-	To   string // 对比目标（新版本）的 release_id
+	From    string      // 对比基准（旧版本）的 release_id
+	To      string      // 对比目标（新版本）的 release_id
+	Section DiffSection // 明细小节，缺省 cells
+	Kind    DiffKind    // 类别过滤，缺省 all
+	Limit   int         // 页大小，缺省 50
+	Offset  int         // 页偏移，从 0 起
 }
 
-// ReleaseDiff 是一次对比的结果：两侧版本头与汇总。
+// normalized 补齐三个缺省值：section → cells、kind → all、limit → 50。
 //
-// section 明细分页（Cells / Rooms / Buildings 三个切片）由 tasklist 第 3 项补到
-// 本类型上；当前只返回汇总。判断「有没有差异」看 Summary.Cells，不靠明细切片是否
-// 为空——第 3 项之后，明细为空也可能只是 offset 翻过了末页。
+// 只映射零值，不做区间校验也不纠正越界值：负数 limit、offset < 0、跨小节的 kind
+// 组合都是 api 参数门要拒的输入（Requirement 4.5），仓储再拦一次只会出现两套
+// 判定口径。
+func (p ReleaseDiffParams) normalized() ReleaseDiffParams {
+	if p.Section == "" {
+		p.Section = DiffSectionCells
+	}
+	if p.Kind == "" {
+		p.Kind = DiffKindAll
+	}
+	if p.Limit == 0 {
+		p.Limit = diffLimitDefault
+	}
+	return p
+}
+
+// ReleaseDiff 是一次对比的结果：两侧版本头、汇总与所选小节的一页明细。
+//
+// 判断「有没有差异」看 Summary.Cells，不靠明细切片是否为空：明细为空既可能是真的
+// 没有该类差异，也可能只是 offset 翻过了末页（CP6）。三个切片恒为非 nil：未选中的
+// 小节省略成空切片，选中的小节没有行时也是空切片，序列化都输出 []。
+//
+// 这里不带 total / limit / offset / section / kind：total 由 DiffTotal 从 Summary
+// 推导（同一快照，CP6），其余四项是请求参数的生效值，由 api 回显；仓储不重复存一份。
 type ReleaseDiff struct {
-	From    ReleaseSide        // from 侧版本头
-	To      ReleaseSide        // to 侧版本头
-	Summary ReleaseDiffSummary // 分类汇总
+	From      ReleaseSide        // from 侧版本头
+	To        ReleaseSide        // to 侧版本头
+	Summary   ReleaseDiffSummary // 分类汇总
+	Cells     []DiffCellRow      // section=cells 时填充，否则为空切片
+	Rooms     []DiffRoomRow      // section=rooms 时填充，否则为空切片
+	Buildings []DiffBuildingRow  // section=buildings 时填充，否则为空切片
+}
+
+// DiffCellRow 是 section=cells 的一行：一个差异格与两侧折叠后的状态。
+//
+// FromState / ToState 是可空的：只在 to 侧出现的格没有 from_state，只在 from 侧
+// 出现的格没有 to_state。FromBuilding / ToBuilding 只由「该房在该版有没有归属快照」
+// 决定：SQL 按 (release_id, room_id) 左连接 release_room_building，不看格是否出现，
+// 所以房号两版都有快照、格只在一侧时，另一侧的归属楼仍然有值；该房在该版没有归属
+// 快照时才是 nil，响应输出 null（CP13）。
+type DiffCellRow struct {
+	Kind         DiffKind // added / removed / changed；分页永不返回 same
+	RoomID       string   // 房号，observation.room_id
+	RoomName     string   // 教室目录里的展示名，room.name；目录缺行时为空串
+	Week         int      // 教学周次
+	Weekday      int      // 星期，1–7
+	Block        string   // 大节编码，axis_node.block
+	FromState    *string  // from 侧折叠后的格状态；只在 to 侧时 nil
+	ToState      *string  // to 侧折叠后的格状态；只在 from 侧时 nil
+	FromBuilding *string  // from 侧归属楼编号；该房在 from 版没有归属快照时 nil（release_id + room_id 左连接，与格是否出现无关）
+	ToBuilding   *string  // to 侧归属楼编号；该房在 to 版没有归属快照时 nil（release_id + room_id 左连接，与格是否出现无关）
+}
+
+// DiffRoomRow 是 section=rooms 的一行：归属快照里新增或消失的房号。
+//
+// 只有 added 与 removed 两种 kind（rooms 小节不过滤 shared）；新增房的 from_*
+// 为 nil、消失房的 to_* 为 nil，四个归属字段成对出现。
+type DiffRoomRow struct {
+	Kind             DiffKind // added / removed
+	RoomID           string   // 房号
+	RoomName         string   // 教室目录里的展示名；目录缺行时为空串
+	FromBuilding     *string  // from 侧楼编号；新增房为 nil
+	ToBuilding       *string  // to 侧楼编号；消失房为 nil
+	FromBuildingName *string  // from 侧楼展示名；新增房为 nil
+	ToBuildingName   *string  // to 侧楼展示名；消失房为 nil
+}
+
+// DiffBuildingRow 是 section=buildings 的一行：两侧都有、但换了楼的房号。
+//
+// 四个归属字段都非空：这一节只取两版归属快照的交集且 building_id 不同，所以没有
+// 「一侧没有」的形状。Kind 不在这里存：buildings 的等价类别恒为 changed，由 api
+// 在 DTO 里回显（Requirement 4.3），仓储不必为每一行重复同一个常量。
+type DiffBuildingRow struct {
+	RoomID           string // 房号
+	RoomName         string // 教室目录里的展示名；目录缺行时为空串
+	FromBuilding     string // from 侧楼编号
+	FromBuildingName string // from 侧楼展示名
+	ToBuilding       string // to 侧楼编号
+	ToBuildingName   string // to 侧楼展示名
+}
+
+// DiffTotal 从汇总推导分页的 total，与本次实际生效的 section / kind 对应。
+//
+// 明细分页语句不返回 count(*)：分页只取一页，再数一遍全量差异等于把最重的两侧
+// 折叠多跑一次；而汇总与明细在同一个只读事务里，汇总的分类计数就是同一快照里的
+// total（CP6）。映射关系：
+//   - cells：all → total（added+removed+changed 之和），否则取对应一类；
+//   - rooms：all → added+removed（shared 不在明细里），否则取对应一类；
+//   - buildings：all 与 changed 等价，都取 building_changed（Requirement 4.3、4.4）。
+//
+// 未识别的组合返回 0 而不是猜一个类别：section/kind 的合法组合由 api 在查库前
+// 校验（Requirement 4.5），仓储侧不会收到；真收到说明上游有 bug，让它以 0 暴露，
+// 不要静默按 cells 或 all 解释。零值 section/kind 仍按缺省 cells / all 处理，
+// 与 normalized 一致（直接调用仓储的用例也不必先补一遍默认值）。
+func DiffTotal(section DiffSection, kind DiffKind, summary ReleaseDiffSummary) int {
+	if section == "" {
+		section = DiffSectionCells
+	}
+	if kind == "" {
+		kind = DiffKindAll
+	}
+
+	switch section {
+	case DiffSectionCells:
+		switch kind {
+		case DiffKindAll:
+			return summary.Cells.Total
+		case DiffKindAdded:
+			return summary.Cells.Added
+		case DiffKindRemoved:
+			return summary.Cells.Removed
+		case DiffKindChanged:
+			return summary.Cells.Changed
+		}
+	case DiffSectionRooms:
+		switch kind {
+		case DiffKindAll:
+			return summary.Rooms.Added + summary.Rooms.Removed
+		case DiffKindAdded:
+			return summary.Rooms.Added
+		case DiffKindRemoved:
+			return summary.Rooms.Removed
+		}
+	case DiffSectionBuildings:
+		// buildings 只接受 all 与 changed，两者取同一份计数：这一节的行恒为
+		// building_changed（Requirement 4.3）。
+		if kind == DiffKindAll || kind == DiffKindChanged {
+			return summary.Rooms.BuildingChanged
+		}
+	}
+	return 0
 }
 
 // ErrReleaseNotFound 表示要读的发布版本不在库里。
@@ -186,11 +355,13 @@ type releaseDetailQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// releaseDiffQuerier 是对比事务体内需要的最小能力：只有单行读。
+// releaseDiffQuerier 是对比事务体内需要的最小能力：单行读与多行读。
 //
-// 两侧版本头各一次 QueryRow，汇总也是单行聚合一次 QueryRow；分页明细（第 3 项）
-// 才会用到多行读，届时再把 Query 加到这里，不在本项提前放行一个用不上的方法。
+// 两侧版本头各一次 QueryRow，汇总也是单行聚合一次 QueryRow；明细小节的那一页用
+// Query（一次至多 200 行）。所有读都走同一个 REPEATABLE READ 只读事务，汇总与
+// 明细因此来自同一快照（CP7）。
 type releaseDiffQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
@@ -345,8 +516,8 @@ SELECT release_id, term, generated_at, dict_version, axis_version,
 // 用「当前」轴去折历史版本会把旧版折成另一套格。两侧 axis_version 不同时仍按
 // block 编码比较，语义变化由管理员从响应里的轴版本看出。
 //
-// j 只投影汇总要用的列；明细分页需要的 from_state / to_state 由 tasklist 第 3 项
-// 补到同一段 j 上，折叠口径不变。
+// j 的投影同时服务汇总与明细分页：汇总只数 kind / inconsistent，分页还要两侧折叠后
+// 的 from_state / to_state 原样给管理员看。两处共用同一段 j，折叠口径只有一份。
 const releaseDiffFoldCTE = `
 WITH f AS (
   SELECT o.room_id, o.week, o.weekday, an.block,
@@ -369,6 +540,8 @@ WITH f AS (
          COALESCE(f.week, t.week)       AS week,
          COALESCE(f.weekday, t.weekday) AS weekday,
          COALESCE(f.block, t.block)     AS block,
+         f.state_key AS from_state,
+         t.state_key AS to_state,
          CASE WHEN f.room_id IS NULL THEN 'added'
               WHEN t.room_id IS NULL THEN 'removed'
               WHEN f.state_key <> t.state_key THEN 'changed'
@@ -422,12 +595,114 @@ SELECT cells.added, cells.removed, cells.changed, cells.inconsistent_blocks,
        rooms.added, rooms.removed, rooms.shared, rooms.building_changed
   FROM cells CROSS JOIN states CROSS JOIN rooms`
 
+// releaseDiffCellsPageSQL 是 section=cells 的一页差异格，沿用折叠 CTE 的 $1–$4。
+//
+// 参数：$1 from 轴版本、$2 from 版本、$3 to 轴版本、$4 to 版本、$5 kind
+// （'all' 表示不过滤）、$6 limit、$7 offset。
+//
+// 分页 CTE 先按固定键排序再 LIMIT/OFFSET，外层 JOIN 出房名与两版归属楼后**再排一次**：
+// JOIN 不保证保持子查询的行序，只在外层 ORDER BY 才让「同一请求同一页」成立（CP6）。
+// 排序键 (room_id, week, weekday, block) 在差异集合内唯一（CP3），所以翻页不会出现
+// 同一格出现两次或漏掉一格。
+//
+// kind 用 SQL 参数比较、不拼字符串：$5 = 'all' 时不过滤，否则 kind = $5。kind <>
+// 'same' 恒成立——'same' 不是合法的请求取值，但折叠结果里确实有这一行，必须在这里
+// 先剔掉，否则 kind=all 会把未变格也发给管理员。
+//
+// 房名取 room.name、目录缺行时由 COALESCE 折成空串：教室目录可能因数据对齐删过房号，
+// 房名缺失不该让整行消失（room 是 LEFT JOIN），空串由 api 原样输出。归属楼用两版各自的归属快照 LEFT
+// JOIN：只在 to 侧出现的格没有 from_building，反之亦然，扫描成 nil 后输出 null。
+//
+// 本语句不返回行数统计：total 由 DiffTotal 从同一事务里的汇总推导（CP6），在分页
+// 语句里再 count(*) 等于把两侧折叠多跑一遍。
+const releaseDiffCellsPageSQL = releaseDiffFoldCTE + `,
+     page AS (
+       SELECT kind, room_id, week, weekday, block, from_state, to_state
+         FROM j
+        WHERE kind <> 'same'
+          AND ($5 = 'all' OR kind = $5)
+        ORDER BY room_id, week, weekday, block
+        LIMIT $6 OFFSET $7
+     )
+SELECT p.kind, p.room_id, p.week, p.weekday, p.block, p.from_state, p.to_state,
+       COALESCE(r.name, '') AS room_name,
+       fb.building_id AS from_building,
+       tb.building_id AS to_building
+  FROM page p
+  LEFT JOIN room r  ON r.room_id = p.room_id
+  LEFT JOIN release_room_building fb ON fb.release_id = $2 AND fb.room_id = p.room_id
+  LEFT JOIN release_room_building tb ON tb.release_id = $4 AND tb.room_id = p.room_id
+ ORDER BY p.room_id, p.week, p.weekday, p.block`
+
+// releaseDiffRoomsPageSQL 是 section=rooms 的一页房号增删。
+//
+// 参数：$1 from 版本、$2 to 版本、$3 kind（'all' | 'added' | 'removed'）、
+// $4 limit、$5 offset。
+//
+// 只读两版归属快照（各几千行），不碰 observation。FULL JOIN 的并集减去交集就是
+// 增删集合；kind 的三个取值在这里落成三个 IS NULL 判定，与折叠 CTE 无关。
+//
+// 归属字段成对可空：新增房没有 from_*，消失房没有 to_*，扫描成 nil 由 api 输出 null。
+// 排序键 room_id 在「只在一侧」的集合内唯一（归属快照主键是 (release_id, room_id)），
+// 外层再排一次的意义同 cells 页。
+const releaseDiffRoomsPageSQL = `
+WITH f AS (SELECT room_id, building_id, building_name
+             FROM release_room_building WHERE release_id = $1),
+     t AS (SELECT room_id, building_id, building_name
+             FROM release_room_building WHERE release_id = $2),
+     page AS (
+       SELECT CASE WHEN f.room_id IS NULL THEN 'added' ELSE 'removed' END AS kind,
+              COALESCE(f.room_id, t.room_id) AS room_id,
+              f.building_id AS from_building, f.building_name AS from_building_name,
+              t.building_id AS to_building,   t.building_name AS to_building_name
+         FROM f FULL JOIN t USING (room_id)
+        WHERE (f.room_id IS NULL OR t.room_id IS NULL)
+          AND ($3 = 'all'
+               OR ($3 = 'added'   AND f.room_id IS NULL)
+               OR ($3 = 'removed' AND t.room_id IS NULL))
+        ORDER BY room_id
+        LIMIT $4 OFFSET $5
+     )
+SELECT p.kind, p.room_id, COALESCE(r.name, '') AS room_name,
+       p.from_building, p.from_building_name, p.to_building, p.to_building_name
+  FROM page p LEFT JOIN room r ON r.room_id = p.room_id
+ ORDER BY p.room_id`
+
+// releaseDiffBuildingsPageSQL 是 section=buildings 的一页归属变化房号。
+//
+// 参数：$1 from 版本、$2 to 版本、$3 limit、$4 offset。
+//
+// kind 不参与 SQL：这一节的行恒为「两侧都存在且 building_id 不同」，对应汇总里的
+// building_changed；入参 all 与 changed 在这里是同一个集合，api 只负责回显生效值。
+// 用内连接而不是 FULL JOIN：只在一侧出现的房号属于 rooms 小节的 added/removed，
+// 不是「归属变化」。
+//
+// 四个归属字段都非空（归属快照两列均 NOT NULL），所以扫描进值类型而不是指针；
+// 房名仍用 COALESCE 兜教室目录缺行。排序键 room_id 在交集内唯一，外层再排一次。
+const releaseDiffBuildingsPageSQL = `
+WITH f AS (SELECT room_id, building_id, building_name
+             FROM release_room_building WHERE release_id = $1),
+     t AS (SELECT room_id, building_id, building_name
+             FROM release_room_building WHERE release_id = $2),
+     page AS (
+       SELECT f.room_id,
+              f.building_id AS from_building, f.building_name AS from_building_name,
+              t.building_id AS to_building,   t.building_name AS to_building_name
+         FROM f JOIN t USING (room_id)
+        WHERE f.building_id <> t.building_id
+        ORDER BY f.room_id
+        LIMIT $3 OFFSET $4
+     )
+SELECT p.*, COALESCE(r.name, '') AS room_name
+  FROM page p LEFT JOIN room r ON r.room_id = p.room_id
+ ORDER BY p.room_id`
+
 // ReleaseAdminRepo 把管理端版本读取的 SQL 与只读事务闭在内部。
 //
 // 它是 api.ReleaseAdminReader 的结构匹配实现：store 不 import api（依赖方向见
 // backend/.golangci.yml 的 store 规则），接口定义在消费侧，方法集在这里一一对应。
-// 本文件当前有列表、详情与对比汇总三个读方法（tasklist 第 1、2 项）；对比分页
-// 明细、异常与回退由后续条目补到同一类型上。
+// 本文件当前有列表、详情、对比（汇总 + 小节分页）三个读方法（tasklist 第 1–3 项）；
+// 异常与回退由后续条目补到同一类型上。
 type ReleaseAdminRepo struct {
 	pool releaseAdminPool // 通常是 *pgxpool.Pool
 }
@@ -607,20 +882,21 @@ func loadReleaseBuildingCounts(
 	return buildingCounts, nil
 }
 
-// Diff 返回两版的分类差异汇总；两侧任一版本不存在时返回包着 ErrReleaseNotFound 的错误。
+// Diff 返回两版的分类差异汇总与所选小节的一页明细；两侧任一版本不存在时返回包着
+// ErrReleaseNotFound 的错误。
 //
 // 整个对比包在一个 REPEATABLE READ READ ONLY 事务里（与 Detail 同一形状）：
-//   - REPEATABLE READ：发布事务会删更早版本。两侧头、汇总若各看各的快照，就可能
-//     出现「头的轴版本还在、观测已经随版本被删」的拼凑结果（CP7）。
+//   - REPEATABLE READ：发布事务会删更早版本。两侧头、汇总、明细若各看各的快照，
+//     就可能出现「头的轴版本还在、观测已经随版本被删」的拼凑结果（CP7）。
 //   - READ ONLY：本路径只有 SELECT，误写直接失败而不是靠人工审查（CP2）。
 //
-// 顺序固定为「先两侧头、再汇总」：头解析失败（缺一版）时立刻返回，不再花一次
-// 全量折叠去算一份注定要丢掉的汇总。same_term 在 Go 侧由两个头比出来，不放进
-// 汇总 SQL——它是版本头的事实，不是观测数据的事实。
+// 顺序固定为「先两侧头、再汇总、最后明细页」：头解析失败（缺一版）时立刻返回，不再
+// 花一次全量折叠去算一份注定要丢掉的汇总；汇总失败时也不必再发分页语句。汇总与
+// 明细同事务、同快照，total 由 DiffTotal 从汇总推导必然与明细一致（CP6）。
 //
 // 失败口径：缺版本 → ErrReleaseNotFound（api 映射 404 / 40401）；读库失败 →
-// model.ErrQueryFailed（api 映射 50000）。参数形状、两侧相同、缺参由 api 层在
-// 查库前挡掉，仓储不重复校验，也不返回半份结果。
+// model.ErrQueryFailed（api 映射 50000）。参数形状、两侧相同、缺参、section/kind
+// 组合与 limit/offset 区间由 api 层在查库前挡掉，仓储不重复校验，也不返回半份结果。
 func (r ReleaseAdminRepo) Diff(ctx context.Context, params ReleaseDiffParams) (ReleaseDiff, error) {
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
@@ -635,7 +911,8 @@ func (r ReleaseAdminRepo) Diff(ctx context.Context, params ReleaseDiffParams) (R
 	return loadReleaseDiff(ctx, tx, params)
 }
 
-// loadReleaseDiff 是 Diff 的事务体：解析两侧头、算汇总、拼 same_term，不负责开事务。
+// loadReleaseDiff 是 Diff 的事务体：解析两侧头、算汇总、取所选小节的一页、
+// 拼 same_term，不负责开事务。
 //
 // 两版头的读法相同，用 loadReleaseDiffSide 的 side 参数带一个「哪一侧」的标签：
 // 缺版本时消息要点名 from / to，排障时才知道是基准版被删还是目标版传错了。
@@ -643,11 +920,22 @@ func (r ReleaseAdminRepo) Diff(ctx context.Context, params ReleaseDiffParams) (R
 // 汇总语句的参数顺序固定为 (from 轴版本, from 版本, to 轴版本, to 版本)，与
 // releaseDiffFoldCTE 的 $1–$4 一一对应；参数取自刚读回的头，而不是调用方的入参，
 // 这样轴版本一定与该版 release 行一致。
+//
+// 分页参数在入口先补齐缺省（section → cells、kind → all、limit → 50，见
+// normalized）：三个字段的零值与 api 的缺省语义一致，直接调用仓储的用例不必先
+// 自己补一遍。明细只取所选小节：三个切片初始化为空切片，未选中的保持空，序列化
+// 输出 [] 而不是 null。
+//
+// 未知 section 返回包着 model.ErrQueryFailed 的错误而不是退回 cells：合法取值由 api
+// 参数门保证（Requirement 4.5），走到这里说明装配或解析有 bug，按内部错误暴露比
+// 静默给一份 cells 明细诚实。
 func loadReleaseDiff(
 	ctx context.Context,
 	q releaseDiffQuerier,
 	params ReleaseDiffParams,
 ) (ReleaseDiff, error) {
+	params = params.normalized()
+
 	from, err := loadReleaseDiffSide(ctx, q, "from", params.From)
 	if err != nil {
 		return ReleaseDiff{}, err
@@ -661,11 +949,213 @@ func loadReleaseDiff(
 	if err != nil {
 		return ReleaseDiff{}, err
 	}
+
+	diff := ReleaseDiff{
+		From:      from,
+		To:        to,
+		Summary:   summary,
+		Cells:     make([]DiffCellRow, 0),
+		Rooms:     make([]DiffRoomRow, 0),
+		Buildings: make([]DiffBuildingRow, 0),
+	}
+
+	switch params.Section {
+	case DiffSectionCells:
+		diff.Cells, err = loadDiffCells(ctx, q, params, from, to)
+	case DiffSectionRooms:
+		diff.Rooms, err = loadDiffRooms(ctx, q, params, from, to)
+	case DiffSectionBuildings:
+		diff.Buildings, err = loadDiffBuildings(ctx, q, params, from, to)
+	default:
+		return ReleaseDiff{}, fmt.Errorf("%w: 未知的对比小节 %q", model.ErrQueryFailed, params.Section)
+	}
+	if err != nil {
+		return ReleaseDiff{}, err
+	}
+
 	// same_term 只由两个 term 决定：不同学期照常给差异，只是在汇总里如实标出来
 	// （Requirement 3.4），不做拒绝也不清空计数。
-	summary.SameTerm = from.Term == to.Term
+	diff.Summary.SameTerm = from.Term == to.Term
+	return diff, nil
+}
 
-	return ReleaseDiff{From: from, To: to, Summary: summary}, nil
+// scanDiffCellRow 按 releaseDiffCellsPageSQL 的列序扫一行格差异。
+//
+// kind 先扫进 string 再转 DiffKind：只有那么几个取值，直接扫进命名类型也行，但
+// week / weekday 是 smallint，用 int16 中转再转 int 与逐周计数同一写法，避免依赖
+// pgx 对 int2 → int 的隐式转换。可空列（from_state / to_state / 两侧归属楼）扫进
+// 指针：NULL 落成 nil，响应据此输出 null。
+func scanDiffCellRow(scan func(dest ...any) error) (DiffCellRow, error) {
+	var (
+		row           DiffCellRow
+		kind          string
+		week, weekday int16
+	)
+	err := scan(
+		&kind,
+		&row.RoomID,
+		&week,
+		&weekday,
+		&row.Block,
+		&row.FromState,
+		&row.ToState,
+		&row.RoomName,
+		&row.FromBuilding,
+		&row.ToBuilding,
+	)
+	if err != nil {
+		return DiffCellRow{}, err
+	}
+	row.Kind = DiffKind(kind)
+	row.Week = int(week)
+	row.Weekday = int(weekday)
+	return row, nil
+}
+
+// scanDiffRoomRow 按 releaseDiffRoomsPageSQL 的列序扫一行房号增删。
+//
+// 四个归属字段都是指针：新增房缺 from_*、消失房缺 to_*，扫描后由 api 输出 null。
+func scanDiffRoomRow(scan func(dest ...any) error) (DiffRoomRow, error) {
+	var (
+		row  DiffRoomRow
+		kind string
+	)
+	err := scan(
+		&kind,
+		&row.RoomID,
+		&row.RoomName,
+		&row.FromBuilding,
+		&row.FromBuildingName,
+		&row.ToBuilding,
+		&row.ToBuildingName,
+	)
+	if err != nil {
+		return DiffRoomRow{}, err
+	}
+	row.Kind = DiffKind(kind)
+	return row, nil
+}
+
+// scanDiffBuildingRow 按 releaseDiffBuildingsPageSQL 的列序扫一行归属变化。
+//
+// 四个归属字段是值类型（两版归属快照的列都 NOT NULL，且这一节只取交集），房名在
+// 最后一列，顺序与 SQL 的 `SELECT p.*, room_name` 一致。
+func scanDiffBuildingRow(scan func(dest ...any) error) (DiffBuildingRow, error) {
+	var row DiffBuildingRow
+	err := scan(
+		&row.RoomID,
+		&row.FromBuilding,
+		&row.FromBuildingName,
+		&row.ToBuilding,
+		&row.ToBuildingName,
+		&row.RoomName,
+	)
+	if err != nil {
+		return DiffBuildingRow{}, err
+	}
+	return row, nil
+}
+
+// loadDiffCells 取 section=cells 的一页；没有差异或 offset 翻过末页时返回空切片。
+//
+// 参数编号与折叠 CTE 对齐：$1/$2 是 from 的轴版本与版本，$3/$4 是 to 的，$5 kind、
+// $6 limit、$7 offset。轴版本取自两侧头而不是入参，保证与 release 行一致。
+func loadDiffCells(
+	ctx context.Context,
+	q releaseDiffQuerier,
+	params ReleaseDiffParams,
+	from ReleaseSide,
+	to ReleaseSide,
+) ([]DiffCellRow, error) {
+	rows, err := q.Query(ctx, releaseDiffCellsPageSQL,
+		from.AxisVersion, from.ReleaseID, to.AxisVersion, to.ReleaseID,
+		string(params.Kind), params.Limit, params.Offset)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 读取 %s 与 %s 的格差异分页失败: %w",
+			model.ErrQueryFailed, from.ReleaseID, to.ReleaseID, err)
+	}
+	defer rows.Close()
+
+	cells := make([]DiffCellRow, 0)
+	for rows.Next() {
+		cell, scanErr := scanDiffCellRow(rows.Scan)
+		if scanErr != nil {
+			return nil, fmt.Errorf("%w: 扫描 %s 与 %s 的格差异分页失败: %w",
+				model.ErrQueryFailed, from.ReleaseID, to.ReleaseID, scanErr)
+		}
+		cells = append(cells, cell)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: 遍历 %s 与 %s 的格差异分页失败: %w",
+			model.ErrQueryFailed, from.ReleaseID, to.ReleaseID, err)
+	}
+	return cells, nil
+}
+
+// loadDiffRooms 取 section=rooms 的一页；参数是 ($1 from, $2 to, $3 kind, $4 limit, $5 offset)。
+func loadDiffRooms(
+	ctx context.Context,
+	q releaseDiffQuerier,
+	params ReleaseDiffParams,
+	from ReleaseSide,
+	to ReleaseSide,
+) ([]DiffRoomRow, error) {
+	rows, err := q.Query(ctx, releaseDiffRoomsPageSQL,
+		from.ReleaseID, to.ReleaseID, string(params.Kind), params.Limit, params.Offset)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 读取 %s 与 %s 的房号差异分页失败: %w",
+			model.ErrQueryFailed, from.ReleaseID, to.ReleaseID, err)
+	}
+	defer rows.Close()
+
+	rooms := make([]DiffRoomRow, 0)
+	for rows.Next() {
+		room, scanErr := scanDiffRoomRow(rows.Scan)
+		if scanErr != nil {
+			return nil, fmt.Errorf("%w: 扫描 %s 与 %s 的房号差异分页失败: %w",
+				model.ErrQueryFailed, from.ReleaseID, to.ReleaseID, scanErr)
+		}
+		rooms = append(rooms, room)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: 遍历 %s 与 %s 的房号差异分页失败: %w",
+			model.ErrQueryFailed, from.ReleaseID, to.ReleaseID, err)
+	}
+	return rooms, nil
+}
+
+// loadDiffBuildings 取 section=buildings 的一页；参数是 ($1 from, $2 to, $3 limit, $4 offset)。
+//
+// kind 不进 SQL：这一节的行恒为 building_changed，all 与 changed 是同一集合。
+func loadDiffBuildings(
+	ctx context.Context,
+	q releaseDiffQuerier,
+	params ReleaseDiffParams,
+	from ReleaseSide,
+	to ReleaseSide,
+) ([]DiffBuildingRow, error) {
+	rows, err := q.Query(ctx, releaseDiffBuildingsPageSQL,
+		from.ReleaseID, to.ReleaseID, params.Limit, params.Offset)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 读取 %s 与 %s 的归属变化分页失败: %w",
+			model.ErrQueryFailed, from.ReleaseID, to.ReleaseID, err)
+	}
+	defer rows.Close()
+
+	buildings := make([]DiffBuildingRow, 0)
+	for rows.Next() {
+		building, scanErr := scanDiffBuildingRow(rows.Scan)
+		if scanErr != nil {
+			return nil, fmt.Errorf("%w: 扫描 %s 与 %s 的归属变化分页失败: %w",
+				model.ErrQueryFailed, from.ReleaseID, to.ReleaseID, scanErr)
+		}
+		buildings = append(buildings, building)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: 遍历 %s 与 %s 的归属变化分页失败: %w",
+			model.ErrQueryFailed, from.ReleaseID, to.ReleaseID, err)
+	}
+	return buildings, nil
 }
 
 // loadReleaseDiffSide 读一侧版本头。

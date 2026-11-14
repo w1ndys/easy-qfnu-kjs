@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -433,12 +434,15 @@ type releaseDiffRoomSeed struct {
 //   - r208 第 9 周 0809：只在 to，状态 composite → 新增格，composite 由 0 变 1；
 //   - r209 第 9 周 0102：两侧 free → 未变格；
 //   - r209 第 10 周 0102：from class、to free → 状态变化（周在键里，第 9 周不受影响）；
+//   - r210 第 9 周 0102：只在 from → 消失格。这间房两版都有归属快照，格只在一侧，
+//     用来钉住「另一侧归属楼照常给值」——归属楼只看该房在该版有没有快照，与格是否
+//     出现无关（to 侧归属楼由 to 版快照给出，不是 nil）；
 //   - r201 第 11 周 0102：from 01 free + 02 class、to 01/02 都 class → 两侧折叠后的
 //     state_key 都是 class（未变格），只有 from 侧块内不一致。这一格钉住
 //     inconsistent 取自「from 或 to」两侧的并集 OR，而不是只看 to 侧。
 //
-// 于是并集 11 个格：added 1 / removed 2 / changed 4 / same 4，unknown 1→0，
-// composite 0→1，inconsistent_blocks 2；cells.total 是前三类之和 7，不含 same。
+// 于是并集 12 个格：added 1 / removed 3 / changed 4 / same 4，unknown 1→0，
+// composite 0→1，inconsistent_blocks 2；cells.total 是前三类之和 8，不含 same。
 func releaseDiffFixtureCells() []releaseDiffCellSeed {
 	return []releaseDiffCellSeed{
 		// from 侧
@@ -451,6 +455,9 @@ func releaseDiffFixtureCells() []releaseDiffCellSeed {
 		{releaseDiffFromID, "r207", 9, 1, []string{"08", "09"}, "unknown"},
 		{releaseDiffFromID, "r209", 9, 1, []string{"01", "02"}, "free"},
 		{releaseDiffFromID, "r209", 10, 1, []string{"01", "02"}, "class"},
+		// 这间房两版都有归属快照，但格只在 from 侧：明细里 to_state 是 nil，
+		// to_building 仍是 to 版快照里的楼（不是 nil）。
+		{releaseDiffFromID, "r210", 9, 1, []string{"01", "02"}, "free"},
 		// 第 11 周这一格的 from 侧两行状态不同：折叠后 state_key = min = class，
 		// max = free ≠ min，于是这一格计入 inconsistent_blocks（to 侧折成同一个
 		// class，kind 是 same——不一致与「状态是否变化」是两件事）。
@@ -475,10 +482,12 @@ func releaseDiffFixtureCells() []releaseDiffCellSeed {
 }
 
 // releaseDiffFixtureRooms 是两版归属快照，覆盖房号新增 / 消失 / 保留 / 换楼：
-//   - from：r201 r202 r203 r204 r205 r206 r207 r209（8 间）；
-//   - to：  r201 r203 r204 r205 r207 r208 r209（7 间，r204 从 Q10 换到 Q03）。
+//   - from：r201 r202 r203 r204 r205 r206 r207 r209 r210（9 间）；
+//   - to：  r201 r203 r204 r205 r207 r208 r209 r210（8 间；r204 从 Q10 换到 Q03、
+//     r210 从 Q03 换到 Q10）。
 //
-// 于是 rooms = added 1（r208）/ removed 2（r202、r206）/ shared 6 / building_changed 1。
+// 于是 rooms = added 1（r208）/ removed 2（r202、r206）/ shared 7 / building_changed 2
+// （r204、r210）。r210 同时是 cells 小节「房号两版都有快照、格只在一侧」的夹具。
 func releaseDiffFixtureRooms() map[string][]releaseDiffRoomSeed {
 	return map[string][]releaseDiffRoomSeed{
 		releaseDiffFromID: {
@@ -490,6 +499,7 @@ func releaseDiffFixtureRooms() map[string][]releaseDiffRoomSeed {
 			{"r206", "Q03", "老文史楼"},
 			{"r207", "Q03", "老文史楼"},
 			{"r209", "Q10", "综合教学楼"},
+			{"r210", "Q03", "老文史楼"}, // 换楼的第一侧
 		},
 		releaseDiffToID: {
 			{"r201", "Q10", "综合教学楼"},
@@ -499,6 +509,7 @@ func releaseDiffFixtureRooms() map[string][]releaseDiffRoomSeed {
 			{"r207", "Q03", "老文史楼"},
 			{"r208", "Q10", "综合教学楼"}, // 新增房号
 			{"r209", "Q10", "综合教学楼"},
+			{"r210", "Q10", "综合教学楼"}, // 归属变化，与 r204 方向相反
 		},
 	}
 }
@@ -520,7 +531,8 @@ VALUES ('r201', 'F201', 'F201', 'Q10', '综合教学楼'),
        ('r206', 'JA101', 'JA101', 'Q03', '老文史楼'),
        ('r207', 'JA102', 'JA102', 'Q03', '老文史楼'),
        ('r208', 'F208', 'F208', 'Q10', '综合教学楼'),
-       ('r209', 'F209', 'F209', 'Q10', '综合教学楼')`)
+       ('r209', 'F209', 'F209', 'Q10', '综合教学楼'),
+       ('r210', 'JA201', 'JA201', 'Q03', '老文史楼')`)
 
 	// 两个版本：from 带归属冲突标记且非 current；to 为 current。
 	mustExec(ctx, t, pool, `
@@ -578,8 +590,8 @@ func TestReleaseAdminRepoDiffAgainstRealDB(t *testing.T) {
 	}
 
 	want := ReleaseDiffSummary{
-		Cells:              DiffCellsSummary{Added: 1, Removed: 2, Changed: 4, Total: 7},
-		Rooms:              DiffRoomsSummary{Added: 1, Removed: 2, Shared: 6, BuildingChanged: 1},
+		Cells:              DiffCellsSummary{Added: 1, Removed: 3, Changed: 4, Total: 8},
+		Rooms:              DiffRoomsSummary{Added: 1, Removed: 2, Shared: 7, BuildingChanged: 2},
 		Unknown:            StateDelta{From: 1, To: 0, Delta: -1},
 		Composite:          StateDelta{From: 0, To: 1, Delta: 1},
 		InconsistentBlocks: 2,
@@ -589,7 +601,7 @@ func TestReleaseAdminRepoDiffAgainstRealDB(t *testing.T) {
 		t.Fatalf("汇总不符:\n got %+v\nwant %+v", diff.Summary, want)
 	}
 
-	// 折叠 CTE 的逐格计数：并集 11 行，四种 kind 各数一遍。'same' 必须真的被数到
+	// 折叠 CTE 的逐格计数：并集 12 行，四种 kind 各数一遍。'same' 必须真的被数到
 	// （4 个），否则「未变格」只写在注释里、没进断言；inconsistent 数 2，钉住它取
 	// from / to 两侧的并集 OR，而不是只看 to 侧。
 	var foldedCounts struct {
@@ -611,7 +623,7 @@ SELECT count(*),
 	}
 	wantFolded := struct {
 		total, same, added, removed, changed, inconsistent int
-	}{11, 4, 1, 2, 4, 2}
+	}{12, 4, 1, 3, 4, 2}
 	if foldedCounts != wantFolded {
 		t.Fatalf("折叠后的逐格计数不符:\n got %+v\nwant %+v", foldedCounts, wantFolded)
 	}
@@ -681,8 +693,8 @@ SELECT j.kind, j.inconsistent, f.state_key, f.max_state
 		t.Fatalf("交换两侧后对比失败: %v", err)
 	}
 	wantSwapped := ReleaseDiffSummary{
-		Cells:              DiffCellsSummary{Added: 2, Removed: 1, Changed: 4, Total: 7},
-		Rooms:              DiffRoomsSummary{Added: 2, Removed: 1, Shared: 6, BuildingChanged: 1},
+		Cells:              DiffCellsSummary{Added: 3, Removed: 1, Changed: 4, Total: 8},
+		Rooms:              DiffRoomsSummary{Added: 2, Removed: 1, Shared: 7, BuildingChanged: 2},
 		Unknown:            StateDelta{From: 0, To: 1, Delta: 1},
 		Composite:          StateDelta{From: 1, To: 0, Delta: -1},
 		InconsistentBlocks: 2,
@@ -884,5 +896,544 @@ VALUES ($1, $2, $3, 1, 1, false),
 	want := ReleaseDiffSummary{SameTerm: true}
 	if diff.Summary != want {
 		t.Fatalf("空版本之间的汇总应全零:\n got %+v\nwant %+v", diff.Summary, want)
+	}
+}
+
+// releaseDiffCellsFixture 是 seedReleaseDiffFixture 的两版在 cells 小节的全部差异行，
+// 按固定排序键 (room_id, week, weekday, block) 升序。
+//
+// 与 releaseDiffFixtureCells 的注释对应：12 个折叠格里 4 个 same 不进明细，剩下
+// 8 行 = added 1（r208）/ removed 3（r202、r206、r210）/ changed 4（r203、r205、r207、r209）。
+//
+// 归属楼只看该房在该版有没有归属快照（release_id + room_id 左连接），与格是否出现
+// 无关：格只在一侧时另一侧的格状态为 nil，但归属楼照常给值——最后一行 r210 就是
+// 这条的钉子（to 侧没有格，to_building 仍是 to 版快照的 Q10）。
+func releaseDiffCellsFixture() []DiffCellRow {
+	return []DiffCellRow{
+		{
+			Kind: DiffKindRemoved, RoomID: "r202", RoomName: "F202",
+			Week: 9, Weekday: 1, Block: "0102",
+			FromState:    releaseAdminPtr("free"),
+			FromBuilding: releaseAdminPtr("Q10"),
+		},
+		{
+			Kind: DiffKindChanged, RoomID: "r203", RoomName: "F203",
+			Week: 9, Weekday: 1, Block: "0102",
+			FromState:    releaseAdminPtr("free"),
+			ToState:      releaseAdminPtr("class"),
+			FromBuilding: releaseAdminPtr("Q10"),
+			ToBuilding:   releaseAdminPtr("Q10"),
+		},
+		{
+			Kind: DiffKindChanged, RoomID: "r205", RoomName: "F205",
+			Week: 9, Weekday: 1, Block: "0607",
+			FromState:    releaseAdminPtr("free"),
+			ToState:      releaseAdminPtr("class"),
+			FromBuilding: releaseAdminPtr("Q10"),
+			ToBuilding:   releaseAdminPtr("Q10"),
+		},
+		{
+			Kind: DiffKindRemoved, RoomID: "r206", RoomName: "JA101",
+			Week: 9, Weekday: 1, Block: "0102",
+			FromState:    releaseAdminPtr("free"),
+			FromBuilding: releaseAdminPtr("Q03"),
+		},
+		{
+			Kind: DiffKindChanged, RoomID: "r207", RoomName: "JA102",
+			Week: 9, Weekday: 1, Block: "0809",
+			FromState:    releaseAdminPtr("unknown"),
+			ToState:      releaseAdminPtr("free"),
+			FromBuilding: releaseAdminPtr("Q03"),
+			ToBuilding:   releaseAdminPtr("Q03"),
+		},
+		{
+			Kind: DiffKindAdded, RoomID: "r208", RoomName: "F208",
+			Week: 9, Weekday: 1, Block: "0809",
+			ToState:    releaseAdminPtr("composite"),
+			ToBuilding: releaseAdminPtr("Q10"),
+		},
+		{
+			Kind: DiffKindChanged, RoomID: "r209", RoomName: "F209",
+			Week: 10, Weekday: 1, Block: "0102",
+			FromState:    releaseAdminPtr("class"),
+			ToState:      releaseAdminPtr("free"),
+			FromBuilding: releaseAdminPtr("Q10"),
+			ToBuilding:   releaseAdminPtr("Q10"),
+		},
+		// 房号两版都有归属快照，格只在 from 侧：ToState 为 nil，但 ToBuilding 不是 nil，
+		// 而且是 to 版快照里的 Q10（from 版是 Q03）——归属楼与格是否出现无关。
+		{
+			Kind: DiffKindRemoved, RoomID: "r210", RoomName: "JA201",
+			Week: 9, Weekday: 1, Block: "0102",
+			FromState:    releaseAdminPtr("free"),
+			FromBuilding: releaseAdminPtr("Q03"),
+			ToBuilding:   releaseAdminPtr("Q10"),
+		},
+	}
+}
+
+// releaseDiffBuildingsFixture 是 section=buildings 的全部行，按排序键 room_id 升序。
+//
+// 两间房都换了楼、方向相反：r204 从 Q10 到 Q03、r210 从 Q03 到 Q10。四个归属字段
+// 全部非空，因为这一节只取两版快照的交集；相邻页断言靠它们的顺序。
+func releaseDiffBuildingsFixture() []DiffBuildingRow {
+	return []DiffBuildingRow{
+		{
+			RoomID: "r204", RoomName: "F204",
+			FromBuilding: "Q10", FromBuildingName: "综合教学楼",
+			ToBuilding: "Q03", ToBuildingName: "老文史楼",
+		},
+		{
+			RoomID: "r210", RoomName: "JA201",
+			FromBuilding: "Q03", FromBuildingName: "老文史楼",
+			ToBuilding: "Q10", ToBuildingName: "综合教学楼",
+		},
+	}
+}
+
+// swapDiffCellRows 把 cells 夹具的两侧对调：added ↔ removed、changed 不变，
+// 两侧格状态与两侧归属楼互换，行序不变（排序键与哪一侧无关）。
+//
+// 交换 from / to 后的期望页由它生成，于是断言落到行级 kind 与顺序，而不只是条数。
+func swapDiffCellRows(rows []DiffCellRow) []DiffCellRow {
+	swapped := make([]DiffCellRow, 0, len(rows))
+	for _, row := range rows {
+		switch row.Kind {
+		case DiffKindAdded:
+			row.Kind = DiffKindRemoved
+		case DiffKindRemoved:
+			row.Kind = DiffKindAdded
+		}
+		row.FromState, row.ToState = row.ToState, row.FromState
+		row.FromBuilding, row.ToBuilding = row.ToBuilding, row.FromBuilding
+		swapped = append(swapped, row)
+	}
+	return swapped
+}
+
+// TestReleaseAdminRepoDiffCellsPageAgainstRealDB 覆盖 section=cells 的真实库口径
+// （Requirement 4.1、4.2、4.4）：逐行断言排序、kind、两侧状态与两侧归属楼（含 null
+// 形状），并按类别过滤逐类断言条数；total 由同一快照的汇总推导，与未分页行数一致。
+func TestReleaseAdminRepoDiffCellsPageAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseDiffFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	all := releaseDiffCellsFixture()
+	diff, err := repo.Diff(ctx, ReleaseDiffParams{
+		From: releaseDiffFromID, To: releaseDiffToID,
+		Section: DiffSectionCells, Kind: DiffKindAll, Limit: 200, Offset: 0,
+	})
+	if err != nil {
+		t.Fatalf("读 cells 分页失败: %v", err)
+	}
+	if !reflect.DeepEqual(diff.Cells, all) {
+		t.Fatalf("cells 分页不符:\n got %+v\nwant %+v", diff.Cells, all)
+	}
+	// rooms / buildings 未选中：仍是非 nil 空切片。
+	if diff.Rooms == nil || diff.Buildings == nil {
+		t.Fatalf("未选中小节应为非 nil 空切片: rooms=%v buildings=%v",
+			diff.Rooms, diff.Buildings)
+	}
+	if len(diff.Rooms) != 0 || len(diff.Buildings) != 0 {
+		t.Fatalf("未选中小节不应有行: %+v / %+v", diff.Rooms, diff.Buildings)
+	}
+
+	// r210 的格只在 from 侧、房号两版都有归属快照：to_state 是 nil，但 to_building
+	// 不是 nil，且取 to 版快照的 Q10（归属楼只看该房在该版有没有快照，与格是否出现
+	// 无关）。单列一条断言，让这条语义在失败时一眼可读，而不只是藏在夹具对比里。
+	var onlyFrom *DiffCellRow
+	for index := range diff.Cells {
+		if diff.Cells[index].RoomID == "r210" {
+			onlyFrom = &diff.Cells[index]
+			break
+		}
+	}
+	if onlyFrom == nil {
+		t.Fatal("cells 分页缺 r210 这一行")
+	}
+	if onlyFrom.ToState != nil {
+		t.Fatalf("r210 只在 from 侧，to_state 应为 nil: %+v", *onlyFrom)
+	}
+	if onlyFrom.ToBuilding == nil || *onlyFrom.ToBuilding != "Q10" {
+		t.Fatalf("r210 两版都有归属快照，to_building 应为 Q10 而不是 nil: %+v", *onlyFrom)
+	}
+
+	// total 从汇总推导：all 取 cells.total，且与未分页行数一致（不在分页语句里数行）。
+	if got := DiffTotal(DiffSectionCells, DiffKindAll, diff.Summary); got != len(all) {
+		t.Fatalf("cells/all 的 total 应为 %d（汇总推导），实际 %d", len(all), got)
+	}
+
+	// 逐类过滤：条数与汇总里的分类计数逐一对应。
+	for _, testCase := range []struct {
+		kind     DiffKind
+		want     int
+		wantRows []string // room_id 的期望顺序
+	}{
+		{DiffKindAdded, 1, []string{"r208"}},
+		{DiffKindRemoved, 3, []string{"r202", "r206", "r210"}},
+		{DiffKindChanged, 4, []string{"r203", "r205", "r207", "r209"}},
+	} {
+		filtered, filterErr := repo.Diff(ctx, ReleaseDiffParams{
+			From: releaseDiffFromID, To: releaseDiffToID,
+			Section: DiffSectionCells, Kind: testCase.kind, Limit: 200, Offset: 0,
+		})
+		if filterErr != nil {
+			t.Fatalf("读 cells/%s 分页失败: %v", testCase.kind, filterErr)
+		}
+		if len(filtered.Cells) != testCase.want {
+			t.Fatalf("cells/%s 应有 %d 行，实际 %d 行: %+v",
+				testCase.kind, testCase.want, len(filtered.Cells), filtered.Cells)
+		}
+		for index, roomID := range testCase.wantRows {
+			if filtered.Cells[index].RoomID != roomID {
+				t.Fatalf("cells/%s 第 %d 行应为 %s，实际 %+v",
+					testCase.kind, index, roomID, filtered.Cells[index])
+			}
+			if filtered.Cells[index].Kind != testCase.kind {
+				t.Fatalf("cells/%s 第 %d 行的 kind 不符: %+v",
+					testCase.kind, index, filtered.Cells[index])
+			}
+		}
+		if got, wantTotal := DiffTotal(DiffSectionCells, testCase.kind, filtered.Summary), testCase.want; got != wantTotal {
+			t.Fatalf("cells/%s 的 total 应由汇总推导为 %d，实际 %d", testCase.kind, wantTotal, got)
+		}
+	}
+
+	// 省略 section/kind/limit 时走 cells/all/50：与显式请求同一页。
+	defaulted, err := repo.Diff(ctx, ReleaseDiffParams{From: releaseDiffFromID, To: releaseDiffToID})
+	if err != nil {
+		t.Fatalf("缺省参数读对比失败: %v", err)
+	}
+	if !reflect.DeepEqual(defaulted.Cells, all) {
+		t.Fatalf("缺省 section 应为 cells/all 且页大小 50（夹具 8 行）:\n got %+v\nwant %+v",
+			defaulted.Cells, all)
+	}
+}
+
+// TestReleaseAdminRepoDiffRoomsPageAgainstRealDB 覆盖 section=rooms 的真实库口径
+// （Requirement 4.3、4.4）：added / removed 的条数与归属字段的 null 形状。
+func TestReleaseAdminRepoDiffRoomsPageAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseDiffFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	wantAll := []DiffRoomRow{
+		{
+			Kind: DiffKindRemoved, RoomID: "r202", RoomName: "F202",
+			FromBuilding:     releaseAdminPtr("Q10"),
+			FromBuildingName: releaseAdminPtr("综合教学楼"),
+		},
+		{
+			Kind: DiffKindRemoved, RoomID: "r206", RoomName: "JA101",
+			FromBuilding:     releaseAdminPtr("Q03"),
+			FromBuildingName: releaseAdminPtr("老文史楼"),
+		},
+		{
+			Kind: DiffKindAdded, RoomID: "r208", RoomName: "F208",
+			ToBuilding:     releaseAdminPtr("Q10"),
+			ToBuildingName: releaseAdminPtr("综合教学楼"),
+		},
+	}
+
+	diff, err := repo.Diff(ctx, ReleaseDiffParams{
+		From: releaseDiffFromID, To: releaseDiffToID,
+		Section: DiffSectionRooms, Kind: DiffKindAll, Limit: 200, Offset: 0,
+	})
+	if err != nil {
+		t.Fatalf("读 rooms 分页失败: %v", err)
+	}
+	if !reflect.DeepEqual(diff.Rooms, wantAll) {
+		t.Fatalf("rooms 分页不符:\n got %+v\nwant %+v", diff.Rooms, wantAll)
+	}
+	// rooms 的 total 不含 shared：all = added + removed。
+	if got := DiffTotal(DiffSectionRooms, DiffKindAll, diff.Summary); got != len(wantAll) {
+		t.Fatalf("rooms/all 的 total 应为 %d，实际 %d", len(wantAll), got)
+	}
+
+	for _, testCase := range []struct {
+		kind DiffKind
+		want int
+	}{
+		{DiffKindAdded, 1},
+		{DiffKindRemoved, 2},
+	} {
+		filtered, filterErr := repo.Diff(ctx, ReleaseDiffParams{
+			From: releaseDiffFromID, To: releaseDiffToID,
+			Section: DiffSectionRooms, Kind: testCase.kind, Limit: 200, Offset: 0,
+		})
+		if filterErr != nil {
+			t.Fatalf("读 rooms/%s 分页失败: %v", testCase.kind, filterErr)
+		}
+		if len(filtered.Rooms) != testCase.want {
+			t.Fatalf("rooms/%s 应有 %d 行，实际 %d 行: %+v",
+				testCase.kind, testCase.want, len(filtered.Rooms), filtered.Rooms)
+		}
+		for _, row := range filtered.Rooms {
+			if row.Kind != testCase.kind {
+				t.Fatalf("rooms/%s 出现别的 kind: %+v", testCase.kind, row)
+			}
+			// added 的 from_* 必须为 nil，removed 的 to_* 必须为 nil（null 形状）。
+			if testCase.kind == DiffKindAdded &&
+				(row.FromBuilding != nil || row.FromBuildingName != nil) {
+				t.Fatalf("新增房不应有 from_*: %+v", row)
+			}
+			if testCase.kind == DiffKindRemoved &&
+				(row.ToBuilding != nil || row.ToBuildingName != nil) {
+				t.Fatalf("消失房不应有 to_*: %+v", row)
+			}
+		}
+		if got := DiffTotal(DiffSectionRooms, testCase.kind, filtered.Summary); got != testCase.want {
+			t.Fatalf("rooms/%s 的 total 应为 %d，实际 %d", testCase.kind, testCase.want, got)
+		}
+	}
+}
+
+// TestReleaseAdminRepoDiffBuildingsPageAgainstRealDB 覆盖 section=buildings 的真实库口径
+// （Requirement 4.3、4.4）：只返回两侧都有且换了楼的房号，归属字段都非空；
+// all 与 changed 是同一集合，total 取汇总的 building_changed。
+func TestReleaseAdminRepoDiffBuildingsPageAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseDiffFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	want := releaseDiffBuildingsFixture()
+
+	for _, kind := range []DiffKind{DiffKindAll, DiffKindChanged} {
+		diff, err := repo.Diff(ctx, ReleaseDiffParams{
+			From: releaseDiffFromID, To: releaseDiffToID,
+			Section: DiffSectionBuildings, Kind: kind, Limit: 200, Offset: 0,
+		})
+		if err != nil {
+			t.Fatalf("读 buildings/%s 分页失败: %v", kind, err)
+		}
+		if !reflect.DeepEqual(diff.Buildings, want) {
+			t.Fatalf("buildings/%s 分页不符:\n got %+v\nwant %+v", kind, diff.Buildings, want)
+		}
+		if got := DiffTotal(DiffSectionBuildings, kind, diff.Summary); got != len(want) {
+			t.Fatalf("buildings/%s 的 total 应为 %d，实际 %d", kind, len(want), got)
+		}
+	}
+}
+
+// TestReleaseAdminRepoDiffPaginationAgainstRealDB 覆盖分页的确定性与边界（CP6）：
+// 三节各自相邻页无重复、无遗漏，offset 翻过末页返回空 items 且 total 不变，同一请求
+// 重复执行返回同一页；buildings 的相邻页断言同时钉住两间换楼房号的排序。
+func TestReleaseAdminRepoDiffPaginationAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseDiffFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	all := releaseDiffCellsFixture()
+	params := func(limit, offset int) ReleaseDiffParams {
+		return ReleaseDiffParams{
+			From: releaseDiffFromID, To: releaseDiffToID,
+			Section: DiffSectionCells, Kind: DiffKindAll, Limit: limit, Offset: offset,
+		}
+	}
+
+	// 每页 2 条：2/2/2/2（8 行），拼起来必须与一次性取全量完全一致（无重复、无遗漏）。
+	collected := make([]DiffCellRow, 0, len(all))
+	for offset := 0; offset < len(all); offset += 2 {
+		page, err := repo.Diff(ctx, params(2, offset))
+		if err != nil {
+			t.Fatalf("读第 %d 页失败: %v", offset/2, err)
+		}
+		wantLen := 2
+		if remaining := len(all) - offset; remaining < 2 {
+			wantLen = remaining
+		}
+		if len(page.Cells) != wantLen {
+			t.Fatalf("offset=%d 的页应有 %d 行，实际 %d 行: %+v",
+				offset, wantLen, len(page.Cells), page.Cells)
+		}
+		if got := DiffTotal(DiffSectionCells, DiffKindAll, page.Summary); got != len(all) {
+			t.Fatalf("offset=%d 的 total 应恒为 %d，实际 %d", offset, len(all), got)
+		}
+		collected = append(collected, page.Cells...)
+	}
+	if !reflect.DeepEqual(collected, all) {
+		t.Fatalf("相邻页拼接后应与全量一致（无重复无遗漏）:\n got %+v\nwant %+v", collected, all)
+	}
+
+	// offset 翻过末页：空 items，total 仍是真实值。
+	beyond, err := repo.Diff(ctx, params(50, 100))
+	if err != nil {
+		t.Fatalf("读越界页失败: %v", err)
+	}
+	if beyond.Cells == nil {
+		t.Fatal("越界页应返回空切片而不是 nil")
+	}
+	if len(beyond.Cells) != 0 {
+		t.Fatalf("越界页不应有行: %+v", beyond.Cells)
+	}
+	if got := DiffTotal(DiffSectionCells, DiffKindAll, beyond.Summary); got != len(all) {
+		t.Fatalf("越界页的 total 应仍为 %d，实际 %d", len(all), got)
+	}
+
+	// 同一请求重复执行：行与顺序完全一致。
+	first, err := repo.Diff(ctx, params(2, 2))
+	if err != nil {
+		t.Fatalf("读固定页失败: %v", err)
+	}
+	second, err := repo.Diff(ctx, params(2, 2))
+	if err != nil {
+		t.Fatalf("重复读固定页失败: %v", err)
+	}
+	if !reflect.DeepEqual(first.Cells, second.Cells) {
+		t.Fatalf("同一请求两次应返回同一页:\n first %+v\nsecond %+v", first.Cells, second.Cells)
+	}
+	if len(first.Cells) != 2 || first.Cells[0].RoomID != "r205" || first.Cells[1].RoomID != "r206" {
+		t.Fatalf("offset=2 的页应为 r205、r206，实际 %+v", first.Cells)
+	}
+
+	// rooms 小节也逐页翻：每页 1 条，拼起来等于全量。
+	roomAll := []DiffRoomRow{
+		{Kind: DiffKindRemoved, RoomID: "r202", RoomName: "F202",
+			FromBuilding: releaseAdminPtr("Q10"), FromBuildingName: releaseAdminPtr("综合教学楼")},
+		{Kind: DiffKindRemoved, RoomID: "r206", RoomName: "JA101",
+			FromBuilding: releaseAdminPtr("Q03"), FromBuildingName: releaseAdminPtr("老文史楼")},
+		{Kind: DiffKindAdded, RoomID: "r208", RoomName: "F208",
+			ToBuilding: releaseAdminPtr("Q10"), ToBuildingName: releaseAdminPtr("综合教学楼")},
+	}
+	roomCollected := make([]DiffRoomRow, 0, len(roomAll))
+	for offset := 0; offset < len(roomAll); offset++ {
+		page, pageErr := repo.Diff(ctx, ReleaseDiffParams{
+			From: releaseDiffFromID, To: releaseDiffToID,
+			Section: DiffSectionRooms, Kind: DiffKindAll, Limit: 1, Offset: offset,
+		})
+		if pageErr != nil {
+			t.Fatalf("读 rooms 第 %d 页失败: %v", offset, pageErr)
+		}
+		if len(page.Rooms) != 1 {
+			t.Fatalf("rooms offset=%d 应有 1 行，实际 %+v", offset, page.Rooms)
+		}
+		roomCollected = append(roomCollected, page.Rooms...)
+	}
+	if !reflect.DeepEqual(roomCollected, roomAll) {
+		t.Fatalf("rooms 相邻页拼接不符:\n got %+v\nwant %+v", roomCollected, roomAll)
+	}
+
+	// rooms 越界页：空 items 但不是 nil，total 仍是 added + removed（翻页不改变 total）。
+	roomBeyond, roomBeyondErr := repo.Diff(ctx, ReleaseDiffParams{
+		From: releaseDiffFromID, To: releaseDiffToID,
+		Section: DiffSectionRooms, Kind: DiffKindAll, Limit: 50, Offset: 100,
+	})
+	if roomBeyondErr != nil {
+		t.Fatalf("读 rooms 越界页失败: %v", roomBeyondErr)
+	}
+	if roomBeyond.Rooms == nil {
+		t.Fatal("rooms 越界页应返回空切片而不是 nil")
+	}
+	if len(roomBeyond.Rooms) != 0 {
+		t.Fatalf("rooms 越界页不应有行: %+v", roomBeyond.Rooms)
+	}
+	if got := DiffTotal(DiffSectionRooms, DiffKindAll, roomBeyond.Summary); got != len(roomAll) {
+		t.Fatalf("rooms 越界页的 total 应仍为 %d，实际 %d", len(roomAll), got)
+	}
+
+	// rooms 同一请求重复执行：行与顺序完全一致（offset=1 的页应是 r206）。
+	roomPage := func(offset int) ReleaseDiffParams {
+		return ReleaseDiffParams{
+			From: releaseDiffFromID, To: releaseDiffToID,
+			Section: DiffSectionRooms, Kind: DiffKindAll, Limit: 1, Offset: offset,
+		}
+	}
+	roomFirst, roomFirstErr := repo.Diff(ctx, roomPage(1))
+	if roomFirstErr != nil {
+		t.Fatalf("读 rooms 固定页失败: %v", roomFirstErr)
+	}
+	roomSecond, roomSecondErr := repo.Diff(ctx, roomPage(1))
+	if roomSecondErr != nil {
+		t.Fatalf("重复读 rooms 固定页失败: %v", roomSecondErr)
+	}
+	if !reflect.DeepEqual(roomFirst.Rooms, roomSecond.Rooms) {
+		t.Fatalf("rooms 同一请求两次应返回同一页:\n first %+v\nsecond %+v",
+			roomFirst.Rooms, roomSecond.Rooms)
+	}
+	if len(roomFirst.Rooms) != 1 || roomFirst.Rooms[0].RoomID != "r206" {
+		t.Fatalf("rooms offset=1 的页应为 r206，实际 %+v", roomFirst.Rooms)
+	}
+
+	// buildings 小节逐页翻：每页 1 条，相邻页各一间且顺序由 room_id 决定
+	// （r204 Q10→Q03、r210 Q03→Q10），拼起来等于全量。
+	buildingAll := releaseDiffBuildingsFixture()
+	buildingParams := func(offset int) ReleaseDiffParams {
+		return ReleaseDiffParams{
+			From: releaseDiffFromID, To: releaseDiffToID,
+			Section: DiffSectionBuildings, Kind: DiffKindAll, Limit: 1, Offset: offset,
+		}
+	}
+	buildingCollected := make([]DiffBuildingRow, 0, len(buildingAll))
+	for offset := 0; offset < len(buildingAll); offset++ {
+		page, pageErr := repo.Diff(ctx, buildingParams(offset))
+		if pageErr != nil {
+			t.Fatalf("读 buildings 第 %d 页失败: %v", offset, pageErr)
+		}
+		if len(page.Buildings) != 1 {
+			t.Fatalf("buildings offset=%d 应有 1 行，实际 %+v", offset, page.Buildings)
+		}
+		if got, want := page.Buildings[0].RoomID, buildingAll[offset].RoomID; got != want {
+			t.Fatalf("buildings offset=%d 的相邻页应为 %s，实际 %s", offset, want, got)
+		}
+		if got := DiffTotal(DiffSectionBuildings, DiffKindAll, page.Summary); got != len(buildingAll) {
+			t.Fatalf("buildings offset=%d 的 total 应恒为 %d，实际 %d",
+				offset, len(buildingAll), got)
+		}
+		buildingCollected = append(buildingCollected, page.Buildings...)
+	}
+	if !reflect.DeepEqual(buildingCollected, buildingAll) {
+		t.Fatalf("buildings 相邻页拼接不符:\n got %+v\nwant %+v", buildingCollected, buildingAll)
+	}
+
+	// buildings 越界页：空 items 但不是 nil，total 仍是 building_changed。
+	buildingBeyond, buildingBeyondErr := repo.Diff(ctx, ReleaseDiffParams{
+		From: releaseDiffFromID, To: releaseDiffToID,
+		Section: DiffSectionBuildings, Kind: DiffKindAll, Limit: 50, Offset: 100,
+	})
+	if buildingBeyondErr != nil {
+		t.Fatalf("读 buildings 越界页失败: %v", buildingBeyondErr)
+	}
+	if buildingBeyond.Buildings == nil {
+		t.Fatal("buildings 越界页应返回空切片而不是 nil")
+	}
+	if len(buildingBeyond.Buildings) != 0 {
+		t.Fatalf("buildings 越界页不应有行: %+v", buildingBeyond.Buildings)
+	}
+	if got := DiffTotal(DiffSectionBuildings, DiffKindAll, buildingBeyond.Summary); got != len(buildingAll) {
+		t.Fatalf("buildings 越界页的 total 应仍为 %d，实际 %d", len(buildingAll), got)
+	}
+
+	// buildings 同一请求重复执行：行与顺序完全一致（offset=1 的页应是 r210）。
+	buildingFirst, buildingFirstErr := repo.Diff(ctx, buildingParams(1))
+	if buildingFirstErr != nil {
+		t.Fatalf("读 buildings 固定页失败: %v", buildingFirstErr)
+	}
+	buildingSecond, buildingSecondErr := repo.Diff(ctx, buildingParams(1))
+	if buildingSecondErr != nil {
+		t.Fatalf("重复读 buildings 固定页失败: %v", buildingSecondErr)
+	}
+	if !reflect.DeepEqual(buildingFirst.Buildings, buildingSecond.Buildings) {
+		t.Fatalf("buildings 同一请求两次应返回同一页:\n first %+v\nsecond %+v",
+			buildingFirst.Buildings, buildingSecond.Buildings)
+	}
+	if len(buildingFirst.Buildings) != 1 || buildingFirst.Buildings[0].RoomID != "r210" {
+		t.Fatalf("buildings offset=1 的页应为 r210，实际 %+v", buildingFirst.Buildings)
+	}
+
+	// 交换 from / to 后分页仍按同一排序键：行序不变，added 与 removed 互换、changed
+	// 行不变，两侧格状态与两侧归属楼互换——逐行断言到 kind 与顺序，不只是条数。
+	swapped, err := repo.Diff(ctx, ReleaseDiffParams{
+		From: releaseDiffToID, To: releaseDiffFromID,
+		Section: DiffSectionCells, Kind: DiffKindAll, Limit: 200, Offset: 0,
+	})
+	if err != nil {
+		t.Fatalf("交换两侧后读 cells 分页失败: %v", err)
+	}
+	if wantSwapped := swapDiffCellRows(all); !reflect.DeepEqual(swapped.Cells, wantSwapped) {
+		t.Fatalf("交换两侧后的 cells 页不符:\n got %+v\nwant %+v", swapped.Cells, wantSwapped)
+	}
+	if got := DiffTotal(DiffSectionCells, DiffKindAll, swapped.Summary); got != len(all) {
+		t.Fatalf("交换两侧后 total 应不变: got %d want %d", got, len(all))
 	}
 }
