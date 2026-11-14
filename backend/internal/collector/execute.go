@@ -11,6 +11,7 @@ import (
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/parser"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/pipeline"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/publish"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/upstream"
 )
@@ -25,9 +26,10 @@ var errSettingsIncomplete = errors.New("设置项未配齐或无法解封")
 
 // execute 是一轮采集的执行体：从读设置开始，到发布或失败收口为止。
 //
-// 到本项（tasklist 第 9 项）为止，execute 覆盖下面第 1–10 步：读设置 → 登录 →
-// 学期/周历 → 写学期日历并绑定学期 → 采集窗口 → 字典与轴快照 → hydrate →
-// 两段式 Plan/Run（周矩阵 → 明细）。阶段顺序是固定契约，每一步的位置都有理由：
+// 它覆盖下面第 1–17 步：读设置 → 登录 → 学期/周历 → 写学期日历并绑定学期 →
+// 采集窗口 → 字典与轴快照 → hydrate → 两段式 Plan/Run（周矩阵 → 明细）→
+// 发布（validate 阶段 → Build → Validate → Commit）。阶段顺序是固定契约，
+// 每一步的位置都有理由：
 //  1. 读设置：账号、OCR 地址与白名单来自同一次 Load，密码只能 Reveal；缺一项就在
 //     发第一个上游请求之前失败，错误码 settings_incomplete；
 //  2. 登录：密码错误与验证码耗尽各有固定错误码，网络/超时按 design 的口径不编码；
@@ -48,11 +50,13 @@ var errSettingsIncomplete = errors.New("设置项未配齐或无法解封")
 //     第一段之前，阶段不推进，续跑时仍停在 week_matrix（design 第 3 节第 10 步）；
 //     正常轮次命中 0 个键、不产生请求（CP10）；补抓失败按 failed 收口，不进入发布；
 //  10. 两段式执行：第一段周矩阵、第二段占用说明，中间用第一段的结果规划明细，并在
-//     必需矩阵已失败时直接收口跳过明细（Requirement 5、6、7、10.7）。
+//     必需矩阵已失败时直接收口跳过明细（Requirement 5、6、7、10.7）；
+//  11. 发布：success/partial 才进入，顺序固定为 AdvancePhase(validate) → Build →
+//     Validate → Commit；Build/Validate 拒绝收口 validation_blocked，Commit 失败
+//     收口 failed（无码），Commit 成功后不再调用任何收口函数（design 第 17 步、CP8）。
 //
-// design 的执行顺序里还有两步不在本项：楼列表（advisory，design 第 9 步）只记日志、
-// 不参与采集结果；发布（design 第 17 步）由第 10 项在本函数后面接续。本项在第二段
-// 收口判定之后返回，success/partial 的发布留给第 10 项。
+// design 的执行顺序里只有一步不在本函数：楼列表（advisory，design 第 9 步）。它只记
+// 日志、不参与采集结果，当前实现没有调用它（upstreamAPI 里保留了该方法）。
 //
 // 每一个失败点都在本函数内收口，并把原因返回给 run() 记 WARN：执行体自己收口、
 // run() 不补刀，两层都写终态会撞 FinishRun 的 status='running' 守卫（CP8）。
@@ -190,8 +194,9 @@ func (c *Collector) prepare(ctx context.Context, runID int64) (roundSetup, error
 //     pipeline.Run 的归属过滤里被丢弃（Requirement 5.3）；
 //  4. 第二段用 Plan2 的任务执行明细，收口判定与第一段同一口径（CP7）：交给
 //     EvaluateRun 的是 RunProgress.Dropped()，库里没有这批丢弃任务的 failed 行；
-//  5. failed 才 CloseRun；success / partial 由第 10 项的发布事务写终态，
-//     本项不提前收口——发布成功后不再调用任何收口函数（CP8）。
+//  5. failed 才 CloseRun；success / partial 进入发布：AdvancePhase(validate) →
+//     Build → Validate → Commit，发布事务在同一个事务里写死终态，成功后不再调用
+//     任何收口函数（design 第 17 步、CP8）。
 //
 // 两段共用同一个任务抓取器（taskFetcher 按 task.Kind 分派），不按段各给一个闭包：
 // pipeline.Run 每次调用都会执行库里该段已有的全部同类任务，第一段可能拿到上一轮
@@ -275,10 +280,123 @@ func (c *Collector) runStages(
 		return c.closeRun(ctx, runID, dropped)
 	}
 
-	// status2 是 success 或 partial：两者都进入发布，由第 10 项接续
-	// （AdvancePhase(validate) → Build → Validate → Commit）。本项到此返回，
-	// 轮次保持 running，不提前收口。
+	// status2 是 success 或 partial：两者都进入发布（design 第 16–17 步）。
+	// 归属快照沿用第二段规划前读回的那一份：本轮 collect_run_room 只增不改，
+	// 中途没有第二次裁决，再读一次只会多一次查询。
+	return c.publishRun(ctx, runID, setup, candidates, rooms, dropped)
+}
+
+// publishRun 是本轮的最后一段：推进 validate 阶段 → Build → Validate → Commit
+// （design 第 17 步、Requirement 9）。
+//
+// 三个失败点的收口方式是 design 定死的分层，不能合并：
+//   - Build / Validate 拒绝（候选集为空、必需任务未完成、归属快照不完整、阈值超限、
+//     候选原料非法）：FailRun(validation_blocked)。它属于「这一轮的采集结果不满足发布
+//     门槛」，原 current 版本不动（CP9）。Build 的错误不全是拒绝：仓储读取失败与
+//     装配错误性质不同，必须按哨兵分流，见 publishBuildErrorCode；
+//   - Commit 失败：事务已整体回滚，轮次还停在 running，必须收口——不然
+//     collect_run_single_running 会一直被这一轮占着，下一次同步只能拿到 409。
+//     它不属于任何业务失败层，不编错误码（design「非结构失败不编码」）；
+//   - Commit 成功：发布事务已经在同一条 UPDATE 里写死 status、phase=publish、
+//     finished_at 与 released_at，轮次已离开 running。这里直接返回，**不再调用
+//     FailRun / CloseRun / EvaluateRun**——再收口只会撞 FinishRun 的 status='running'
+//     守卫并报错，把一次成功发布记成一条 WARN（CP8、Requirement 9.1、10.5）。
+//
+// dropped 与第二段交给 EvaluateRun / CloseRun 的是同一个值（CP7）：被归属过滤丢弃的
+// 明细任务从来没有写进 sync_task，任务汇总与 Validate 都看不见它们，只能由 RunInput
+// 带进候选集，供 Commit 判 success / partial / 拒绝发布。
+//
+// generatedAt 与发布时刻分两次取时钟：前者是版本生成时间（release.generated_at 与
+// 版本标识），后者是事务提交时刻（collect_run.released_at / updated_at），语义不同，
+// 不能共用一个 time.Time。
+func (c *Collector) publishRun(
+	ctx context.Context,
+	runID int64,
+	setup roundSetup,
+	candidates *bank,
+	rooms []store.RunRoom,
+	dropped pipeline.DroppedTasks,
+) error {
+	// 进发布前校验前先推进阶段（Requirement 9.5）：面板在「校验中」看到的进度
+	// 与真正的动作一致。阶段只前进，重复推进是幂等刷新计数（CP2）。
+	if err := pipeline.AdvancePhase(ctx, c.phases, runID, pipeline.PhaseValidate, c.clock); err != nil {
+		return c.failRun(ctx, runID, "", err)
+	}
+
+	candidate, err := publish.Build(ctx, c.reader, runID, publish.RunInput{
+		// 版本号与节次轴取本轮清洗时用的那一份快照：发布要如实记录「这批观测是按
+		// 哪一版字典与轴投影出来的」，重新读一次会拿到另一个版本。
+		DictVersion: setup.snapshot.DictVersion,
+		AxisVersion: setup.snapshot.AxisVersion,
+		GeneratedAt: c.clock(),
+		Buildings:   publishBuildings(setup.settings.Buildings),
+		AxisNodes:   setup.snapshot.Axis,
+		Cells:       candidates.publishCells(setup.settings.ids(), rooms, setup.window),
+		Details:     candidates.publishDetails(rooms),
+		// 与 EvaluateRun2 同一个 Dropped()，不再从库里另算一份（CP7）。
+		DroppedRequired: dropped.Required,
+		DroppedOptional: dropped.Optional,
+	})
+	if err != nil {
+		// Build 的错误是混装的：四类业务哨兵表示「这一轮的采集结果不满足发布
+		// 门槛」，仓储读取失败与装配错误（reader 为 nil）则是基础设施/编程错误。
+		// 只有前者是 validation_blocked；后者若也加载同一个码，排障时会把「库读
+		// 不出来」误读成「数据不合格」，所以不编码、原因照原样落库。
+		return c.failRun(ctx, runID, publishBuildErrorCode(err), err)
+	}
+
+	// 阈值传零值：PRD 4.5 要求未知/复合只计数、不阻断，库里也没有阈值设置项
+	// （design「待确认事项」6）。
+	if err := publish.Validate(candidate, publish.Thresholds{}); err != nil {
+		return c.failRun(ctx, runID, codeValidationBlocked, err)
+	}
+
+	if _, err := publish.Commit(ctx, c.committer, candidate, c.clock()); err != nil {
+		return c.failRun(ctx, runID, "", err)
+	}
 	return nil
+}
+
+// publishBuildRejections 是 publish.Build 里表达「拒绝发布」的四类业务哨兵。
+//
+// 只在 Build 这一层用：Validate 的拒绝另有 ErrRequiredTasksIncomplete /
+// ErrAttributionIncomplete / ErrUnknownCellsExceeded / ErrCompositeCellsExceeded，
+// 而 validate 的调用点固定是拒绝（Validate 不做仓储读取），所以那边不需要分流。
+var publishBuildRejections = []error{
+	publish.ErrEmptyCandidate,
+	publish.ErrRunFactsInvalid,
+	publish.ErrCandidateInputInvalid,
+	publish.ErrAxisInvalid,
+}
+
+// publishBuildErrorCode 把 publish.Build 的错误映射成轮次错误码：
+// 命中四类业务哨兵时返回 validation_blocked，其余返回空串（不编码）。
+//
+// 为什么必须分流：Build 除了「数据不满足发布门槛」，还会原样上抛仓储读取失败
+// （LoadRunFacts / LoadRunRooms / LoadRunTaskSummary）与装配错误（reader 为 nil）。
+// 这些不是业务拒绝——把一次「读库失败」记成 validation_blocked，会让排障的人
+// 去查数据质量，而真正的原因是基础设施；也违反 design「非结构失败不编码」。
+// 按哨兵而不是错误文案判断（errorlint）：文案会随版本调整，哨兵才是契约。
+func publishBuildErrorCode(err error) string {
+	for _, sentinel := range publishBuildRejections {
+		if errors.Is(err, sentinel) {
+			return codeValidationBlocked
+		}
+	}
+	return ""
+}
+
+// publishBuildings 把白名单映射成发布入参的楼：编号与展示名都原样搬运。
+//
+// 不在这一步 trim 或去重：规范化已由 normalizeBuildings 在读设置时做过（Requirement
+// 4.2），发布侧再动一次会让「发布用的楼」与「规划、执行、归属裁决用的楼」有机会
+// 不一致。publish.Build 自己会拒绝空编号与重复编号，那属于装配错误，交给它报。
+func publishBuildings(buildings []model.Building) []publish.Building {
+	mapped := make([]publish.Building, 0, len(buildings))
+	for _, building := range buildings {
+		mapped = append(mapped, publish.Building{ID: building.ID, Name: building.Name})
+	}
+	return mapped
 }
 
 // hydrate 用库里已完成的周矩阵任务重建本轮内存候选（Requirement 8.2、design 第 3 节

@@ -42,7 +42,7 @@ func doneWeekMatrixTasks() []store.SyncTask {
 //     sync_task 的 done 状态一条都没被改写；
 //  4. 补回来的页真的参与了第二段规划：R0001 的不可用格按上一轮 collect_run_room
 //     的归属下钻一次明细（否则 hydrate 只是空转）；
-//  5. success/partial 的发布与收口留给第 10 项，本项不写终态。
+//  5. success/partial 由发布接线（第二段判定之后）写终态，本层不调用收口函数。
 func TestExecuteHydratesDoneWeekMatrixPages(t *testing.T) {
 	f := newStageFake()
 	f.matrixBody = []byte(matrixFixturePage(matrixDataRow("R0001", map[int]string{0: "◆"})))
@@ -56,7 +56,7 @@ func TestExecuteHydratesDoneWeekMatrixPages(t *testing.T) {
 		t.Fatalf("续跑补抓成功时执行体不应返回错误，实际 %v", err)
 	}
 	if finishes := f.finishCalls(); len(finishes) != 0 {
-		t.Fatalf("success/partial 的收口属于发布事务（第 10 项），本项不应提前收口，实际 %+v", finishes)
+		t.Fatalf("success/partial 的终态由发布事务写，不应再调用收口函数，实际 %+v", finishes)
 	}
 
 	if f.loadWeekMatrixCalls != 1 {
@@ -156,22 +156,17 @@ func TestHydrateSkipsPagesAlreadyCached(t *testing.T) {
 }
 
 // TestHydrateFailureFailsRunAndKeepsReleaseRows 覆盖 tasklist 第 9 项的第三条单测：
-// 补抓失败 → 轮次 failed、原因点名楼与周、不进入发布（本项做到「发布事务一次都不调」）。
+// 补抓失败 → 轮次 failed、原因点名楼与周、不进入发布（发布事务一次都不调）。
 //
 // 失败点定在补抓本身（上游错误），且库里只有一条 done 的周矩阵任务：
 // 执行体应停在 hydrate，一条任务都不落、一条明细都不下钻、发布事务一次都不调。
 //
-// 「release 行数不变」这条不变量要等第 10 项把 Committer 接进 execute 之后才有区分力：
-// 本项的 execute 根本不调用 Committer，因此下面的 commitCalls == 0 今天只能证明
-// 「没有提前接线」。用例仍显式打开 allowCommit 并计数，是为了第 10 项接线后这段断言
-// 自动升级成真正的回归——不打开的话，误接线只会炸在替身的 panic 上，看不出一共
-// 调了几次、也就无从判断 release 行数有没有变。
+// 「release 行数不变」在发布接线之后才有真正的区分力：发布接线（第 10 项）会在
+// success/partial 时调用 Committer，因此 commitCalls == 0 现在是一条真正的回归断言，
+// 而不是「执行体根本没有 Committer」的同义反复。
 func TestHydrateFailureFailsRunAndKeepsReleaseRows(t *testing.T) {
 	f := newStageFake()
 	f.matrixErr = errors.New("上游超时")
-	// 打开替身的发布计数：默认是 panic（第 9 项不发布），这里要的是「0 次」这个
-	// 可读的计数证据，而不是一个炸在调用点、说不出次数的 panic。
-	f.allowCommit = true
 	f.tasks = []store.SyncTask{{
 		TaskID:     1,
 		Kind:       store.SyncTaskKindWeekMatrix,
@@ -201,8 +196,8 @@ func TestHydrateFailureFailsRunAndKeepsReleaseRows(t *testing.T) {
 	if len(f.matrixCalls) != 1 {
 		t.Fatalf("第一条缺失键补抓失败就应收口，实际请求 %d 次：%+v", len(f.matrixCalls), f.matrixCalls)
 	}
-	// 第 10 项接线后这条断言才有区分力（今天只能证明「没有提前接线」）：打开
-	// allowCommit 之后，误接线会留下 commitCalls == 1 而不是一个说不清次数的 panic。
+	// 发布接线之后这条断言才是真正的回归：hydrate 失败时就该停在发布之前，
+	// 误接线会留下 commitCalls == 1。
 	if f.commitCalls != 0 {
 		t.Fatalf("hydrate 失败不应进入发布，release 行数应不变，实际提交 %d 次", f.commitCalls)
 	}

@@ -58,7 +58,7 @@
   - 补抓失败 → `FailRun`（无码，原因点名楼与周），不进入发布
   - 单测：预置 `running` 轮次 + `done` 的周矩阵任务 + 空内存 → 补抓数与缺失键数一致；全部命中时补抓数为 0（CP10）；补抓失败时轮次 `failed` 且 `release` 行数不变
 
-- [ ] 10. 发布接线
+- [x] 10. 发布接线
   - `EvaluateRun` 为 `success`/`partial` 时：`AdvancePhase(validate)` → `Build` → `Validate(Thresholds{})` → `Commit`
   - `Build`/`Validate` 拒绝 → `FailRun(validation_blocked)`；`Commit` 失败 → `FailRun`（无码），两者都不动原 current
   - `DroppedRequired`/`DroppedOptional` 与 `CloseRun`/`EvaluateRun` 用同一个 `Dropped()` 值；`Commit` 成功后不再调用任何收口函数

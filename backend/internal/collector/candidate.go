@@ -6,6 +6,7 @@ import (
 	"github.com/w1ndys/easy-qfnu-kjs/internal/clean"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/pipeline"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/publish"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
 )
 
@@ -175,24 +176,8 @@ func (b *bank) storeDetail(key cellKey, entries []model.OccupancyEntry, dict mod
 // 导出顺序固定为 (房号, 星期, 大节) 升序：同一份上游返回同一份候选集才可复现，
 // 任务落库顺序与断言都依赖它（design「内存候选的形状」最后一条）。
 func (b *bank) unavailableCells(rooms []store.RunRoom) []pipeline.Cell {
-	owners := make(map[string]string, len(rooms))
-	for _, room := range rooms {
-		owners[room.RoomID] = room.BuildingID
-	}
-
-	keys := make([]cellKey, 0, len(b.unavailable))
-	for key := range b.unavailable {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].RoomID != keys[j].RoomID {
-			return keys[i].RoomID < keys[j].RoomID
-		}
-		if keys[i].Weekday != keys[j].Weekday {
-			return keys[i].Weekday < keys[j].Weekday
-		}
-		return keys[i].Block < keys[j].Block
-	})
+	owners := ownerIndex(rooms)
+	keys := sortedCellKeys(b.unavailable)
 
 	cells := make([]pipeline.Cell, 0, len(keys))
 	b.orphanCells = 0
@@ -210,6 +195,129 @@ func (b *bank) unavailableCells(rooms []store.RunRoom) []pipeline.Cell {
 		})
 	}
 	return cells
+}
+
+// ownerIndex 把本轮归属快照摊成「房号 → 归属楼」（D5：快照是归属的唯一权威）。
+//
+// 矩阵响应报出的房号不一定属于响应所在的楼，明细请求本身又完全不带楼；两者都只能
+// 按这张表判归属。查不到的房号在导出时一律丢弃——publish.Build 会以「归属快照
+// 不完整」拒绝整轮，而这类格子本来就不该进候选集（CP6、Requirement 8.4–8.5）。
+func ownerIndex(rooms []store.RunRoom) map[string]string {
+	owners := make(map[string]string, len(rooms))
+	for _, room := range rooms {
+		owners[room.RoomID] = room.BuildingID
+	}
+	return owners
+}
+
+// sortedCellKeys 按「房号 × 星期 × 大节」升序返回 map 的键。
+//
+// 导出顺序固定是 design「内存候选的形状」的最后一条：同一份上游返回同一份候选集，
+// 任务落库顺序、发布行顺序与用例断言才可复现。两个 map（不可用格、明细）共用这一份
+// 排序，不各写一套比较函数。
+func sortedCellKeys[V any](cells map[cellKey]V) []cellKey {
+	keys := make([]cellKey, 0, len(cells))
+	for key := range cells {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].RoomID != keys[j].RoomID {
+			return keys[i].RoomID < keys[j].RoomID
+		}
+		if keys[i].Weekday != keys[j].Weekday {
+			return keys[i].Weekday < keys[j].Weekday
+		}
+		return keys[i].Block < keys[j].Block
+	})
+	return keys
+}
+
+// publishCells 把内存里的矩阵页摊平成 publish.RunInput.Cells（design「RunInput 的
+// 字段来源」的 Cells 行）。
+//
+// 导出口径三条，缺一条都会让发布结果偏离本轮真实观测：
+//   - 只导出白名单楼、窗口内的周：窗口是 CP1 的唯一来源，续跑留下的、按旧窗口抓的
+//     页面不能进候选集，否则 publish.Build 会以「观测周越界」拒绝整轮；
+//   - 只留归属快照里的房号，且归属楼必须等于这一页所在的楼：跨楼被裁决掉的响应行
+//     不进候选集（CP6）。不按「响应顺序猜归属」，否则同一「房 × 周 × 天 × 大节」
+//     会出现两份观测，publish.Build 同样会拒绝整轮（CP5）；
+//   - 顺序固定为「白名单楼顺序 × 周次升序 × 页内格子顺序」：白名单顺序同时是规划
+//     顺序与归属裁决顺序，发布行按它排才与任务落库顺序对得上。
+//
+// 页内格子顺序由 projectCells 保证（房号页面顺序 × 星期 × 大节表头顺序），这里不再
+// 排序：重排会把「同一份上游返回同一份候选集」从结构断言降级成一次无意义的 sort。
+func (b *bank) publishCells(
+	buildings []string,
+	rooms []store.RunRoom,
+	window pipeline.Window,
+) []publish.CellObservation {
+	owners := ownerIndex(rooms)
+
+	total := 0
+	for _, page := range b.pages {
+		total += len(page.Cells)
+	}
+
+	cells := make([]publish.CellObservation, 0, total)
+	for _, buildingID := range buildings {
+		for week := window.Start; week <= window.End; week++ {
+			page, ok := b.pages[weekKey{BuildingID: buildingID, Week: week}]
+			if !ok {
+				continue
+			}
+			for _, cell := range page.Cells {
+				if owners[cell.RoomID] != buildingID {
+					continue
+				}
+				cells = append(cells, publish.CellObservation{
+					RoomID:  cell.RoomID,
+					Week:    week,
+					Weekday: cell.Weekday,
+					Block:   cell.Block,
+					State:   cell.State,
+				})
+			}
+		}
+	}
+	return cells
+}
+
+// publishDetails 把内存里的占用说明摊平成 publish.RunInput.Details。
+//
+// 明细没有周（周次范围在 WeekRange 里，与窗口求交由 publish.Build 做），所以这里
+// 只按归属快照过滤：房号不在快照里的说明不进候选集，否则 Validate 会以「占用说明
+// 的房号不在归属快照里」拒绝整轮。正常轮次过滤不掉任何一条——Plan2 的明细任务
+// 本来就按快照的归属楼规划，pipeline.Run 的归属过滤也已经挡过一轮（Requirement 5.3）。
+//
+// 顺序固定为「房号 × 星期 × 大节升序」，同一格的多个说明保持教务返回顺序
+// （Requirement 7.2）：排序的只有格的身份，格内顺序是上游事实，不能重排。
+func (b *bank) publishDetails(rooms []store.RunRoom) []publish.CellDetail {
+	owners := ownerIndex(rooms)
+	keys := sortedCellKeys(b.details)
+
+	total := 0
+	for _, key := range keys {
+		total += len(b.details[key])
+	}
+
+	details := make([]publish.CellDetail, 0, total)
+	for _, key := range keys {
+		if _, ok := owners[key.RoomID]; !ok {
+			continue
+		}
+		for _, row := range b.details[key] {
+			details = append(details, publish.CellDetail{
+				RoomID:    key.RoomID,
+				Weekday:   key.Weekday,
+				Block:     key.Block,
+				State:     row.State,
+				Course:    row.Course,
+				WeekRange: row.WeekRange,
+				TimeFlag:  row.TimeFlag,
+			})
+		}
+	}
+	return details
 }
 
 // projectCells 把 parser 的房号行摊平成格子并逐格清洗。

@@ -23,11 +23,10 @@ import (
 // stageFake 是两段式编排用例的替身：在 execFake（设置、学期页、快照、窗口）之上
 // 补一份可用的内存版任务/归属/阶段仓储，并把上游矩阵与明细改成按预置返回。
 //
-// 它只替掉 stub 里 hydrate 的读入口（LoadWeekMatrixTasks），其余仍走 stub：本组用例
-// 若意外碰到发布事务的读侧（LoadRunFacts）仍会炸在调用点，而不是拿到零值后悄悄
-// 通过。发布事务的写侧（CommitRelease）保留同一条纪律：默认 panic，只有显式打开
-// allowCommit 的用例才允许调用并记账——第 9 项还没有发布，任何一次真实提交都说明
-// 接线接错了地方。
+// 它只替掉 stub 里 hydrate 的读入口（LoadWeekMatrixTasks）、发布读侧（LoadRunFacts）
+// 与发布写侧（CommitRelease），其余仍走 stub。发布侧替身的行为对齐 store 的语义：
+// LoadRunFacts 读本轮已写下的学期与窗口，CommitRelease 记录草稿并（默认）成功，
+// 成功后 FinishRun 立刻报错——发布事务已经写死终态，再收口会撞真实仓储的守卫。
 //
 // 任务状态与归属都按 store 的语义实现到「够 pipeline.Run 跑完」为止：两段 Ensure
 // 遇到同类任务已存在时不再写入、从第一个 pending 继续、done/failed 不重试、
@@ -61,11 +60,22 @@ type stageFake struct {
 	detailErr    error                            // FetchOccupancyDetail 的返回错误
 	detailCalls  []upstream.OccupancyDetailParams // 每次明细请求的入参
 
-	summaryCalls int // LoadRunTaskSummary 的调用次数：两段各一次 = 2
+	summaryCalls int // LoadRunTaskSummary 的调用次数：两段各一次 + 发布组装的 Build 一次
 
-	loadWeekMatrixCalls int  // LoadWeekMatrixTasks 的调用次数：hydrate 每次一轮一次
-	allowCommit         bool // 显式允许 CommitRelease 被调用并计数；默认 panic（第 9 项不发布）
-	commitCalls         int  // CommitRelease 的调用次数；只在 allowCommit 打开时累加
+	loadWeekMatrixCalls int // LoadWeekMatrixTasks 的调用次数：hydrate 每次一轮一次
+
+	// 发布读侧：LoadRunFacts 按本轮已写入的学期与窗口返回；发布写侧：commits 记录
+	// 每次草稿、commitCalls 计数（含失败）、commitErr 让发布事务失败。
+	factsCalls  int
+	commits     []store.ReleaseDraft
+	commitCalls int
+	commitErr   error
+	committed   bool // 发布事务已成功：终态已由它写死，之后任何收口都是错误
+
+	// finishesAfterCommit 是「发布成功之后仍调用 FinishRun」的次数：应当恒为 0。
+	// 单独计数而不是靠 finishCalls 与 commitCalls 相减，是为了在误接线时能直接
+	// 指认「第二次收口」这件事，而不是让用例只看到一个难解释的数量差。
+	finishesAfterCommit int
 }
 
 // newStageFake 返回一份「白名单只有 Q10、学期页与周历页可解析、快照齐备」的替身。
@@ -252,16 +262,50 @@ func (s *stageFake) LoadWeekMatrixTasks(_ context.Context, _ int64) ([]store.Syn
 	return s.tasksOfKind(store.SyncTaskKindWeekMatrix), nil
 }
 
-// CommitRelease 默认 panic，与 stub 的纪律一致：第 9 项不发布，本组用例的任何一次
-// 真实调用都说明接线接错了地方，应当炸在调用点而不是静默成功。只有显式打开
-// allowCommit 的用例才允许调用并计数——「hydrate 失败时一次发布都不做」需要一个能
-// 区分「0 次」与「炸在调用点」的计数器（见 TestHydrateFailureFailsRunAndKeepsReleaseRows）。
-func (s *stageFake) CommitRelease(_ context.Context, _ store.ReleaseDraft) error {
-	if !s.allowCommit {
-		panic("stageFake: 第 9 项不发布，CommitRelease 被意外调用（需要计数请显式置 allowCommit）")
+// LoadRunFacts 按本轮自己写下的学期与窗口返回发布事实：学期取最后一次 SetRunTerm，
+// 窗口取最后一次 SetRunWindow。真实仓储读 collect_run 的对应列；替身用执行器写进去的
+// 值，正好钉住「发布组装读的是本轮落库的学期与窗口，而不是内存里的另一份」这条口径。
+// 归属冲突数不在这里造：Build 还会逐房号看快照的 Conflict 标记，本组用例不涉及冲突轮。
+func (s *stageFake) LoadRunFacts(_ context.Context, _ int64) (store.RunFacts, error) {
+	s.record("facts")
+	s.factsCalls++
+	facts := store.RunFacts{RunID: executeRunID}
+	if n := len(s.termSets); n > 0 {
+		facts.Term = s.termSets[n-1]
 	}
+	if n := len(s.windows); n > 0 {
+		facts.WindowStart = s.windows[n-1].Start
+		facts.WindowEnd = s.windows[n-1].End
+	}
+	return facts, nil
+}
+
+// CommitRelease 记录每次交给写侧的草稿，并按用例返回成功或失败。
+//
+// 成功时把 committed 置位：发布事务已经在同一条 UPDATE 里写死轮次终态，替身的
+// FinishRun 在那之后会立刻报错并计数，用来钉住「Commit 成功后不再调用任何收口函数」
+// （CP8）。失败时不清 committed——事务整体回滚、轮次仍停在 running，失败收口路径
+// 必须照常可走。
+func (s *stageFake) CommitRelease(_ context.Context, draft store.ReleaseDraft) error {
+	s.record("commit")
 	s.commitCalls++
+	s.commits = append(s.commits, draft)
+	if s.commitErr != nil {
+		return s.commitErr
+	}
+	s.committed = true
 	return nil
+}
+
+// FinishRun 在发布事务成功之后再被调用时直接报错：真实 store 会用
+// status='running' 的守卫拒绝第二次收口，替身不复刻那条 SQL，而是记一个可断言的
+// 计数并返回错误，用例因此能同时看到「执行体返回了错误」与「第二次收口发生了几次」。
+func (s *stageFake) FinishRun(ctx context.Context, finish store.RunFinish) error {
+	if s.committed {
+		s.finishesAfterCommit++
+		return errors.New("stageFake: 发布事务已写终态，不得再收口")
+	}
+	return s.stub.FinishRun(ctx, finish)
 }
 
 // RecordWeekFetch 记周结果到达顺序。
@@ -493,7 +537,7 @@ func TestExecuteTwoStagesInOrder(t *testing.T) {
 		t.Fatalf("两段式执行不应返回错误，实际 %v", err)
 	}
 	if finishes := f.finishCalls(); len(finishes) != 0 {
-		t.Fatalf("success/partial 的收口属于发布事务（第 10 项），本项不应提前收口，实际 %+v", finishes)
+		t.Fatalf("success/partial 的终态由发布事务写，执行体不应再调用收口函数，实际 %+v", finishes)
 	}
 
 	// 顺序：Run1 → 第一段判定 → 读归属 → Run2 → 明细 → 第二段判定。
@@ -508,8 +552,9 @@ func TestExecuteTwoStagesInOrder(t *testing.T) {
 		evaluate1 >= plan2Read || plan2Read >= run2 || run2 >= detail || detail >= evaluate2 {
 		t.Fatalf("两段式顺序应为 Plan1 → Run1 → EvaluateRun → Plan2 → Run2 → EvaluateRun，实际序列 %v", f.events)
 	}
-	if f.summaryCalls != 2 {
-		t.Fatalf("两段各应做一次收口判定，实际 %d 次", f.summaryCalls)
+	if f.summaryCalls != 3 {
+		// 两段各一次收口判定 + 发布组装（publish.Build）读一次任务汇总。
+		t.Fatalf("两段判定 + 发布组装应共读三次任务汇总，实际 %d 次", f.summaryCalls)
 	}
 
 	// 第一段只规划周矩阵：Q10 × 窗口 9..12 共 4 条，Run1 收到的就是这份清单。
@@ -621,6 +666,30 @@ func TestExecuteDetailTasksNotDroppedByAttribution(t *testing.T) {
 	}
 	if got := f.detailCalls[0]; got.RoomID != "R0001" || got.Weekday != 1 || got.BigSlot != "0102" {
 		t.Fatalf("明细请求参数不符：%+v", got)
+	}
+
+	// 发布候选也只能含归属快照里的那一份（CP6）：Q11 页面上的 R0001 已被归属裁决
+	// 丢掉，若按「响应所在的楼」摊平，同一个「房 × 周 × 天 × 小节」会出现两份观测，
+	// publish.Build 会以重复观测拒绝整轮。1 间房 × 4 周 × 84 = 336 行正好证明只导出了
+	// Q10 那一份，而 Q11 报出的不可用格仍以 Q10 的身份规划并下钻了一条明细。
+	if f.commitCalls != 1 || len(f.commits) != 1 {
+		t.Fatalf("本轮应恰好发布一次，实际提交 %d 次：%+v", f.commitCalls, f.commits)
+	}
+	draft := f.commits[0]
+	if draft.Status != store.RunStatusSuccess {
+		t.Fatalf("跨楼重复房号不应影响发布终态，实际 %q（原因 %q）",
+			draft.Status, draft.ErrorMessage)
+	}
+	if len(draft.Observations) != 4*84 {
+		t.Fatalf("候选集应只含 Q10 页面的 336 行观测，实际 %d 行", len(draft.Observations))
+	}
+	for _, observation := range draft.Observations {
+		if observation.RoomID != "R0001" {
+			t.Fatalf("候选集不应出现归属过滤掉的房号，实际 %+v", observation)
+		}
+	}
+	if len(draft.Details) != 1 {
+		t.Fatalf("Q11 报出的不可用格应按 Q10 归属发布 1 条说明，实际 %d 条", len(draft.Details))
 	}
 }
 
@@ -751,9 +820,10 @@ func TestExecuteNoOrphanWarnWhenAllRoomsAttributed(t *testing.T) {
 // 明细结构失败（parser.ErrDetailStructureInvalid）只让可选任务失败，轮次的判定结果
 // 是 partial，不是 failed。
 //
-// 本项还没有发布（第 10 项），所以 partial 不会被 CloseRun 收口，轮次保持 running：
-// 用例在 execute 返回后用同一条库状态再跑一次 EvaluateRun，断言它给出的正是 partial。
-// 这同时钉住「明细失败不升级成 failed」与「partial 不提前收口」两条口径。
+// 发布接线之后 partial 由发布事务写终态（见 publish_test.go 的 partial 用例）：
+// 本用例仍用同一份库状态再跑一次 EvaluateRun，钉住失败分层给出的正是 partial，
+// 而不是 failed——发布终态与发布前的判定同口径。这同时钉住「明细失败不升级成
+// failed」与「partial 不提前收口」两条口径。
 func TestExecuteDetailStructureFailureYieldsPartial(t *testing.T) {
 	f := newStageFake()
 	f.matrixBody = []byte(matrixFixturePage(matrixDataRow("R0001", map[int]string{0: "◆"})))
@@ -764,10 +834,11 @@ func TestExecuteDetailStructureFailureYieldsPartial(t *testing.T) {
 		t.Fatalf("明细结构失败属于任务失败，执行体不应返回错误，实际 %v", err)
 	}
 	if finishes := f.finishCalls(); len(finishes) != 0 {
-		t.Fatalf("partial 应由发布事务收口，本项不应提前收口，实际 %+v", finishes)
+		t.Fatalf("partial 应由发布事务收口，执行体不应再调用收口函数，实际 %+v", finishes)
 	}
-	if f.summaryCalls != 2 {
-		t.Fatalf("两段各应做一次收口判定，实际 %d 次", f.summaryCalls)
+	if f.summaryCalls != 3 {
+		// 两段各一次收口判定 + 发布组装（publish.Build）读一次任务汇总。
+		t.Fatalf("两段判定 + 发布组装应共读三次任务汇总，实际 %d 次", f.summaryCalls)
 	}
 
 	// 结构失败码在 failTask 时写进轮次，任务置 failed。
