@@ -5,7 +5,7 @@
 > 前置：`collect-pipeline`（发布事务与 `release` / `observation` 数据）、`admin-bootstrap`（会话 / CSRF / 错误码）、`admin-settings-sync`（分页与响应契约）、`collect-runner`（真实发布数据与 `collect_run_room`）。
 > 本 spec 不写任何 Go 代码，以下条目在实现阶段执行。
 
-- [ ] 1. 版本读取仓储：列表与详情
+- [x] 1. 版本读取仓储：列表与详情
   - `store.ReleaseAdminRepo.List`：`release` 按 `generated_at DESC, release_id DESC`；`released_at` 用 `collect_run` 的 `max(released_at)` 左连接，没有关联轮次为 `NULL`；`week_count` / `observation_rows` / `rooms` 各由一个 LATERAL 聚合
   - `store.ReleaseAdminRepo.Detail`：在 `REPEATABLE READ READ ONLY` 事务里读头（不带观测聚合）、逐周计数（`count(DISTINCT (room_id, weekday, block))`）与按楼计数；`stats` 与 `release.week_count` / `release.observation_rows` 由逐周结果拼出，不额外发聚合；不存在返回 `(zero, false, nil)`
   - 空库列表返回空切片与 `total=0`；`week_counts` / `building_counts` 的切片恒非 nil（JSON 输出 `[]`）

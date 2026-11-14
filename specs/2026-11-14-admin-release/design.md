@@ -127,7 +127,8 @@ type ReleaseBuildingCount struct {
     Rooms        int
 }
 
-type ReleaseDetail struct {
+// 名字避开 publish.go 里已占用的 ReleaseDetail（occupancy_detail 的一行）。
+type ReleaseDetailView struct {
     Release        ReleaseSummary
     Stats          ReleaseStats
     WeekCounts     []ReleaseWeekCount    // 按 week 升序
@@ -296,7 +297,7 @@ type ReleaseAdminRepo struct{ /* 连接池 */ }
 func NewReleaseAdminRepo(pool releaseAdminPool) ReleaseAdminRepo
 
 func (r ReleaseAdminRepo) List(ctx context.Context) ([]ReleaseSummary, error)
-func (r ReleaseAdminRepo) Detail(ctx context.Context, releaseID string) (ReleaseDetail, bool, error)
+func (r ReleaseAdminRepo) Detail(ctx context.Context, releaseID string) (ReleaseDetailView, bool, error)
 func (r ReleaseAdminRepo) Diff(ctx context.Context, params ReleaseDiffParams) (ReleaseDiff, error)
 func (r ReleaseAdminRepo) Anomalies(ctx context.Context) ([]ReleaseAnomaly, error)
 func (r ReleaseAdminRepo) Rollback(ctx context.Context, targetID string) (RollbackResult, error)
@@ -308,7 +309,7 @@ func (r ReleaseAdminRepo) Rollback(ctx context.Context, targetID string) (Rollba
 // ReleaseAdminReader 是 api 对版本仓储的消费侧接口，方法集是 store.ReleaseAdminRepo 的子集。
 type ReleaseAdminReader interface {
     List(ctx context.Context) ([]store.ReleaseSummary, error)
-    Detail(ctx context.Context, releaseID string) (store.ReleaseDetail, bool, error)
+    Detail(ctx context.Context, releaseID string) (store.ReleaseDetailView, bool, error)
     Diff(ctx context.Context, params store.ReleaseDiffParams) (store.ReleaseDiff, error)
     Anomalies(ctx context.Context) ([]store.ReleaseAnomaly, error)
     Rollback(ctx context.Context, releaseID string) (store.RollbackResult, error)
