@@ -16,7 +16,20 @@ import (
 
 // openReleaseAdminTestDB 连真实 PostgreSQL 并重建 schema；未设置 KJS_TEST_DSN 时跳过。
 // 与其它集成测试一样会清空 public schema，只能指向测试库。
+//
+// 默认给整条用例 60 秒；大夹具用例（如 87 万行的性能实测）用
+// openReleaseAdminTestDBWithTimeout 单独放宽。
 func openReleaseAdminTestDB(t *testing.T) (context.Context, *pgxpool.Pool) {
+	t.Helper()
+
+	return openReleaseAdminTestDBWithTimeout(t, 60*time.Second)
+}
+
+// openReleaseAdminTestDBWithTimeout 同 openReleaseAdminTestDB，但由调用方给整条用例定超时。
+//
+// 超时覆盖建连、重建 schema、迁移与后续所有查询；性能夹具的灌数加采样会逼近 60 秒，
+// 把「用例跑不完」误报成「查询变慢」没有意义，所以由调用方按数据规模自行放宽。
+func openReleaseAdminTestDBWithTimeout(t *testing.T, timeout time.Duration) (context.Context, *pgxpool.Pool) {
 	t.Helper()
 
 	dsn := os.Getenv("KJS_TEST_DSN")
@@ -24,7 +37,7 @@ func openReleaseAdminTestDB(t *testing.T) (context.Context, *pgxpool.Pool) {
 		t.Skip("未设置 KJS_TEST_DSN，跳过真实库集成测试")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	t.Cleanup(cancel)
 
 	pool, err := Open(ctx, dsn)

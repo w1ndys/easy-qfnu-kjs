@@ -52,7 +52,7 @@
   - 回退后同一进程内先预热 `/api/query` 缓存、再回退、再用同参数查询，断言读到新 current 的结果（不等 30 秒）；`/api/screen` 的版本标识同步切换
   - 列表仍为两行、`is_current` 恰好一条且指向回退目标、`collect_run` 未变；响应带 `Cache-Control: no-store`
 
-- [ ] 9. 门禁、性能实测与文档回填
+- [x] 9. 门禁、性能实测与文档回填
   - 性能：用 `COPY` 造两版各 87 万观测行的夹具，实测「汇总 + 首页」与 `section=rooms` 的耗时，把结果记回 `design.md` 的「预算」段；超 2 秒按预算段的备选方案合并语句
   - 门禁：`cd backend && go build ./... && go vet ./... && go test -count=1 ./... && go test -p 1 -count=1 ./...`（带 `KJS_TEST_DSN`）、`golangci-lint run`、`go test -race -count=1 ./internal/api ./internal/store ./internal/query` 全部 0 退出
   - `go.mod` 不变（不新增依赖）；`backend/.golangci.yml` 不新增包规则（D1 不新建包）
