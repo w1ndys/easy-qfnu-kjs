@@ -1757,3 +1757,249 @@ func TestReleaseAdminRepoRollbackConcurrentAgainstRealDB(t *testing.T) {
 		t.Fatalf("并发回退不应改变版本行数：并发前 %d，并发后 %d", len(releasesBefore), len(after))
 	}
 }
+
+// releaseAnomalyConflictRooms 是异常用例造的冲突房号数：201 条，其中第 201 条
+// 只用来触发截断，不会被视图返回。
+const releaseAnomalyConflictRooms = 201
+
+// seedReleaseAnomalyFixture 铺一套专门给异常视图用的两版夹具。
+//
+// 手工折叠（当前版本）：
+//   - 第 9 周 r101 周一：01/02 → 0102 格（unknown）、03/04/05 → 030405 格（composite）；
+//   - 第 9 周 r101 周二：06 → 0607 格（free）；
+//   - 第 9 周 r103 周三：10 → 101112 格（free）；
+//   - 第 11 周 r102 周一：01 → 0102 格（unknown）、08 → 0809 格（free）；
+//   - 第 11 周 r103 周二：11 → 101112 格（free）。
+//
+// 于是当前版本：观测 10 行、7 个格，unknown 2 格、composite 1 格；覆盖周 [9,11]，
+// 第 10 周是缺口。按小节行数会算成 unknown 3 / composite 3，两种口径的比值不同
+// （2/7 vs 3/10），断言能直接区分 D12 要求的大节口径。
+//
+// 当前版本有两轮关联：旧一轮窗口 9–10、冲突房号 a000；最新一轮窗口 9–12、冲突
+// 房号 z001..z201。视图必须取最新一轮的窗口与冲突清单（a000 不能出现）。
+// 旧版本只有一轮（窗口 5–6、无冲突）。
+func seedReleaseAnomalyFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+
+	mustExec(ctx, t, pool,
+		"INSERT INTO term (term, total_weeks) VALUES ($1, 20)",
+		releaseAdminFixtureTerm)
+
+	// 字典 v1 与轴 v1 由基线种好：01/02 → 0102，03–05 → 030405，06/07 → 0607，
+	// 08/09 → 0809，10–12 → 101112。
+	mustExec(ctx, t, pool, `
+INSERT INTO room (room_id, name, name_raw, building_id, building_name)
+VALUES ('r101', 'F101', 'F101', 'Q10', '综合教学楼'),
+       ('r102', 'F102', 'F102', 'Q10', '综合教学楼'),
+       ('r103', 'F103', 'F103', 'Q10', '综合教学楼'),
+       ('a000', 'A000', 'A000', 'Q10', '综合教学楼')`)
+
+	// z001..z201：按 room_id 升序时 a000 < z001 < … < z201，截断边界因此可以逐条断言。
+	mustExec(ctx, t, pool, `
+INSERT INTO room (room_id, name, name_raw, building_id, building_name)
+SELECT 'z' || lpad(g::text, 3, '0'),
+       'Z' || lpad(g::text, 3, '0'),
+       'Z' || lpad(g::text, 3, '0'),
+       'Q10', '综合教学楼'
+  FROM generate_series(1, $1) AS g`, releaseAnomalyConflictRooms)
+
+	mustExec(ctx, t, pool, `
+INSERT INTO release (release_id, term, generated_at, dict_version, axis_version, has_attr_conflict, is_current)
+VALUES ($1, $2, $3, 1, 1, false, false),
+       ($4, $2, $5, 1, 1, true, true)`,
+		releaseAdminPreviousID, releaseAdminFixtureTerm,
+		mustParseReleaseAdminTime(t, releaseAdminPreviousGenAt),
+		releaseAdminCurrentID, mustParseReleaseAdminTime(t, releaseAdminCurrentGenAt))
+
+	observations := []struct {
+		releaseID string
+		roomID    string
+		week      int
+		weekday   int
+		node      string
+		stateKey  string
+	}{
+		{releaseAdminCurrentID, "r101", 9, 1, "01", "unknown"},
+		{releaseAdminCurrentID, "r101", 9, 1, "02", "unknown"},
+		{releaseAdminCurrentID, "r101", 9, 1, "03", "composite"},
+		{releaseAdminCurrentID, "r101", 9, 1, "04", "composite"},
+		{releaseAdminCurrentID, "r101", 9, 1, "05", "composite"},
+		{releaseAdminCurrentID, "r101", 9, 2, "06", "free"},
+		{releaseAdminCurrentID, "r102", 11, 1, "01", "unknown"},
+		{releaseAdminCurrentID, "r102", 11, 1, "08", "free"},
+		{releaseAdminCurrentID, "r103", 9, 3, "10", "free"},
+		{releaseAdminCurrentID, "r103", 11, 2, "11", "free"},
+		{releaseAdminPreviousID, "r101", 5, 1, "01", "free"},
+	}
+	for _, observation := range observations {
+		mustExec(ctx, t, pool, `
+INSERT INTO observation (release_id, room_id, term, week, weekday, node, state_key, available)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			observation.releaseID, observation.roomID, releaseAdminFixtureTerm,
+			observation.week, observation.weekday, observation.node,
+			observation.stateKey, observation.stateKey == "free")
+	}
+
+	// 当前版本旧一轮：窗口 9–10，带一个只在旧轮出现的冲突房号 a000。
+	var staleRunID int64
+	if err := pool.QueryRow(ctx, `
+INSERT INTO collect_run (started_at, status, term, release_id, released_at, window_start, window_end)
+VALUES ($1, 'success', $2, $3, $4, 9, 10)
+RETURNING run_id`,
+		mustParseReleaseAdminTime(t, "2026-11-14T03:06:00Z"), releaseAdminFixtureTerm,
+		releaseAdminCurrentID,
+		mustParseReleaseAdminTime(t, releaseAdminDuplicatePublishAt)).Scan(&staleRunID); err != nil {
+		t.Fatalf("铺当前版本旧轮次失败: %v", err)
+	}
+	mustExec(ctx, t, pool, `
+INSERT INTO collect_run_room (run_id, term, room_id, building_id, conflict, conflict_building_id)
+VALUES ($1, $2, 'a000', 'Q10', true, 'Q03')`, staleRunID, releaseAdminFixtureTerm)
+
+	// 当前版本最新一轮：窗口 9–12，冲突房号 z001..z201；另外放一条非冲突行，
+	// 验证冲突清单只取 conflict=true。
+	var latestRunID int64
+	if err := pool.QueryRow(ctx, `
+INSERT INTO collect_run (started_at, status, term, release_id, released_at, window_start, window_end)
+VALUES ($1, 'success', $2, $3, $4, 9, 12)
+RETURNING run_id`,
+		mustParseReleaseAdminTime(t, "2026-11-14T03:06:40Z"), releaseAdminFixtureTerm,
+		releaseAdminCurrentID,
+		mustParseReleaseAdminTime(t, releaseAdminCurrentPublish)).Scan(&latestRunID); err != nil {
+		t.Fatalf("铺当前版本最新轮次失败: %v", err)
+	}
+	mustExec(ctx, t, pool, `
+INSERT INTO collect_run_room (run_id, term, room_id, building_id, conflict, conflict_building_id)
+SELECT $1, $2, room_id, 'Q10', true, 'Q03'
+  FROM room
+ WHERE room_id LIKE 'z%'`, latestRunID, releaseAdminFixtureTerm)
+	mustExec(ctx, t, pool, `
+INSERT INTO collect_run_room (run_id, term, room_id, building_id, conflict, conflict_building_id)
+VALUES ($1, $2, 'r101', 'Q10', false, NULL)`, latestRunID, releaseAdminFixtureTerm)
+
+	// 旧版本一轮：窗口 5–6，无冲突。
+	mustExec(ctx, t, pool, `
+INSERT INTO collect_run (started_at, status, term, release_id, released_at, window_start, window_end)
+VALUES ($1, 'success', $2, $3, $4, 5, 6)`,
+		mustParseReleaseAdminTime(t, "2026-10-28T04:16:22Z"), releaseAdminFixtureTerm,
+		releaseAdminPreviousID,
+		mustParseReleaseAdminTime(t, "2026-10-28T04:16:22Z"))
+}
+
+// TestReleaseAdminRepoAnomaliesAgainstRealDB 覆盖异常视图的真实库口径（Requirement 7.1–7.4）：
+// 未知/复合按大节计数与手工折数一致、ratio 是 4 位小数、week_gaps 命中缺周、window 取
+// 最新轮次、冲突清单取最新一轮且按 200 条截断。
+func TestReleaseAdminRepoAnomaliesAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseAnomalyFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	anomalies, err := repo.Anomalies(ctx)
+	if err != nil {
+		t.Fatalf("读异常视图失败: %v", err)
+	}
+	if len(anomalies) != 2 {
+		t.Fatalf("夹具应有当前与旧两个版本，实际 %d 个: %+v", len(anomalies), anomalies)
+	}
+
+	// 排序与列表一致：generated_at 倒序。
+	if anomalies[0].ReleaseID != releaseAdminCurrentID ||
+		anomalies[1].ReleaseID != releaseAdminPreviousID {
+		t.Fatalf("版本顺序应为当前在前、旧版在后，实际 %s / %s",
+			anomalies[0].ReleaseID, anomalies[1].ReleaseID)
+	}
+
+	current := anomalies[0]
+	if !current.IsCurrent || !current.HasAttrConflict {
+		t.Fatalf("当前版本标记不符: %+v", current)
+	}
+	// 手工折数：7 个格，unknown 2、composite 1（按小节行会算成 3 与 3）。
+	if want := (StateRatio{Cells: 2, Ratio: 0.2857}); current.Unknown != want {
+		t.Fatalf("unknown 应为 %+v，实际 %+v（按小节计数会得到 3 与 0.3）", want, current.Unknown)
+	}
+	if want := (StateRatio{Cells: 1, Ratio: 0.1429}); current.Composite != want {
+		t.Fatalf("composite 应为 %+v，实际 %+v（按小节计数会得到 3 与 0.3）", want, current.Composite)
+	}
+	if !reflect.DeepEqual(current.ObservedWeeks, []int{9, 11}) {
+		t.Fatalf("observed_weeks 应为 [9 11]，实际 %v", current.ObservedWeeks)
+	}
+	if !reflect.DeepEqual(current.WeekGaps, []int{10}) {
+		t.Fatalf("week_gaps 应命中第 10 周，实际 %v", current.WeekGaps)
+	}
+	// 窗口取 run_id 最大的一轮：旧一轮是 9–10，只有取最新一轮才会是 9–12。
+	if current.Window == nil || *current.Window != (ReleaseWindow{Start: 9, End: 12}) {
+		t.Fatalf("window 应取最新轮次的 9–12，实际 %+v", current.Window)
+	}
+
+	// 冲突清单：最新一轮共 201 条冲突 + 1 条非冲突；返回 room_id 最小的 200 条并标截断。
+	if !current.ConflictRoomsTruncated {
+		t.Fatal("冲突超过 200 条时应标记截断")
+	}
+	if len(current.ConflictRooms) != conflictRoomsLimit {
+		t.Fatalf("冲突清单应恰好返回 %d 条，实际 %d 条", conflictRoomsLimit, len(current.ConflictRooms))
+	}
+	if first := current.ConflictRooms[0]; first != (ConflictRoom{
+		RoomID: "z001", BuildingID: "Q10", ConflictBuildingID: "Q03",
+	}) {
+		t.Fatalf("清单首条应为 room_id 最小的 z001，实际 %+v", first)
+	}
+	if last := current.ConflictRooms[len(current.ConflictRooms)-1]; last.RoomID != "z200" {
+		t.Fatalf("清单末条应为第 200 条 z200，实际 %+v", last)
+	}
+	for _, conflict := range current.ConflictRooms {
+		// 旧一轮的 a000 不在清单里：冲突清单必须按最新一轮取。
+		if conflict.RoomID == "a000" {
+			t.Fatalf("冲突清单不应包含旧轮次的房号 a000: %+v", conflict)
+		}
+		if conflict.BuildingID != "Q10" || conflict.ConflictBuildingID != "Q03" {
+			t.Fatalf("冲突归属楼不符: %+v", conflict)
+		}
+		// 非冲突行（r101）也不该出现在清单里。
+		if conflict.RoomID == "r101" {
+			t.Fatalf("冲突清单不应包含 conflict=false 的房号: %+v", conflict)
+		}
+	}
+
+	previous := anomalies[1]
+	if previous.IsCurrent || previous.HasAttrConflict {
+		t.Fatalf("旧版本标记不符: %+v", previous)
+	}
+	if previous.Unknown != (StateRatio{Cells: 0, Ratio: 0}) {
+		t.Fatalf("旧版本没有未知格，实际 %+v", previous.Unknown)
+	}
+	if previous.Composite != (StateRatio{Cells: 0, Ratio: 0}) {
+		t.Fatalf("旧版本没有复合格，实际 %+v", previous.Composite)
+	}
+	if !reflect.DeepEqual(previous.ObservedWeeks, []int{5}) {
+		t.Fatalf("旧版本 observed_weeks 应为 [5]，实际 %v", previous.ObservedWeeks)
+	}
+	if previous.WeekGaps == nil || len(previous.WeekGaps) != 0 {
+		t.Fatalf("单周版本应给出空缺口切片，实际 %+v", previous.WeekGaps)
+	}
+	if previous.Window == nil || *previous.Window != (ReleaseWindow{Start: 5, End: 6}) {
+		t.Fatalf("旧版本 window 应为 5–6，实际 %+v", previous.Window)
+	}
+	if previous.ConflictRooms == nil || len(previous.ConflictRooms) != 0 {
+		t.Fatalf("没有冲突的版本应给出空清单，实际 %+v", previous.ConflictRooms)
+	}
+	if previous.ConflictRoomsTruncated {
+		t.Fatal("没有冲突的版本不应标记截断")
+	}
+}
+
+// TestReleaseAdminRepoAnomaliesEmptyAgainstRealDB 覆盖空库：没有版本时返回空切片，
+// 响应里 releases 为 []（Requirement 7.5）。
+func TestReleaseAdminRepoAnomaliesEmptyAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	repo := NewReleaseAdminRepo(pool)
+
+	anomalies, err := repo.Anomalies(ctx)
+	if err != nil {
+		t.Fatalf("空库读异常视图失败: %v", err)
+	}
+	if anomalies == nil {
+		t.Fatal("空库应返回空切片而不是 nil")
+	}
+	if len(anomalies) != 0 {
+		t.Fatalf("空库不应有版本: %+v", anomalies)
+	}
+}

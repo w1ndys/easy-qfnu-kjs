@@ -35,7 +35,7 @@
   - 单测：预热同键 → `Invalidate` → 同键重新查库（替身被第二次调用）；screen 同理
   - `cmd/server/main.go` 装配 `store.NewReleaseAdminRepo(pool)` 与 `func(){ queries.Invalidate(); screenService.Invalidate() }`，并加编译期断言 `var _ api.ReleaseAdminReader = store.ReleaseAdminRepo{}`
 
-- [ ] 6. 异常数据视图
+- [x] 6. 异常数据视图
   - `store.ReleaseAdminRepo.Anomalies`：逐版折叠出 `block_cells` / `observation_rows` / `unknown` / `composite` / `observed_weeks`，`window` 取该版最新发布轮次的 `window_start` / `window_end`
   - 纯函数：`weekGaps(observedWeeks)`（`[min,max]` 内缺周）与 `ratioOf(cells, blockCells)`（4 位小数，分母 0 记 0）；单测覆盖空、单周、缺中间周、四舍五入边界（`releaseIDValid` 由第 7 项实现与测试）
   - 冲突清单：`collect_run_room` 按 `run_id` 取该版最新一轮的 `conflict=true` 行，每版最多 200 条，出现第 201 条时 `conflict_rooms_truncated=true`

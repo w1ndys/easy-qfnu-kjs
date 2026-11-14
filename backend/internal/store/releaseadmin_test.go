@@ -148,6 +148,25 @@ func assignReleaseAdminValue(dest any, value any) error {
 			return fmt.Errorf("期望 string 或 nil，实际 %T", value)
 		}
 		*d = &v
+	case **int16:
+		// 可空 smallint 列（异常视图的窗口周次）：nil 落成 nil 指针。
+		if value == nil {
+			*d = nil
+			return nil
+		}
+		v, ok := value.(int16)
+		if !ok {
+			return fmt.Errorf("期望 int16 或 nil，实际 %T", value)
+		}
+		*d = &v
+	case *[]int32:
+		// int4[] 列（异常视图的 observed_weeks）：空数组落成空切片而不是 nil，
+		// 与 pgx 扫空数组的行为一致。
+		v, ok := value.([]int32)
+		if !ok {
+			return fmt.Errorf("期望 []int32，实际 %T", value)
+		}
+		*d = v
 	default:
 		return fmt.Errorf("目标类型 %T 不被替身支持", dest)
 	}
@@ -774,6 +793,95 @@ func (s *releaseDiffTxStub) Query(ctx context.Context, sql string, args ...any) 
 func (s *releaseDiffTxStub) Rollback(context.Context) error {
 	s.rolledBack = true
 	return nil
+}
+
+// releaseAnomalyQuerierStub 是 releaseAnomalyQuerier 的替身：按 SQL 常量分派两条
+// 多行读，记录调用顺序，用来断言「版本折叠先于冲突清单」与错误口径。
+type releaseAnomalyQuerierStub struct {
+	anomalies    pgx.Rows // 版本折叠的行集
+	anomaliesErr error
+	conflicts    pgx.Rows // 冲突清单的行集
+	conflictsErr error
+
+	calls []string // 调用顺序：anomalies / conflicts
+}
+
+// Query 按 SQL 常量分派；没预设行集时回放一个空行集，保持「成功但零行」。
+func (s *releaseAnomalyQuerierStub) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+	switch sql {
+	case releaseAnomaliesSQL:
+		s.calls = append(s.calls, "anomalies")
+		if s.anomalies == nil {
+			return &releaseAdminRowsStub{}, s.anomaliesErr
+		}
+		return s.anomalies, s.anomaliesErr
+	case releaseAnomalyConflictRoomsSQL:
+		s.calls = append(s.calls, "conflicts")
+		if s.conflicts == nil {
+			return &releaseAdminRowsStub{}, s.conflictsErr
+		}
+		return s.conflicts, s.conflictsErr
+	default:
+		panic("未知的异常视图语句")
+	}
+}
+
+// releaseAnomalyTxStub 是 pgx.Tx 的替身：事务体内的读转发给查询替身，Rollback 由
+// Anomalies 的 defer 调用（只读事务也靠它结束快照并归还连接），其余方法嵌入接口、
+// 调用即 panic，避免替身放行被测路径之外的行为。
+type releaseAnomalyTxStub struct {
+	pgx.Tx
+	querier    *releaseAnomalyQuerierStub
+	rolledBack bool // Rollback 是否被调用：漏掉收尾会让连接一直占着事务
+}
+
+// Query 转发给查询替身，服务版本折叠与冲突清单两条语句。
+func (s *releaseAnomalyTxStub) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return s.querier.Query(ctx, sql, args...)
+}
+
+// Rollback 记下收尾调用；只读事务不需要提交，回滚与提交等价。
+func (s *releaseAnomalyTxStub) Rollback(context.Context) error {
+	s.rolledBack = true
+	return nil
+}
+
+// releaseAnomalyRow 是异常视图一行的值序列，列序与 releaseAnomaliesSQL 一致。
+//
+// windowStart / windowEnd 传 nil 表示该版没有关联轮次（两列都为 NULL）；传指针表示
+// 窗口周次。term 固定成一个值：用例关心的是每行自己的列序与派生量，再让学期随行
+// 变化只会让断言更难读。
+func releaseAnomalyRow(
+	releaseID string,
+	generatedAt time.Time,
+	isCurrent bool,
+	hasAttrConflict bool,
+	observationRows int64,
+	blockCells int,
+	unknownCells int,
+	compositeCells int,
+	observedWeeks []int32,
+	windowStart *int16,
+	windowEnd *int16,
+) []any {
+	var start, end any
+	if windowStart != nil {
+		start = *windowStart
+	}
+	if windowEnd != nil {
+		end = *windowEnd
+	}
+	return []any{
+		releaseID, "2026-2027-1", generatedAt, isCurrent, hasAttrConflict,
+		observationRows, blockCells, unknownCells, compositeCells,
+		observedWeeks,
+		start, end,
+	}
+}
+
+// releaseAnomalyConflictRow 是冲突清单一行：release_id、房号、采纳楼、冲突楼、序号。
+func releaseAnomalyConflictRow(releaseID, roomID, buildingID, conflictBuildingID string, rank int64) []any {
+	return []any{releaseID, roomID, buildingID, conflictBuildingID, rank}
 }
 
 // releaseDiffFromSide / releaseDiffToSide 是两侧版本头的夹具。
@@ -2133,4 +2241,417 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestWeekGaps 覆盖周覆盖缺口的纯函数口径（Requirement 7.3、design 的边界清单）：
+// 空输入、单周、连续区间、缺中间周、多周缺口、无序输入与非 1 起始的区间。
+func TestWeekGaps(t *testing.T) {
+	cases := []struct {
+		name     string
+		observed []int
+		want     []int
+	}{
+		{name: "空输入", observed: nil, want: []int{}},
+		{name: "空切片", observed: []int{}, want: []int{}},
+		{name: "单周没有缺口", observed: []int{9}, want: []int{}},
+		{name: "连续四周没有缺口", observed: []int{9, 10, 11, 12}, want: []int{}},
+		{name: "缺中间一周", observed: []int{9, 10, 12}, want: []int{11}},
+		{name: "两头之间缺多周", observed: []int{5, 9}, want: []int{6, 7, 8}},
+		{name: "无序且重复仍按升序给出", observed: []int{12, 9, 12, 10}, want: []int{11}},
+		{name: "区间不从 1 开始", observed: []int{16, 14}, want: []int{15}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := weekGaps(tc.observed)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("weekGaps(%v) = %v，期望 %v", tc.observed, got, tc.want)
+			}
+			if got == nil {
+				t.Fatal("weekGaps 必须返回非 nil 切片，JSON 才会输出 []")
+			}
+		})
+	}
+}
+
+// TestRatioOf 覆盖占比的纯函数口径（Requirement 7.2）：4 位小数、四舍五入、
+// 分母为 0 记 0，以及中点向上这个边界。中点用例按浮点不精确的方向挑：
+// 57/800 = 0.07125 与 3/20000 = 0.00015 在 float64 里略小于真值，旧实现会舍成
+// 0.0712 / 0.0001，整数运算才得到 0.0713 / 0.0002。
+func TestRatioOf(t *testing.T) {
+	cases := []struct {
+		name       string
+		cells      int
+		blockCells int
+		want       float64
+	}{
+		{name: "分母为 0 且分子为 0", cells: 0, blockCells: 0, want: 0},
+		{name: "分母为 0 但有分子", cells: 12, blockCells: 0, want: 0},
+		{name: "分子为 0", cells: 0, blockCells: 363050, want: 0},
+		{name: "48/363050 进到第 4 位", cells: 48, blockCells: 363050, want: 0.0001},
+		{name: "12/363050 舍成 0", cells: 12, blockCells: 363050, want: 0},
+		{name: "中点 0.00005 向上", cells: 5, blockCells: 100000, want: 0.0001},
+		{name: "边界下方 0.00004 舍去", cells: 4, blockCells: 100000, want: 0},
+		{name: "中点 57/800 向上到 0.0713", cells: 57, blockCells: 800, want: 0.0713},
+		{name: "中点 3/20000 向上到 0.0002", cells: 3, blockCells: 20000, want: 0.0002},
+		{name: "1/3 保留四位", cells: 1, blockCells: 3, want: 0.3333},
+		{name: "2/3 保留四位", cells: 2, blockCells: 3, want: 0.6667},
+		{name: "整比例", cells: 1, blockCells: 1, want: 1},
+		{name: "负数分子兜底 0", cells: -1, blockCells: 10, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ratioOf(tc.cells, tc.blockCells); got != tc.want {
+				t.Fatalf("ratioOf(%d, %d) = %v，期望 %v", tc.cells, tc.blockCells, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReleaseAnomaliesSQLClauses 锁定异常视图两条语句的口径：
+// 折叠按各版自己的轴版本、未知/复合数折叠后的格（不是小节行）、周次去重升序、
+// 窗口取 run_id 最大的一轮、版本按生成时间倒序；冲突清单取最新一轮、按房号编号、
+// 多取一条识别截断。
+func TestReleaseAnomaliesSQLClauses(t *testing.T) {
+	clauses := []string{
+		"JOIN axis_node an ON an.axis_version = r.axis_version AND an.node = o.node", // 按该版自己的轴折叠
+		"GROUP BY o.room_id, o.week, o.weekday, an.block",                            // 折叠键：房号 × 周 × 星期 × 大节
+		"min(o.state_key) AS state_key",                                              // 块状态取 min，与对比/发布同口径
+		"count(*) FILTER (WHERE blk.state_key = 'unknown')",                          // 数折叠后的格，不是小节
+		"count(*) FILTER (WHERE blk.state_key = 'composite')",
+		"array_agg(DISTINCT blk.week::int ORDER BY blk.week::int)", // 观测周去重升序
+		"sum(blk.node_rows)::bigint",                               // 观测行数按大节格求和，仍是小节粒度
+		"COALESCE(s.observed_weeks, '{}'::int[])",
+		"ORDER BY cr.run_id DESC", // 窗口取最新一轮
+		"LIMIT 1",
+		"ORDER BY r.generated_at DESC, r.release_id DESC", // 与列表同一排序
+	}
+	for _, clause := range clauses {
+		if !strings.Contains(releaseAnomaliesSQL, clause) {
+			t.Fatalf("异常视图 SQL 缺少 %q:\n%s", clause, releaseAnomaliesSQL)
+		}
+	}
+	// 折叠前的 observation.state_key 不能直接拿来数：同一大节展开的 2–3 个小节
+	// 会重复计数（D12 / CP11）。
+	if strings.Contains(releaseAnomaliesSQL, "WHERE o.state_key") {
+		t.Fatalf("未知/复合必须数折叠后的格，不能直接数 observation 行:\n%s", releaseAnomaliesSQL)
+	}
+	// 窗口取最新一轮；写成 ASC 会让回退后窗口停在旧轮次。
+	if strings.Contains(releaseAnomaliesSQL, "run_id ASC") {
+		t.Fatalf("窗口应取 run_id 最大的一轮:\n%s", releaseAnomaliesSQL)
+	}
+
+	// 上限从 conflictRoomsLimit 派生：Go 侧按 rank > conflictRoomsLimit 置截断，
+	// SQL 侧按 rn <= conflictRoomsLimit+1 取数，两边必须是同一个数字，不能各写一份。
+	conflictFetchLimit := conflictRoomsLimit + 1
+	conflictClauses := []string{
+		"row_number() OVER (PARTITION BY r.release_id ORDER BY crr.room_id)", // 截断保留 room_id 最小的那批
+		"WHERE r.has_attr_conflict",      // 只查标了冲突的版本
+		"ORDER BY c.run_id DESC LIMIT 1", // 取该版最新一轮
+		"JOIN collect_run_room crr ON crr.run_id = pub.run_id AND crr.conflict",
+		fmt.Sprintf("WHERE rn <= %d", conflictFetchLimit), // 多取一条（200 + 1）才能识别截断
+		"ORDER BY release_id, rn",
+	}
+	for _, clause := range conflictClauses {
+		if !strings.Contains(releaseAnomalyConflictRoomsSQL, clause) {
+			t.Fatalf("冲突清单 SQL 缺少 %q:\n%s", clause, releaseAnomalyConflictRoomsSQL)
+		}
+	}
+	if !strings.Contains(releaseAnomalyConflictRoomsSQL, fmt.Sprintf("%d", conflictFetchLimit)) {
+		t.Fatalf("冲突清单必须多取一条以识别截断:\n%s", releaseAnomalyConflictRoomsSQL)
+	}
+}
+
+// TestReleaseAdminRepoAnomaliesOpensRepeatableReadReadOnlyTx 覆盖异常视图的事务外观：
+// REPEATABLE READ 让版本行与冲突清单看同一快照（CP7），READ ONLY 让误写直接失败（CP2）；
+// 顺序固定为「版本折叠 → 冲突清单」，结束后 Rollback 收尾。
+func TestReleaseAdminRepoAnomaliesOpensRepeatableReadReadOnlyTx(t *testing.T) {
+	windowStart, windowEnd := int16(9), int16(12)
+	querier := &releaseAnomalyQuerierStub{
+		anomalies: &releaseAdminRowsStub{rows: [][]any{
+			releaseAnomalyRow("20261114T030512Z", releaseAdminTestNow(), true, false,
+				10, 7, 2, 1, []int32{9, 11}, &windowStart, &windowEnd),
+		}},
+	}
+	tx := &releaseAnomalyTxStub{querier: querier}
+	pool := &releaseAdminPoolStub{tx: tx}
+	repo := NewReleaseAdminRepo(pool)
+
+	anomalies, err := repo.Anomalies(context.Background())
+	if err != nil {
+		t.Fatalf("读异常视图失败: %v", err)
+	}
+	if len(anomalies) != 1 || anomalies[0].ReleaseID != "20261114T030512Z" {
+		t.Fatalf("异常视图应经事务体返回: %+v", anomalies)
+	}
+	if fmt.Sprint(querier.calls) != fmt.Sprint([]string{"anomalies", "conflicts"}) {
+		t.Fatalf("应先读版本折叠、再读冲突清单，实际调用 %v", querier.calls)
+	}
+	if pool.txOptions.IsoLevel != pgx.RepeatableRead {
+		t.Fatalf("异常视图事务隔离级别应为 REPEATABLE READ，实际 %v", pool.txOptions.IsoLevel)
+	}
+	if pool.txOptions.AccessMode != pgx.ReadOnly {
+		t.Fatalf("异常视图事务应为 READ ONLY，实际 %v", pool.txOptions.AccessMode)
+	}
+	if !tx.rolledBack {
+		t.Fatal("异常视图事务结束后必须 Rollback 收尾")
+	}
+}
+
+// TestReleaseAdminRepoAnomaliesScansAllColumns 覆盖异常视图的列序与派生量：
+// 未知/复合的 ratio 由折叠格数当分母、周次数组转 int 后给出缺周、窗口两列可空、
+// 冲突清单按 rn 贴回版本并置截断标记，没有冲突的版本是空切片。
+func TestReleaseAdminRepoAnomaliesScansAllColumns(t *testing.T) {
+	windowStart, windowEnd := int16(9), int16(12)
+	anomalyRows := &releaseAdminRowsStub{rows: [][]any{
+		releaseAnomalyRow("20261114T030512Z", releaseAdminTestNow(), true, false,
+			10, 7, 2, 1, []int32{9, 11}, &windowStart, &windowEnd),
+		releaseAnomalyRow("20261028T041500Z", releaseAdminTestNow().Add(-17*24*time.Hour), false, true,
+			2, 1, 0, 1, []int32{5}, nil, nil),
+	}}
+	conflictRows := &releaseAdminRowsStub{rows: [][]any{
+		releaseAnomalyConflictRow("20261028T041500Z", "z001", "Q10", "Q03", 1),
+		releaseAnomalyConflictRow("20261028T041500Z", "z200", "Q10", "Q03", 200),
+		releaseAnomalyConflictRow("20261028T041500Z", "z201", "Q10", "Q03", 201), // 第 201 条：只置截断
+		releaseAnomalyConflictRow("20200101T000000Z", "ghost", "Q10", "Q03", 1),  // 不在版本集合里：跳过
+	}}
+	querier := &releaseAnomalyQuerierStub{anomalies: anomalyRows, conflicts: conflictRows}
+	tx := &releaseAnomalyTxStub{querier: querier}
+	repo := NewReleaseAdminRepo(&releaseAdminPoolStub{tx: tx})
+
+	anomalies, err := repo.Anomalies(context.Background())
+	if err != nil {
+		t.Fatalf("读异常视图失败: %v", err)
+	}
+	if len(anomalies) != 2 {
+		t.Fatalf("夹具应有两个版本，实际 %d 个: %+v", len(anomalies), anomalies)
+	}
+
+	current := anomalies[0]
+	if !current.IsCurrent || current.HasAttrConflict {
+		t.Fatalf("版本标记扫描不符: %+v", current)
+	}
+	if !current.GeneratedAt.Equal(releaseAdminTestNow()) {
+		t.Fatalf("generated_at 扫描不符: %s", current.GeneratedAt)
+	}
+	if want := (StateRatio{Cells: 2, Ratio: 0.2857}); current.Unknown != want {
+		t.Fatalf("unknown 应为 %+v，实际 %+v", want, current.Unknown)
+	}
+	if want := (StateRatio{Cells: 1, Ratio: 0.1429}); current.Composite != want {
+		t.Fatalf("composite 应为 %+v，实际 %+v", want, current.Composite)
+	}
+	if !reflect.DeepEqual(current.ObservedWeeks, []int{9, 11}) {
+		t.Fatalf("observed_weeks 应为 [9 11]，实际 %v", current.ObservedWeeks)
+	}
+	if !reflect.DeepEqual(current.WeekGaps, []int{10}) {
+		t.Fatalf("week_gaps 应命中缺周 10，实际 %v", current.WeekGaps)
+	}
+	if current.Window == nil || *current.Window != (ReleaseWindow{Start: 9, End: 12}) {
+		t.Fatalf("window 应来自关联轮次 9–12，实际 %+v", current.Window)
+	}
+	if current.ConflictRooms == nil || len(current.ConflictRooms) != 0 {
+		t.Fatalf("没有冲突的版本应给出空切片，实际 %+v", current.ConflictRooms)
+	}
+	if current.ConflictRoomsTruncated {
+		t.Fatal("没有冲突的版本不应标记截断")
+	}
+
+	previous := anomalies[1]
+	if previous.Unknown != (StateRatio{Cells: 0, Ratio: 0}) {
+		t.Fatalf("unknown 为 0 时占比也应为 0，实际 %+v", previous.Unknown)
+	}
+	if previous.Composite != (StateRatio{Cells: 1, Ratio: 1}) {
+		t.Fatalf("composite 1/1 应为 1，实际 %+v", previous.Composite)
+	}
+	if previous.Window != nil {
+		t.Fatalf("没有关联轮次的版本 window 应为 nil，实际 %+v", previous.Window)
+	}
+	if previous.WeekGaps == nil || len(previous.WeekGaps) != 0 {
+		t.Fatalf("单周版本应给出空缺口切片，实际 %+v", previous.WeekGaps)
+	}
+	wantConflicts := []ConflictRoom{
+		{RoomID: "z001", BuildingID: "Q10", ConflictBuildingID: "Q03"},
+		{RoomID: "z200", BuildingID: "Q10", ConflictBuildingID: "Q03"},
+	}
+	if !reflect.DeepEqual(previous.ConflictRooms, wantConflicts) {
+		t.Fatalf("冲突清单只保留 rn ≤ 200 的房号，got %+v want %+v",
+			previous.ConflictRooms, wantConflicts)
+	}
+	if !previous.ConflictRoomsTruncated {
+		t.Fatal("出现第 201 条冲突时应标记截断")
+	}
+
+	if !anomalyRows.closed || !conflictRows.closed {
+		t.Fatal("两条语句都必须关闭行集")
+	}
+}
+
+// TestReleaseAdminRepoAnomaliesConflictRoomsExactlyLimit 覆盖截断边界：冲突恰好
+// conflictRoomsLimit 条时，SQL 取回的 rn 最大就是 conflictRoomsLimit，不存在第
+// conflictRoomsLimit+1 行，所以清单条数等于上限且 conflict_rooms_truncated 为 false
+// （Requirement 7.4）。这条与「201 条才截断」互补，防止把 >= 写成 >（或反过来）。
+func TestReleaseAdminRepoAnomaliesConflictRoomsExactlyLimit(t *testing.T) {
+	anomalyRows := &releaseAdminRowsStub{rows: [][]any{
+		releaseAnomalyRow("20261114T030512Z", releaseAdminTestNow(), true, true,
+			10, 7, 2, 1, []int32{9}, nil, nil),
+	}}
+	conflictRows := make([][]any, 0, conflictRoomsLimit)
+	for rank := 1; rank <= conflictRoomsLimit; rank++ {
+		conflictRows = append(conflictRows, releaseAnomalyConflictRow(
+			"20261114T030512Z", fmt.Sprintf("z%03d", rank), "Q10", "Q03", int64(rank)))
+	}
+	querier := &releaseAnomalyQuerierStub{
+		anomalies: anomalyRows,
+		conflicts: &releaseAdminRowsStub{rows: conflictRows},
+	}
+	repo := newAnomaliesRepo(querier)
+
+	anomalies, err := repo.Anomalies(context.Background())
+	if err != nil {
+		t.Fatalf("读异常视图失败: %v", err)
+	}
+	if len(anomalies) != 1 {
+		t.Fatalf("夹具应有一个版本，实际 %d 个: %+v", len(anomalies), anomalies)
+	}
+	if got := len(anomalies[0].ConflictRooms); got != conflictRoomsLimit {
+		t.Fatalf("恰好 %d 条冲突时应全部返回，实际 %d 条", conflictRoomsLimit, got)
+	}
+	if anomalies[0].ConflictRoomsTruncated {
+		t.Fatalf("恰好 %d 条冲突不是截断，不应标记 conflict_rooms_truncated", conflictRoomsLimit)
+	}
+	if last := anomalies[0].ConflictRooms[conflictRoomsLimit-1].RoomID; last != "z200" {
+		t.Fatalf("清单末条应为第 %d 条 z200，实际 %q", conflictRoomsLimit, last)
+	}
+}
+
+// TestReleaseAdminRepoAnomaliesEmptyIsEmptySlice 覆盖空库：返回非 nil 的空切片，
+// 响应里 releases 是 []（Requirement 7.5）。
+func TestReleaseAdminRepoAnomaliesEmptyIsEmptySlice(t *testing.T) {
+	anomalyRows := &releaseAdminRowsStub{}
+	conflictRows := &releaseAdminRowsStub{}
+	querier := &releaseAnomalyQuerierStub{anomalies: anomalyRows, conflicts: conflictRows}
+	tx := &releaseAnomalyTxStub{querier: querier}
+	repo := NewReleaseAdminRepo(&releaseAdminPoolStub{tx: tx})
+
+	anomalies, err := repo.Anomalies(context.Background())
+	if err != nil {
+		t.Fatalf("空库读异常视图失败: %v", err)
+	}
+	if anomalies == nil {
+		t.Fatal("空库应返回空切片而不是 nil")
+	}
+	if len(anomalies) != 0 {
+		t.Fatalf("空库不应有版本: %+v", anomalies)
+	}
+	if !anomalyRows.closed || !conflictRows.closed {
+		t.Fatal("空结果也要关闭行集")
+	}
+}
+
+// TestReleaseAdminRepoAnomaliesErrors 覆盖异常视图的失败口径：开事务失败、两条语句的
+// 读库失败、扫描失败、遍历到一半失败，全部包 model.ErrQueryFailed（api 映射 50000），
+// 且不返回半份视图。
+func TestReleaseAdminRepoAnomaliesErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		// build 返回仓储、替身与「冲突清单是否应被读过」的期望。
+		build func() (ReleaseAdminRepo, *releaseAnomalyQuerierStub, bool)
+	}{
+		{
+			name: "事务开不起来",
+			build: func() (ReleaseAdminRepo, *releaseAnomalyQuerierStub, bool) {
+				querier := &releaseAnomalyQuerierStub{}
+				repo := NewReleaseAdminRepo(&releaseAdminPoolStub{
+					beginErr: errors.New("连接池耗尽"),
+					tx:       &releaseAnomalyTxStub{querier: querier},
+				})
+				return repo, querier, false
+			},
+		},
+		{
+			name: "版本折叠查询失败",
+			build: func() (ReleaseAdminRepo, *releaseAnomalyQuerierStub, bool) {
+				querier := &releaseAnomalyQuerierStub{anomaliesErr: errors.New("连接断了")}
+				repo := newAnomaliesRepo(querier)
+				return repo, querier, false
+			},
+		},
+		{
+			name: "版本折叠扫描失败",
+			build: func() (ReleaseAdminRepo, *releaseAnomalyQuerierStub, bool) {
+				querier := &releaseAnomalyQuerierStub{anomalies: &releaseAdminRowsStub{
+					rows:    [][]any{releaseAnomalyRow("20261114T030512Z", releaseAdminTestNow(), true, false, 0, 0, 0, 0, []int32{}, nil, nil)},
+					scanErr: errors.New("列类型不符"),
+				}}
+				return newAnomaliesRepo(querier), querier, false
+			},
+		},
+		{
+			name: "版本折叠遍历中途失败",
+			build: func() (ReleaseAdminRepo, *releaseAnomalyQuerierStub, bool) {
+				querier := &releaseAnomalyQuerierStub{anomalies: &releaseAdminRowsStub{
+					rows: [][]any{releaseAnomalyRow("20261114T030512Z", releaseAdminTestNow(), true, false, 0, 0, 0, 0, []int32{}, nil, nil)},
+					err:  errors.New("遍历中连接断了"),
+				}}
+				return newAnomaliesRepo(querier), querier, false
+			},
+		},
+		{
+			name: "冲突清单查询失败",
+			build: func() (ReleaseAdminRepo, *releaseAnomalyQuerierStub, bool) {
+				querier := &releaseAnomalyQuerierStub{
+					anomalies:    &releaseAdminRowsStub{},
+					conflictsErr: errors.New("连接断了"),
+				}
+				return newAnomaliesRepo(querier), querier, true
+			},
+		},
+		{
+			name: "冲突清单扫描失败",
+			build: func() (ReleaseAdminRepo, *releaseAnomalyQuerierStub, bool) {
+				querier := &releaseAnomalyQuerierStub{
+					anomalies: &releaseAdminRowsStub{},
+					conflicts: &releaseAdminRowsStub{
+						rows:    [][]any{releaseAnomalyConflictRow("20261028T041500Z", "z001", "Q10", "Q03", 1)},
+						scanErr: errors.New("列类型不符"),
+					},
+				}
+				return newAnomaliesRepo(querier), querier, true
+			},
+		},
+		{
+			name: "冲突清单遍历中途失败",
+			build: func() (ReleaseAdminRepo, *releaseAnomalyQuerierStub, bool) {
+				querier := &releaseAnomalyQuerierStub{
+					anomalies: &releaseAdminRowsStub{},
+					conflicts: &releaseAdminRowsStub{
+						rows: [][]any{releaseAnomalyConflictRow("20261028T041500Z", "z001", "Q10", "Q03", 1)},
+						err:  errors.New("遍历中连接断了"),
+					},
+				}
+				return newAnomaliesRepo(querier), querier, true
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, querier, wantConflictRead := tc.build()
+
+			anomalies, err := repo.Anomalies(context.Background())
+			if !errors.Is(err, model.ErrQueryFailed) {
+				t.Fatalf("期望包装 model.ErrQueryFailed，实际 err=%v", err)
+			}
+			if anomalies != nil {
+				t.Fatalf("失败时不应返回半份视图: %+v", anomalies)
+			}
+			if got := containsString(querier.calls, "conflicts"); got != wantConflictRead {
+				t.Fatalf("冲突清单是否被读应为 %t，实际调用 %v", wantConflictRead, querier.calls)
+			}
+		})
+	}
+}
+
+// newAnomaliesRepo 用替身拼一个走事务体的仓储；cases 只关心查询替身的内容。
+func newAnomaliesRepo(querier *releaseAnomalyQuerierStub) ReleaseAdminRepo {
+	tx := &releaseAnomalyTxStub{querier: querier}
+	return NewReleaseAdminRepo(&releaseAdminPoolStub{tx: tx})
 }

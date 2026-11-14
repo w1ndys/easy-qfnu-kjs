@@ -325,6 +325,135 @@ func DiffTotal(section DiffSection, kind DiffKind, summary ReleaseDiffSummary) i
 	return 0
 }
 
+// StateRatio 是某一类格（未知/复合）在该版里的格数与占比。
+//
+// Cells 按「房号 × 周 × 星期 × 大节」计数，同一大节展开的 2–3 个小节只算一格
+// （D12 / CP11），与发布侧走 collect_run.unknown_cells / composite_cells 的口径同源。
+// Ratio 以该版格数为分母、四舍五入到 4 位小数（Requirement 7.2）：两个值一起给，
+// 调用方不必自己再算一遍除法，也不会出现「比例与格数对不上」的两种算法。
+type StateRatio struct {
+	Cells int     // 该类的格数（大节粒度）
+	Ratio float64 // cells / 该版格数，4 位小数；分母为 0 时为 0
+}
+
+// ReleaseWindow 是该版关联发布轮次的采集窗口（教学周次闭区间）。
+//
+// 窗口属于轮次而不是版本：observation 不存窗口，collect_run 才是「这一轮抓了哪几周」
+// 的事实来源。取 run_id 最大的一轮：正常一版只由一轮发布，手工修数据造成重复关联时
+// 取最新一轮，结果仍然确定（与冲突清单取同一轮）。
+//
+// 没有关联轮次时 ReleaseAnomaly.Window 为 nil，响应输出 null；这与列表的 released_at
+// 可空是同一件事。
+type ReleaseWindow struct {
+	Start int // 窗口起始周，collect_run.window_start
+	End   int // 窗口结束周，collect_run.window_end
+}
+
+// ConflictRoom 是发布轮次里的一个房号级归属冲突：同一个房号落在两栋楼。
+//
+// BuildingID 是该轮采纳的楼，ConflictBuildingID 是被丢弃的另一栋；collect_run_room
+// 的 CHECK 保证标了 conflict 的行两列都非空，因此这里用值类型而不是指针。
+// 清单按 room_id 升序，每版最多 conflictRoomsLimit 条（Requirement 7.4）。
+type ConflictRoom struct {
+	RoomID             string // 房号
+	BuildingID         string // 该轮采纳的教学楼
+	ConflictBuildingID string // 与该房号冲突、被丢弃的教学楼
+}
+
+// ReleaseAnomaly 是 GET /api/admin/anomalies 里一个版本的一行（Requirement 7）。
+//
+// 计数口径与发布侧同源（D12）：先按各版自己的 axis_version 把小节折叠成大节再数，
+// 不是小节粒度，所以管理员在运行详情里看到的 unknown/composite 与这里一致。
+//
+// 三处「空」都恒为非 nil 切片：ObservedWeeks / WeekGaps / ConflictRooms 没有内容时
+// 是空切片，序列化成 JSON 的 [] 而不是 null（响应键集合是封闭的，值形状也要稳定）。
+//
+// Window 为 nil 表示该版没有可关联的发布轮次。ConflictRoomsTruncated 只在冲突数超过
+// 每版上限时为 true，且此时 ConflictRooms 是 room_id 最小的那批——截断也不能悄悄换成
+// 另一批房号。
+type ReleaseAnomaly struct {
+	ReleaseID              string         // 版本标识，release.release_id
+	Term                   string         // 学期
+	GeneratedAt            time.Time      // 版本生成时间
+	IsCurrent              bool           // 是否为公开查询读取的当前版本
+	HasAttrConflict        bool           // 该版是否标记了归属冲突
+	Unknown                StateRatio     // 未知格数与占比
+	Composite              StateRatio     // 复合格数与占比
+	ObservedWeeks          []int          // 有观测的周次，升序
+	WeekGaps               []int          // [min,max] 内没有观测的周，升序
+	Window                 *ReleaseWindow // 关联轮次的采集窗口；没有轮次时 nil
+	ConflictRooms          []ConflictRoom // room_id 最小的那批冲突房号，至多 conflictRoomsLimit 条
+	ConflictRoomsTruncated bool           // 冲突数超过每版上限时为 true
+}
+
+// conflictRoomsLimit 是每个版本最多返回的冲突房号数（Requirement 7.4）。
+//
+// 冲突清单是排障线索，不是可翻页的明细：201 条与 20100 条对管理员没有区别，
+// 反而会让异常视图的响应随数据量膨胀。SQL 侧按本常量加一取数（当前 rn <= 201）
+// 才能区分「正好 200 条」与「超过 200 条」，Go 侧按 rn 是否超过本常量置截断标记。
+const conflictRoomsLimit = 200
+
+// ratioOf 返回 cells 占 blockCells 的比例，保留 4 位小数（四舍五入）。
+//
+// 分母为 0 时返回 0：空版本在发布侧不可达（发布门槛要求候选非空），这里仍按 0
+// 处理，不让除零变成 NaN/Inf 混进响应。cells 为负也按 0 兜底——格数不可能为负，
+// 真出现说明上游计数错，返回 0 比返回一个负比例更不容易被误读。
+//
+// 舍入全程用整数：先把比例放大成 q = floor(cells*1e4/blockCells)，再看余数是否达到
+// 分母的一半（2*余数 >= 分母）决定进位。中点向上是 design 的边界口径，而浮点算不出
+// 这个边界：57/800 = 0.07125、3/20000 = 0.00015 在二进制里都略小于真值，乘 1e4 后
+// 是 712.4999… / 1.4999…，math.Round 会把它们舍成 0.0712 / 0.0001。整数除法与取余
+// 没有这个误差，57/800 得 0.0713、3/20000 得 0.0002。
+func ratioOf(cells int, blockCells int) float64 {
+	if cells <= 0 || blockCells <= 0 {
+		return 0
+	}
+	scaled := int64(cells) * 10000
+	q := scaled / int64(blockCells)
+	if 2*(scaled%int64(blockCells)) >= int64(blockCells) {
+		q++
+	}
+	return float64(q) / 1e4
+}
+
+// weekGaps 返回 [min(observedWeeks), max(observedWeeks)] 内没有观测的周，按周次升序。
+//
+// 入参是某版有观测的周次集合（SQL 侧 array_agg(DISTINCT ... ORDER BY ...) 已去重升序）。
+// 空切片返回空切片而不是 nil：响应里 week_gaps 是 []，调用方不必区分两种「空」。
+//
+// 不假设入参有序：纯函数不该依赖调用方的隐含约定，先扫一遍定 min/max，再用标记数组
+// 记下已覆盖的周，最后按周次升序补出缺口。规模是 min..max 的跨度（教学周，≤ 学期
+// 总周数），线性且只分配一次，比逐周回查切片或 SQL 的 generate_series 都好测。
+func weekGaps(observedWeeks []int) []int {
+	gaps := make([]int, 0)
+	if len(observedWeeks) == 0 {
+		return gaps
+	}
+
+	minimum, maximum := observedWeeks[0], observedWeeks[0]
+	for _, week := range observedWeeks[1:] {
+		if week < minimum {
+			minimum = week
+		}
+		if week > maximum {
+			maximum = week
+		}
+	}
+
+	// 下标是 week - minimum：区间跨度由观测决定，不按学期总周数分配，也不依赖 week
+	// 从 1 开始。跨度来自 smallint 周次，实际数据不超过几十。
+	covered := make([]bool, maximum-minimum+1)
+	for _, week := range observedWeeks {
+		covered[week-minimum] = true
+	}
+	for week := minimum; week <= maximum; week++ {
+		if !covered[week-minimum] {
+			gaps = append(gaps, week)
+		}
+	}
+	return gaps
+}
+
 // ErrReleaseNotFound 表示要读的发布版本不在库里。
 //
 // 对比时两侧任一缺失都返回它（消息里点名 from / to 与版本标识），api 映射
@@ -369,9 +498,9 @@ var (
 // 头条、逐周计数与按楼计数要走同一个快照（发布事务会删更早版本，多语句读若跨
 // 快照就会给出「头还在、明细已经没了」的半份结果）。
 //
-// QueryRow 是 design 为本类型声明的方法，当前三个读方法都用不到（列表只用 Query，
-// 详情与对比的单行读都在事务体内）。保留它是为了与 design 的接口形状一致：后续
-// 异常/回退条目若需要「不进事务的单行读」，不必再回来扩接口。
+// QueryRow 是 design 为本类型声明的方法，当前四个读方法都用不到（列表只用 Query，
+// 详情、对比与异常的读都在事务体内）。保留它是为了与 design 的接口形状一致：将来
+// 若需要「不进事务的单行读」，不必再回来扩接口；回退的直接写入走 interface 之外。
 type releaseAdminPool interface {
 	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -394,6 +523,15 @@ type releaseDetailQuerier interface {
 type releaseDiffQuerier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// releaseAnomalyQuerier 是异常视图事务体内需要的能力：两条多行读。
+//
+// 异常视图没有单行读：版本行由第一条语句整批给出，冲突清单由第二条语句整批给出，
+// 两条都在同一个 REPEATABLE READ 只读事务里，版本集合与冲突清单因此来自同一快照
+// （CP2 / CP7）。单独的窄接口让事务体可以用替身单独验证。
+type releaseAnomalyQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 // releaseRollbackTx 是回退事务体需要的最小能力：两条加锁单行读与两条 UPDATE。
@@ -738,6 +876,95 @@ SELECT p.*, COALESCE(r.name, '') AS room_name
   FROM page p LEFT JOIN room r ON r.room_id = p.room_id
  ORDER BY p.room_id`
 
+// releaseAnomaliesSQL 按版本折叠出异常视图的折叠口径，窗口从发布轮次取。
+//
+// 每个版本一个 LEFT JOIN LATERAL：内层先用该版自己的 axis_version 把小节观测折成
+// 「房号 × 周 × 星期 × 大节」的格（与详情、对比的折叠同口径，D4 / D12），再在折叠
+// 结果上数格数、未知、复合与观测行数。必须折完再数：同一大节展开的 2–3 个小节只算
+// 一格，直接数 observation 行会把未知/复合放大 2–3 倍，与发布侧 collect_run 的
+// 计数（publish/build.go 的大节口径）对不上（CP11）。
+//
+// 折叠用 r.axis_version 而不是「当前」轴版本：轴改版后同一个 node 可能落到不同 block，
+// 用当前轴折历史版本会把旧版折成另一套格。
+//
+// LATERAL 在空集上仍返回一行：sum 为 NULL、count 为 0、array_agg 为 NULL，所以
+// COALESCE 把观测行数/周次折成 0 / 空数组；COALESCE 的其它列只是把「count 理论上
+// 不会 NULL」写成确定值，与列表 SQL 同一写法。
+//
+// observed_weeks 在 SQL 里就排好序（array_agg 带 ORDER BY），Go 侧只做 int32 → int
+// 的搬运与 weekGaps 推导；week 先转 int 再聚合，扫描侧就不会撞上 int2[] 的类型
+// 歧义（design「异常聚合」的说明）。
+//
+// 窗口取 run_id 最大的一轮：正常一版只由一轮发布，重复关联时取最新一轮并保持确定；
+// 没有关联轮次时两列为 NULL，Go 侧输出 null（Requirement 7.4）。
+const releaseAnomaliesSQL = `
+SELECT r.release_id, r.term, r.generated_at, r.is_current, r.has_attr_conflict,
+       COALESCE(s.observation_rows, 0), COALESCE(s.block_cells, 0),
+       COALESCE(s.unknown_cells, 0),    COALESCE(s.composite_cells, 0),
+       COALESCE(s.observed_weeks, '{}'::int[]),
+       w.window_start, w.window_end
+  FROM release r
+  LEFT JOIN LATERAL (
+        SELECT sum(blk.node_rows)::bigint AS observation_rows,
+               count(*)                   AS block_cells,
+               count(*) FILTER (WHERE blk.state_key = 'unknown')   AS unknown_cells,
+               count(*) FILTER (WHERE blk.state_key = 'composite') AS composite_cells,
+               array_agg(DISTINCT blk.week::int ORDER BY blk.week::int) AS observed_weeks
+          FROM (
+                SELECT o.room_id, o.week, o.weekday, an.block,
+                       min(o.state_key) AS state_key,
+                       count(*) AS node_rows
+                  FROM observation o
+                  JOIN axis_node an ON an.axis_version = r.axis_version AND an.node = o.node
+                 WHERE o.release_id = r.release_id
+                 GROUP BY o.room_id, o.week, o.weekday, an.block
+               ) blk
+       ) s ON true
+  LEFT JOIN LATERAL (
+        SELECT cr.window_start, cr.window_end
+          FROM collect_run cr
+         WHERE cr.release_id = r.release_id
+         ORDER BY cr.run_id DESC
+         LIMIT 1
+       ) w ON true
+ ORDER BY r.generated_at DESC, r.release_id DESC`
+
+// releaseAnomalyConflictRoomsSQL 取每个异常版本最新发布轮次的房号级冲突清单。
+//
+// 取数上限是 conflictRoomsLimit + 1（201）：多取一条才能区分「正好 200 条」与
+// 「超过 200 条」，Go 侧据此置 conflict_rooms_truncated（Requirement 7.4）。
+// 上限由 fmt.Sprintf 从 conflictRoomsLimit 算出，不在这里另写一个数字：Go 侧的截断
+// 判定（rank > conflictRoomsLimit）与 SQL 的过滤条件是同一个来源，改常量时两边一起动。
+//
+// 冲突只对 has_attr_conflict 的版本查：没标冲突的版本即使某轮 collect_run_room 里
+// 有 conflict=true 的行也不属于「这个版本的归属冲突」（版本标记是发布时定下的口径）。
+//
+// 轮次同样用 LATERAL 取 run_id 最大的一轮：冲突快照按轮次存，回退不改轮次，所以
+// 「这一版最新一轮」就是发布这一版的那一轮（重复关联时是最新一次）。
+//
+// row_number() 按 room_id 升序编号，截断保留的就是 room_id 最小的一批——结果确定，
+// 不会随执行计划换一批房号（Requirement 7.4 的「room_id 最小的 200 条」）。
+//
+// conflict_building_id 在表里可空，但 CHECK 保证 conflict=true 的行两列非空，
+// 所以 WHERE crr.conflict 之后可以扫进值类型。
+var releaseAnomalyConflictRoomsSQL = fmt.Sprintf(`
+WITH ranked AS (
+  SELECT r.release_id, crr.room_id, crr.building_id, crr.conflict_building_id,
+         row_number() OVER (PARTITION BY r.release_id ORDER BY crr.room_id) AS rn
+    FROM release r
+    JOIN LATERAL (
+          SELECT c.run_id FROM collect_run c
+           WHERE c.release_id = r.release_id
+           ORDER BY c.run_id DESC LIMIT 1
+         ) pub ON true
+    JOIN collect_run_room crr ON crr.run_id = pub.run_id AND crr.conflict
+   WHERE r.has_attr_conflict
+)
+SELECT release_id, room_id, building_id, conflict_building_id, rn
+  FROM ranked
+ WHERE rn <= %d
+ ORDER BY release_id, rn`, conflictRoomsLimit+1)
+
 // 回退要识别的两个「可重试」SQLSTATE。唯一冲突复用 collectrun.go 的
 // pgUniqueViolation（23505），不在这里重复声明。
 const (
@@ -795,8 +1022,8 @@ UPDATE release
 //
 // 它是 api.ReleaseAdminReader 的结构匹配实现：store 不 import api（依赖方向见
 // backend/.golangci.yml 的 store 规则），接口定义在消费侧，方法集在这里一一对应。
-// 本文件有列表、详情、对比（汇总 + 小节分页）三个读方法与回退一个写方法（tasklist
-// 第 1–4 项）；异常由后续条目补到同一类型上。
+// 本文件有列表、详情、对比（汇总 + 小节分页）、异常四个读方法与回退一个写方法
+// （tasklist 第 1–6 项）。
 type ReleaseAdminRepo struct {
 	pool releaseAdminPool // 通常是 *pgxpool.Pool
 }
@@ -1328,6 +1555,176 @@ func loadReleaseDiffSummary(
 	summary.Unknown = StateDelta{From: fromUnknown, To: toUnknown, Delta: toUnknown - fromUnknown}
 	summary.Composite = StateDelta{From: fromComposite, To: toComposite, Delta: toComposite - fromComposite}
 	return summary, nil
+}
+
+// Anomalies 返回库中每个版本的异常聚合：未知/复合格数与占比、观测周与缺周、
+// 关联轮次的采集窗口、归属冲突清单（Requirement 7）。
+//
+// 两条语句（版本折叠 + 冲突清单）包在一个 REPEATABLE READ READ ONLY 事务里：
+//   - REPEATABLE READ：发布事务会删更早版本。版本行与冲突清单若各看各的快照，
+//     就会出现「版本还在、冲突清单已经跟着轮次或版本被删」的拼凑结果（CP7）；
+//   - READ ONLY：本路径只有 SELECT，误写直接失败而不是靠人工审查（CP2）。
+//
+// 没有版本时返回空切片而不是 nil：响应里 releases 是 []（Requirement 7.5）。
+// 读库失败一律包 model.ErrQueryFailed（api 映射 50000），不返回半份视图。
+//
+// 冲突清单在版本行之后单独读：它要 join collect_run 找最新一轮再扫 collect_run_room，
+// 与观测折叠是两棵互不相干的查询；放进同一条语句会让折叠结果按冲突行复制。
+func (r ReleaseAdminRepo) Anomalies(ctx context.Context) ([]ReleaseAnomaly, error) {
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: 开启异常视图只读事务失败: %w", model.ErrQueryFailed, err)
+	}
+	// 只读事务不需要提交：回滚与提交一样只是结束快照并归还连接，不会产生任何写入。
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	return loadReleaseAnomalies(ctx, tx)
+}
+
+// loadReleaseAnomalies 是 Anomalies 的事务体：先读全部版本的折叠结果，再读冲突清单
+// 并按版本贴回去，不负责开事务。
+//
+// 冲突清单必须等版本行全部读完之后再读：版本行要按 release_id 建下标，才能把
+// 「冲突行属于哪个版本」在 O(1) 里定位；两条语句在同一个只读事务里，先后不影响快照。
+// 每个版本的 ConflictRooms 在扫描阶段就初始化成空切片，所以「没有冲突」的版本与
+// 「冲突行还没贴上来」的版本在序列化上是同一个稳定的 []。
+func loadReleaseAnomalies(ctx context.Context, q releaseAnomalyQuerier) ([]ReleaseAnomaly, error) {
+	rows, err := q.Query(ctx, releaseAnomaliesSQL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 读取异常视图失败: %w", model.ErrQueryFailed, err)
+	}
+	defer rows.Close()
+
+	anomalies := make([]ReleaseAnomaly, 0)
+	positions := make(map[string]int) // release_id → 在 anomalies 里的下标
+	for rows.Next() {
+		anomaly, scanErr := scanReleaseAnomaly(rows.Scan)
+		if scanErr != nil {
+			return nil, fmt.Errorf("%w: 扫描异常视图失败: %w", model.ErrQueryFailed, scanErr)
+		}
+		positions[anomaly.ReleaseID] = len(anomalies)
+		anomalies = append(anomalies, anomaly)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: 遍历异常视图失败: %w", model.ErrQueryFailed, err)
+	}
+
+	if err := loadReleaseAnomalyConflictRooms(ctx, q, anomalies, positions); err != nil {
+		return nil, err
+	}
+	return anomalies, nil
+}
+
+// loadReleaseAnomalyConflictRooms 读冲突清单并按下标贴回 anomalies；截断按版本标记。
+//
+// 空切片来自扫描阶段的初始化，这里只 append 命中上限以内的行，所以没有冲突的版本
+// 仍是 []。rn 由 SQL 的 row_number() 给出、不是 Go 侧数出来的：截断边界必须与
+// 「room_id 最小的 N 条」是同一次排序的结果，否则两条路径各排一次就可能换一批房号。
+func loadReleaseAnomalyConflictRooms(
+	ctx context.Context,
+	q releaseAnomalyQuerier,
+	anomalies []ReleaseAnomaly,
+	positions map[string]int,
+) error {
+	rows, err := q.Query(ctx, releaseAnomalyConflictRoomsSQL)
+	if err != nil {
+		return fmt.Errorf("%w: 读取异常视图的归属冲突清单失败: %w", model.ErrQueryFailed, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			releaseID          string
+			roomID             string
+			buildingID         string
+			conflictBuildingID string
+			rank               int64
+		)
+		if err := rows.Scan(&releaseID, &roomID, &buildingID, &conflictBuildingID, &rank); err != nil {
+			return fmt.Errorf("%w: 扫描异常视图的归属冲突清单失败: %w", model.ErrQueryFailed, err)
+		}
+
+		position, ok := positions[releaseID]
+		if !ok {
+			// 同一只读事务的两条语句看到同一份 release 集合，正常不可能走到这里。
+			// 真出现说明快照被外力切开（或 SQL 改了过滤条件），跳过这一行而不是 panic，
+			// 也不为它伪造一个版本条目。
+			continue
+		}
+		if rank > conflictRoomsLimit {
+			// SQL 只多取一条（201）：这一行唯一的用途就是告诉 Go「后面还有」。
+			anomalies[position].ConflictRoomsTruncated = true
+			continue
+		}
+		anomalies[position].ConflictRooms = append(anomalies[position].ConflictRooms, ConflictRoom{
+			RoomID:             roomID,
+			BuildingID:         buildingID,
+			ConflictBuildingID: conflictBuildingID,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%w: 遍历异常视图的归属冲突清单失败: %w", model.ErrQueryFailed, err)
+	}
+	return nil
+}
+
+// scanReleaseAnomaly 按 releaseAnomaliesSQL 的列序扫一行，并就地补出派生量：
+// 未知/复合的 ratio、observed_weeks 的 int 转换、week_gaps、window 与空冲突清单。
+//
+// 列序：版本身份 5 列、折叠 5 列（观测行数、格数、未知、复合、观测周）、窗口 2 列。
+// 窗口两列是 smallint 且可空，扫成 *int16 再转 int：NULL 表示没有关联轮次，Window 为
+// nil。observed_weeks 扫成 []int32 再逐项转 int，避开 int2[] 的扫描歧义（design）。
+//
+// observation_rows 不在 ReleaseAnomaly 的契约里（响应没有这个键），仍随折叠选出：
+// 它与 block_cells 同出一次扫描，是「观测行数 / 格数」这对口径的完整一行。本视图
+// 只把 block_cells 用作 ratio 分母；行数扫进局部变量后即不再参与拼装，后续条目若要
+// 在视图里展示观测行数，不必回来把同一个版本再折一遍。
+func scanReleaseAnomaly(scan func(dest ...any) error) (ReleaseAnomaly, error) {
+	var (
+		anomaly         ReleaseAnomaly
+		observationRows int64
+		blockCells      int
+		unknownCells    int
+		compositeCells  int
+		observedWeeks   []int32
+		windowStart     *int16
+		windowEnd       *int16
+	)
+	err := scan(
+		&anomaly.ReleaseID,
+		&anomaly.Term,
+		&anomaly.GeneratedAt,
+		&anomaly.IsCurrent,
+		&anomaly.HasAttrConflict,
+		&observationRows,
+		&blockCells,
+		&unknownCells,
+		&compositeCells,
+		&observedWeeks,
+		&windowStart,
+		&windowEnd,
+	)
+	if err != nil {
+		return ReleaseAnomaly{}, err
+	}
+
+	anomaly.Unknown = StateRatio{Cells: unknownCells, Ratio: ratioOf(unknownCells, blockCells)}
+	anomaly.Composite = StateRatio{Cells: compositeCells, Ratio: ratioOf(compositeCells, blockCells)}
+	anomaly.ObservedWeeks = make([]int, len(observedWeeks))
+	for index, week := range observedWeeks {
+		anomaly.ObservedWeeks[index] = int(week)
+	}
+	anomaly.WeekGaps = weekGaps(anomaly.ObservedWeeks)
+	anomaly.ConflictRooms = make([]ConflictRoom, 0)
+	// 两列要么同时有值、要么同时为 NULL（同一个 LATERAL 选同一行）：只认成对的窗口，
+	// 只有一半时按「没有窗口」处理，不拼一个半开区间出来。
+	if windowStart != nil && windowEnd != nil {
+		anomaly.Window = &ReleaseWindow{Start: int(*windowStart), End: int(*windowEnd)}
+	}
+	return anomaly, nil
 }
 
 // Rollback 把目标版本置为当前版本，并在同一个事务里把原当前版本置为非当前版本。
