@@ -64,7 +64,7 @@
   - `DroppedRequired`/`DroppedOptional` 与 `CloseRun`/`EvaluateRun` 用同一个 `Dropped()` 值；`Commit` 成功后不再调用任何收口函数
   - 单测：success 与 partial 各一条、候选集为空、校验拦截、发布事务失败、`Commit` 成功后无第二次收口调用
 
-- [ ] 11. 装配、门禁与端到端检查点
+- [x] 11. 装配、门禁与端到端检查点
   - `config.Config.UpstreamBaseURL`（`UPSTREAM_BASE_URL`，缺省 `http://zhjw.qfnu.edu.cn`）+ `main.go` 装配 `upstream.New` → `collector.New` → `runner.Deps.Collect`，启动日志 `collector_wired=true`
   - `backend/.golangci.yml` 补 `collector` 包规则；`go.mod` 不变
   - 三条编译期断言：`var _ collector.RunLifecycle = store.CollectRunRepo{}`、`var _ collector.TermCalendar = store.TermRepo{}`、`var _ collector.SnapshotReader = store.SnapshotRepo{}`

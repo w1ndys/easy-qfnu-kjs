@@ -94,6 +94,36 @@ func TestLoadSecretKeyPath(t *testing.T) {
 	}
 }
 
+// TestLoadUpstreamBaseURL 覆盖上游根地址：未设置（或显式空串）时落到设计默认值，
+// 显式给出时原样采用。地址形状（http/https、主机、路径前缀）由 upstream.New 校验，
+// config 不重复实现，所以这里也不期望它拒绝非法形状。
+func TestLoadUpstreamBaseURL(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "未设置时用设计默认地址", raw: "", want: "http://zhjw.qfnu.edu.cn"},
+		{name: "显式地址原样采用", raw: "https://jw.example.edu.cn", want: "https://jw.example.edu.cn"},
+		{name: "带路径前缀也照收", raw: "http://10.0.0.8:8080/jw", want: "http://10.0.0.8:8080/jw"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://u:p@127.0.0.1:5432/db")
+			t.Setenv("UPSTREAM_BASE_URL", c.raw)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("期望成功，实际 err=%v", err)
+			}
+			if cfg.UpstreamBaseURL != c.want {
+				t.Fatalf("UpstreamBaseURL 期望 %q，实际 %q", c.want, cfg.UpstreamBaseURL)
+			}
+		})
+	}
+}
+
 // TestLoadAdminCookieSecure 覆盖管理会话 Cookie 的 Secure 开关：默认开启（生产口径），
 // 可显式关闭（本地 http 开发），非法值拒绝启动。
 func TestLoadAdminCookieSecure(t *testing.T) {

@@ -20,6 +20,7 @@ import (
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/api"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/auth"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/collector"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/config"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/pipeline"
@@ -30,6 +31,7 @@ import (
 	"github.com/w1ndys/easy-qfnu-kjs/internal/settings"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/stats"
 	"github.com/w1ndys/easy-qfnu-kjs/internal/store"
+	"github.com/w1ndys/easy-qfnu-kjs/internal/upstream"
 )
 
 // 管理端数据来源必须满足 auth.AdminStore：消费侧接口定义在 internal/auth，
@@ -41,6 +43,15 @@ var _ auth.AdminStore = store.AdminRepo{}
 // 结构匹配，store 不 import settings（依赖方向见 backend/.golangci.yml）。这条断言
 // 与上面的 auth.AdminStore 并列，把「settings 服务能不能直接用这个仓储」钉在编译期。
 var _ settings.Store = store.SettingsRepo{}
+
+// 采集执行器的三条仓储窄接口同理：collector.RunLifecycle / TermCalendar / SnapshotReader
+// 是消费侧接口，实现留在 internal/store（store 不 import collector），方法集一旦漂移就
+// 在编译期失败，而不是等到第一次手动同步才在后台轮次里报「缺依赖」。
+var (
+	_ collector.RunLifecycle   = store.CollectRunRepo{}
+	_ collector.TermCalendar   = store.TermRepo{}
+	_ collector.SnapshotReader = store.SnapshotRepo{}
+)
 
 // main 只把 run 的返回值转成退出码：0 正常，1 非正常终止。
 func main() {
@@ -131,11 +142,50 @@ func run() int {
 	// 都读同一张 collect_run，不另建第二份查询实现。
 	runStatusRepo := store.NewRunStatusRepo(pool)
 
-	// 采集执行器属于 collect-runner spec，本 spec 只交付启动端口（D6）。Collect 保持
-	// nil 是明确的可观察过渡态：白名单非空的手动同步与定时触发返回 50000 且零建轮
-	// （CP16），启动日志另记一条 WARN，运维能从启动信息直接看出这条链还没接上。
-	var collector runner.Collector
-	collectorWired := collector != nil
+	// 采集链路的装配顺序固定（collect-runner design「依赖方向」的装配段）：
+	// 上游客户端 → 采集执行器 → runner 的 Collect 端口。三步都必须在 runner.New 之前完成：
+	// runner 允许 Collect 为 nil（过渡态），但本装配成功后不再存在 nil 状态；装配顺序反过来
+	// 就只能先塞一个 nil 再回头补，等于把「执行链没接上」变成运行期才暴露的问题。
+	//
+	// 上游根地址来自配置（UPSTREAM_BASE_URL，缺省 http://zhjw.qfnu.edu.cn），
+	// 形状校验只有 upstream.New 一处；OCR 超时用 config 里那个值，与启动日志打的是
+	// 同一个配置项，避免「日志写 10s、客户端用默认值」这种两处口径。
+	upstreamClient, err := upstream.New(cfg.UpstreamBaseURL, upstream.WithOCRTimeout(cfg.OCRTimeout))
+	if err != nil {
+		log.Error("启动失败", "err", err)
+		return 1
+	}
+
+	// 任务仓储同时承担两个接口：Tasks 是执行循环的读写面，TaskRead 只给 hydrate 读
+	// 周矩阵任务状态。同一个值注入两次，避免两个仓储实例对同一批行各持一份状态。
+	syncTasks := store.NewSyncTaskRepo(pool)
+	collectorPort, err := newRunCollector(collector.Deps{
+		Runs:      store.NewCollectRunRepo(pool),
+		Terms:     store.NewTermRepo(pool),
+		Snapshots: store.NewSnapshotRepo(pool),
+		Phases:    store.NewRunPhaseRepo(pool),
+		Tasks:     syncTasks,
+		TaskRead:  syncTasks,
+		Rooms:     store.NewRoomRepo(pool),
+		Reader:    store.NewPublishRepo(pool),
+		Committer: store.NewReleaseRepo(pool),
+		Settings:  settingsSvc,
+		Upstream:  upstreamClient,
+		// RunCtx 是进程生命周期上下文（信号 ctx），不是任何一次 HTTP 请求的 ctx：
+		// 一轮采集要跑几十分钟，请求 ctx 在 202 写出后立刻取消（D9、CP11）。
+		RunCtx: ctx,
+		Log:    log,
+	})
+	// 依赖缺失只可能是装配被改坏；与 upstream.New 的启动期校验同口径直接拒绝启动，
+	// 不把「第一次手动同步 50000」留给运维。
+	if err != nil {
+		log.Error("启动失败", "err", err)
+		return 1
+	}
+
+	// 端口变量保持接口类型而不是 *collector.Collector：runner.Deps.Collect 是消费侧
+	// 接口，装配层在这里决定「接上谁」；接口为 nil 仍是 runner 能识别的未装配状态。
+	collectorWired := collectorPort != nil
 
 	// Converge 注入 pipeline.ConvergeStaleRuns，而不是在 runner 里重算 cutoff：
 	// 「2 小时」与 started_at < 的边界只允许有一份实现（D8）。now 由 runner 传入，
@@ -146,7 +196,7 @@ func run() int {
 	syncSvc, err := runner.New(runner.Deps{
 		Runs:     runStatusRepo,
 		Settings: settingsSvc,
-		Collect:  collector,
+		Collect:  collectorPort,
 		Converge: converge,
 		Log:      log,
 	})
@@ -207,9 +257,9 @@ func run() int {
 		"settings_cron", settingsCron,
 		"version", version,
 	)
-	// 采集启动器未装配是本 spec 的过渡态，不是故障：白名单为空的手动同步仍会建
-	// blocked 轮次，数据面照常。但它必须能从启动日志一眼看出来，否则管理员点了
-	// 「立即同步」只会拿到 50000，运维还得去翻代码才知道这一版根本没接执行链（D6）。
+	// collector.New 失败即拒绝启动，所以本装配成功后 collectorPort 必非 nil：下方 WARN
+	// 分支为将来装配回 nil 预留、当前不可达。保留它是为了「装配被改回 nil」时仍能从启动
+	// 日志一眼看出来，而不是等管理员点了「立即同步」只拿到 50000。
 	if !collectorWired {
 		log.Warn("采集启动器未装配，白名单非空的手动同步与定时触发不会建立采集轮次")
 	}
@@ -502,6 +552,21 @@ func screenRunFacts(run *store.ScreenRun) *query.ScreenRunFacts {
 		CompositeCells:    run.CompositeCells,
 		AttrConflictCount: run.AttrConflictCount,
 	}
+}
+
+// newRunCollector 组装采集执行器，并以消费侧接口返回。
+//
+// 返回 runner.Collector 而不是 *collector.Collector，是为了让装配层保留「执行链接上
+// 了没有」这一状态：runner.Deps.Collect 用 nil 表示未装配（admin-settings-sync 的
+// 过渡态），直接返回具体类型会把「成功即非 nil」写死成常量，启动日志里的
+// collector_wired 与未装配 WARN 就失去意义。这与上面的 Converge 闭包同一做法：
+// 装配层负责适配，runner 与 collector 互不 import。
+func newRunCollector(deps collector.Deps) (runner.Collector, error) {
+	runCollector, err := collector.New(deps)
+	if err != nil {
+		return nil, err
+	}
+	return runCollector, nil
 }
 
 // statsBatchWriter 把连接池适配成统计写入入口，避免 internal/stats 直接持有驱动类型。

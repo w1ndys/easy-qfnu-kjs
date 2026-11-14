@@ -464,10 +464,17 @@ SELECT state_key, derived
 // 与 store 包的集成测试同一口径：会清空 public schema，只能指向专用测试库。
 func openTestDB(t *testing.T) (context.Context, *pgxpool.Pool) {
 	t.Helper()
+	return openE2ETestDB(t, "采集 → 发布 → 查询端到端检查点")
+}
+
+// openE2ETestDB 是各条端到端检查点共用的连接与重建逻辑；checkpoint 只用在跳过提示里，
+// 让「哪一条检查点没跑」一眼可辨，不影响行为。
+func openE2ETestDB(t *testing.T, checkpoint string) (context.Context, *pgxpool.Pool) {
+	t.Helper()
 
 	dsn := os.Getenv("KJS_TEST_DSN")
 	if dsn == "" {
-		t.Skip("未设置 KJS_TEST_DSN，跳过采集 → 发布 → 查询端到端检查点")
+		t.Skip("未设置 KJS_TEST_DSN，跳过" + checkpoint)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)

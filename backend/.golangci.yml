@@ -158,6 +158,27 @@ linters:
             - github.com/w1ndys/easy-qfnu-kjs/internal/model
             - github.com/w1ndys/easy-qfnu-kjs/internal/store
 
+        # 采集执行器：唯一的「有副作用的总装」，把上游、解析/清洗、编排与发布串起来。
+        # 方向见 specs/2026-11-09-collect-runner/design.md 的「依赖方向」：
+        # collector → pipeline, publish, upstream, parser, clean, store, settings, model, runner
+        # （runner 只用于 var _ runner.Collector = (*Collector)(nil) 的编译期断言）。
+        # 不 import secret：密码明文只从 settings.Service.Reveal 出来，执行器拿不到
+        # 密钥与密文（settings 的规则已在上面写明它不 import store，这里不重复）。
+        collector:
+          files:
+            - "**/internal/collector/**"
+          allow:
+            - $gostd
+            - github.com/w1ndys/easy-qfnu-kjs/internal/model
+            - github.com/w1ndys/easy-qfnu-kjs/internal/upstream
+            - github.com/w1ndys/easy-qfnu-kjs/internal/parser
+            - github.com/w1ndys/easy-qfnu-kjs/internal/clean
+            - github.com/w1ndys/easy-qfnu-kjs/internal/pipeline
+            - github.com/w1ndys/easy-qfnu-kjs/internal/publish
+            - github.com/w1ndys/easy-qfnu-kjs/internal/store
+            - github.com/w1ndys/easy-qfnu-kjs/internal/settings
+            - github.com/w1ndys/easy-qfnu-kjs/internal/runner
+
         # HTTP 层：编排与查询都从这一层进，不直接访问上游。
         # auth 只被管理端中间件用来判定会话有效性与比对 CSRF，属于纯函数调用，没有反向依赖。
         # secret 只被管理端的 state/init 用来取指纹与一次性创建密钥，同样是纯能力调用。

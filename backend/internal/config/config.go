@@ -31,6 +31,11 @@ const (
 	// 目录不存在时由 secret.Manager.Create 在初始化写入前按 0700 补建，
 	// 所以这里只给路径，不在启动期创建任何东西。
 	defaultSecretKeyPath = "/var/lib/easy-qfnu-kjs/secret.key"
+
+	// defaultUpstreamBaseURL 是教务系统根地址的缺省值（docs/upstream-api.md）。
+	// 采集执行器必须能构造 *upstream.Client，而根地址在部署里可能换成内网域名、
+	// 反向代理或带路径前缀的入口，所以作为配置项而不是写死在装配处。
+	defaultUpstreamBaseURL = "http://zhjw.qfnu.edu.cn"
 )
 
 // Config 是启动所需的非秘密配置。
@@ -42,6 +47,7 @@ type Config struct {
 	TrustProxyHeaders bool          // 是否信任前置反代给出的来源头（X-Forwarded-For / X-Real-IP）
 	SecretKeyPath     string        // 加密密钥文件路径；只给路径，文件由管理端初始化写出
 	AdminCookieSecure bool          // 管理会话 Cookie 是否带 Secure；默认 true，本地 http 开发需显式关闭
+	UpstreamBaseURL   string        // 教务系统根地址；只做缺省与透传，形状校验由 upstream.New 负责
 }
 
 // Load 读取并校验环境变量，任一项不合法即返回错误，供入口拒绝启动。
@@ -52,6 +58,7 @@ func Load() (Config, error) {
 		OCRTimeout:        defaultOCRTimeout,
 		SecretKeyPath:     defaultSecretKeyPath,
 		AdminCookieSecure: true,
+		UpstreamBaseURL:   defaultUpstreamBaseURL,
 		// design D2 的部署拓扑里 server 只被 web 反代访问，默认信任反代来源头；
 		// server 若被直接暴露给客户端，必须设 TRUST_PROXY_HEADERS=false，否则来源可被伪造。
 		TrustProxyHeaders: true,
@@ -113,6 +120,13 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("%w: ADMIN_COOKIE_SECURE 只接受 true/false/1/0，收到 %q", model.ErrConfigInvalid, raw)
 		}
 		cfg.AdminCookieSecure = enabled
+	}
+
+	// 上游根地址只做「非空透传」：空串与未设置同义，都落到设计默认值。http/https 与
+	// 主机名、路径前缀的校验只有 upstream.New 一处，这里再写一份只会在两处规则分叉时
+	// 出现「config 放行、装配期又拒绝」的双重口径。
+	if raw := os.Getenv("UPSTREAM_BASE_URL"); raw != "" {
+		cfg.UpstreamBaseURL = raw
 	}
 
 	return cfg, nil
