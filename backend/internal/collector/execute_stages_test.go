@@ -23,9 +23,11 @@ import (
 // stageFake 是两段式编排用例的替身：在 execFake（设置、学期页、快照、窗口）之上
 // 补一份可用的内存版任务/归属/阶段仓储，并把上游矩阵与明细改成按预置返回。
 //
-// 它替掉 stub 里会 panic 的两类方法，其余仍走 stub：本组用例若意外碰到发布
-// （LoadRunFacts / CommitRelease）或 hydrate（LoadWeekMatrixTasks），仍会炸在调用点，
-// 而不是拿到零值后悄悄通过。
+// 它只替掉 stub 里 hydrate 的读入口（LoadWeekMatrixTasks），其余仍走 stub：本组用例
+// 若意外碰到发布事务的读侧（LoadRunFacts）仍会炸在调用点，而不是拿到零值后悄悄
+// 通过。发布事务的写侧（CommitRelease）保留同一条纪律：默认 panic，只有显式打开
+// allowCommit 的用例才允许调用并记账——第 9 项还没有发布，任何一次真实提交都说明
+// 接线接错了地方。
 //
 // 任务状态与归属都按 store 的语义实现到「够 pipeline.Run 跑完」为止：两段 Ensure
 // 遇到同类任务已存在时不再写入、从第一个 pending 继续、done/failed 不重试、
@@ -60,6 +62,10 @@ type stageFake struct {
 	detailCalls  []upstream.OccupancyDetailParams // 每次明细请求的入参
 
 	summaryCalls int // LoadRunTaskSummary 的调用次数：两段各一次 = 2
+
+	loadWeekMatrixCalls int  // LoadWeekMatrixTasks 的调用次数：hydrate 每次一轮一次
+	allowCommit         bool // 显式允许 CommitRelease 被调用并计数；默认 panic（第 9 项不发布）
+	commitCalls         int  // CommitRelease 的调用次数；只在 allowCommit 打开时累加
 }
 
 // newStageFake 返回一份「白名单只有 Q10、学期页与周历页可解析、快照齐备」的替身。
@@ -233,6 +239,29 @@ func (s *stageFake) tasksOfKind(kind string) []store.SyncTask {
 		}
 	}
 	return filtered
+}
+
+// LoadWeekMatrixTasks 读回本轮周矩阵任务，与 store.SyncTaskRepo 的口径一致：
+// 只按 kind 过滤、按 task_id 升序，状态原样返回。
+//
+// hydrate 在 Run1 之前调用，所以这里读到的就是续跑留下的行；新任务由 Run1 的
+// EnsureWeekMatrixTasks 写入，不会提前出现在这份清单里。
+func (s *stageFake) LoadWeekMatrixTasks(_ context.Context, _ int64) ([]store.SyncTask, error) {
+	s.record("load_week_tasks")
+	s.loadWeekMatrixCalls++
+	return s.tasksOfKind(store.SyncTaskKindWeekMatrix), nil
+}
+
+// CommitRelease 默认 panic，与 stub 的纪律一致：第 9 项不发布，本组用例的任何一次
+// 真实调用都说明接线接错了地方，应当炸在调用点而不是静默成功。只有显式打开
+// allowCommit 的用例才允许调用并计数——「hydrate 失败时一次发布都不做」需要一个能
+// 区分「0 次」与「炸在调用点」的计数器（见 TestHydrateFailureFailsRunAndKeepsReleaseRows）。
+func (s *stageFake) CommitRelease(_ context.Context, _ store.ReleaseDraft) error {
+	if !s.allowCommit {
+		panic("stageFake: 第 9 项不发布，CommitRelease 被意外调用（需要计数请显式置 allowCommit）")
+	}
+	s.commitCalls++
+	return nil
 }
 
 // RecordWeekFetch 记周结果到达顺序。

@@ -25,9 +25,9 @@ var errSettingsIncomplete = errors.New("设置项未配齐或无法解封")
 
 // execute 是一轮采集的执行体：从读设置开始，到发布或失败收口为止。
 //
-// 到本项（tasklist 第 8 项）为止，execute 覆盖下面第 1–9 步：读设置 → 登录 →
-// 学期/周历 → 写学期日历并绑定学期 → 采集窗口 → 字典与轴快照 → 两段式 Plan/Run
-// （周矩阵 → 明细）。阶段顺序是固定契约，每一步的位置都有理由：
+// 到本项（tasklist 第 9 项）为止，execute 覆盖下面第 1–10 步：读设置 → 登录 →
+// 学期/周历 → 写学期日历并绑定学期 → 采集窗口 → 字典与轴快照 → hydrate →
+// 两段式 Plan/Run（周矩阵 → 明细）。阶段顺序是固定契约，每一步的位置都有理由：
 //  1. 读设置：账号、OCR 地址与白名单来自同一次 Load，密码只能 Reveal；缺一项就在
 //     发第一个上游请求之前失败，错误码 settings_incomplete；
 //  2. 登录：密码错误与验证码耗尽各有固定错误码，网络/超时按 design 的口径不编码；
@@ -43,12 +43,16 @@ var errSettingsIncomplete = errors.New("设置项未配齐或无法解封")
 //     不写窗口也不发请求（Requirement 2.3）；非空窗经 pipeline.RecordWindow 落库，
 //     窗口之外的一周都不会被请求（CP1）；
 //  8. 字典与轴快照：必须在第一个矩阵请求之前取到，取不到就失败（design 第 5 节）；
-//  9. 两段式执行：第一段周矩阵、第二段占用说明，中间用第一段的结果规划明细，并在
+//  9. hydrate：取库里的周矩阵任务状态，补抓「已经 done 但内存缺页」的楼×周，只累计
+//     内存候选、不写 collect_run_week、不改 sync_task（Requirement 8.2）；放在规划
+//     第一段之前，阶段不推进，续跑时仍停在 week_matrix（design 第 3 节第 10 步）；
+//     正常轮次命中 0 个键、不产生请求（CP10）；补抓失败按 failed 收口，不进入发布；
+//  10. 两段式执行：第一段周矩阵、第二段占用说明，中间用第一段的结果规划明细，并在
 //     必需矩阵已失败时直接收口跳过明细（Requirement 5、6、7、10.7）。
 //
-// design 的执行顺序还有「楼列表（advisory）→ hydrate → ... → 发布」，分别由第 9 项
-// 与第 10 项在本函数后面接续；本项在第二段收口判定之后返回，success/partial 的
-// 发布留给第 10 项。
+// design 的执行顺序里还有两步不在本项：楼列表（advisory，design 第 9 步）只记日志、
+// 不参与采集结果；发布（design 第 17 步）由第 10 项在本函数后面接续。本项在第二段
+// 收口判定之后返回，success/partial 的发布留给第 10 项。
 //
 // 每一个失败点都在本函数内收口，并把原因返回给 run() 记 WARN：执行体自己收口、
 // run() 不补刀，两层都写终态会撞 FinishRun 的 status='running' 守卫（CP8）。
@@ -170,9 +174,13 @@ func (c *Collector) prepare(ctx context.Context, runID int64) (roundSetup, error
 	}, nil
 }
 
-// runStages 是两段式编排：Plan1 → Run1 → EvaluateRun → Plan2 → Run2 → EvaluateRun。
+// runStages 是两段式编排：hydrate → Plan1 → Run1 → EvaluateRun → Plan2 → Run2 →
+// EvaluateRun。
 //
-// 两段之间的顺序是固定的，每一步都有理由：
+// 顺序是固定的，每一步都有理由：
+//  0. hydrate 在 Plan1 之前：它只补「库里 done、内存缺页」的楼×周，补抓结果进内存
+//     候选；不推进阶段，续跑时阶段仍停在 week_matrix，进度条与实际动作一致
+//     （design 第 3 节第 10 步）；失败直接收口 failed，不进入规划与发布；
 //  1. 第一段用 Plan(window, 楼, nil) 只规划周矩阵：不可用格只有抓完矩阵才知道，
 //     而 Plan 的第三个参数必须由调用方给出（design D3）；
 //  2. 第一段执行完立刻 EvaluateRun：必需矩阵已有失败时，继续跑 70 分钟的明细没有
@@ -197,6 +205,12 @@ func (c *Collector) runStages(
 	candidates := newBank()
 	buildings := setup.settings.ids()
 	fetch := c.taskFetcher(setup.term, setup.kbjcmsid, setup.snapshot, candidates)
+
+	// hydrate 在规划第一段之前：它只补「库里 done、内存缺页」的楼×周，补抓结果
+	// 进内存候选，阶段不推进（续跑时仍停在 week_matrix，进度条与实际动作一致）。
+	if err := c.hydrate(ctx, runID, fetch, candidates); err != nil {
+		return err
+	}
 
 	plan1 := pipeline.Plan(setup.window, buildings, nil)
 	switch plan1.Status {
@@ -264,6 +278,62 @@ func (c *Collector) runStages(
 	// status2 是 success 或 partial：两者都进入发布，由第 10 项接续
 	// （AdvancePhase(validate) → Build → Validate → Commit）。本项到此返回，
 	// 轮次保持 running，不提前收口。
+	return nil
+}
+
+// hydrate 用库里已完成的周矩阵任务重建本轮内存候选（Requirement 8.2、design 第 3 节
+// 第 10 步）。
+//
+// 为什么需要它：pipeline.Run 只执行 pending 任务，上一轮已经 done 的楼×周不会再被
+// 请求，而原始页面按 CP12 不落库、观测在发布前也没有表可落。不补这一页，续跑就会
+// 发布一个「少几周却记 success」的版本。补抓只累计内存候选：不写 collect_run_week、
+// 不改 sync_task（design 第 3 节），任务状态与周结果仍以库里上一轮写下的事实为准。
+//
+// 键按业务身份「楼 × 周」判，任务按 task_id 升序处理：同一 (楼,周) 至多一条 done
+// 任务，页面缓存又保证同键只抓一次。正常轮次（所有页都是本轮抓的）这里命中 0 个键，
+// 请求数不增加（CP10）；只有同一轮被再次执行时才会补抓。
+//
+// 补抓复用统一抓取器的矩阵路径（taskFetcher），解析、清洗与内存写入和第一段是同一条
+// 代码，不另写一份「hydrate 专用」的解析。失败按失败收口、不进入发布：这一周的
+// sync_task 是 done，publish.Validate 只看「必需任务都完成」，看不到观测缺失；放着
+// 不管就会发布缺周的 success。原因点名楼与周，便于定位是哪一页没补回来
+// （Requirement 8.3、CP9）。
+func (c *Collector) hydrate(
+	ctx context.Context,
+	runID int64,
+	fetch pipeline.TaskFetcher,
+	candidates *bank,
+) error {
+	tasks, err := c.taskRead.LoadWeekMatrixTasks(ctx, runID)
+	if err != nil {
+		// 读不回来就不知道缺哪些页：这是基础设施失败，不编业务码，原因照原样落库。
+		return c.failRun(ctx, runID, "", fmt.Errorf("读取本轮周矩阵任务失败: %w", err))
+	}
+
+	for _, task := range tasks {
+		if task.Status != store.SyncTaskDone {
+			// pending 与 failed 留给后面的 pipeline.Run 按续跑口径处理（pending 继续
+			// 执行、failed 同一轮内不重试）；hydrate 只补 done 却缺页的键。
+			continue
+		}
+		key := weekKey{BuildingID: task.BuildingID, Week: task.Week}
+		if _, ok := candidates.pages[key]; ok {
+			// 内存里已有这一页（本进程刚抓过，或本函数前一轮循环补过）：不再请求，
+			// 也不覆盖——同一键每轮至多一次请求由这里与页面缓存共同守住（CP10）。
+			continue
+		}
+		if _, err := fetch(ctx, pipeline.Task{
+			Kind:       pipeline.TaskWeekMatrix,
+			BuildingID: task.BuildingID,
+			Week:       task.Week,
+		}); err != nil {
+			// 无错误码：hydrate 失败不属于任何业务失败层（design「hydrate 补抓失败」
+			// 行）。原因点名楼与周——publish.Validate 看不到观测缺口，只有这句话能
+			// 告诉管理员是哪一页没补回来。
+			return c.failRun(ctx, runID, "", fmt.Errorf(
+				"重建第 %d 周楼 %s 的矩阵失败: %w", task.Week, task.BuildingID, err))
+		}
+	}
 	return nil
 }
 

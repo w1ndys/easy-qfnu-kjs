@@ -274,6 +274,39 @@ func TestEnsureCellDetailTasksInsertsAndReloads(t *testing.T) {
 	}
 }
 
+// TestLoadWeekMatrixTasksReadsWeekKind 覆盖 hydrate 的读入口：只按 kind 查 week_matrix、
+// 按 task_id 升序返回含状态的任务，且只读——不执行任何写入 SQL。
+func TestLoadWeekMatrixTasksReadsWeekKind(t *testing.T) {
+	rows := &syncTaskRowsStub{tasks: []SyncTask{
+		{TaskID: 1, Kind: SyncTaskKindWeekMatrix, Required: true, BuildingID: "Q10", Week: 20, Status: SyncTaskDone},
+		{TaskID: 2, Kind: SyncTaskKindWeekMatrix, Required: true, BuildingID: "Q10", Week: 21, Status: SyncTaskPending},
+	}}
+	querier := &syncTaskQuerierStub{queryRows: rows}
+
+	tasks, err := NewSyncTaskRepo(querier).LoadWeekMatrixTasks(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("读周矩阵任务不应报错，实际 %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("应读回 2 条任务，实际 %d 条：%+v", len(tasks), tasks)
+	}
+	if tasks[0].Status != SyncTaskDone || tasks[1].Week != 21 || tasks[1].Status != SyncTaskPending {
+		t.Fatalf("任务状态与周次应按库里的值原样返回: %+v", tasks)
+	}
+	if querier.execCalls != 0 {
+		t.Fatalf("读入口不应执行任何写入 SQL，实际 %d 条", querier.execCalls)
+	}
+	if querier.queryCalls != 1 || querier.querySQL != selectSyncTasksByKindSQL {
+		t.Fatalf("应只执行按种类读任务的 SQL，实际 calls=%d sql=%q", querier.queryCalls, querier.querySQL)
+	}
+	if got := querier.queryArgs; len(got) != 2 || got[0].(int64) != 7 || got[1] != SyncTaskKindWeekMatrix {
+		t.Fatalf("读任务参数不符: %v", got)
+	}
+	if !rows.closed {
+		t.Fatal("任务行应被关闭")
+	}
+}
+
 // TestEnsureSplitSyncTasksRejectsMixedKind 覆盖两段 Ensure 的段边界：
 // 把占用说明任务交给周矩阵段（或反过来）直接报错，不执行任何 SQL。
 func TestEnsureSplitSyncTasksRejectsMixedKind(t *testing.T) {

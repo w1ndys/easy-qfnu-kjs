@@ -52,7 +52,7 @@
   - 明细：`FetchOccupancyDetail` → `parser.Occupancy` → `clean.State`，四项字段写入 `details[(房,天,大节)]`（整片覆盖）
   - 单测：调用顺序（Plan1 → Run1 → EvaluateRun → Plan2 → Run2）、明细任务无一条被归属过滤丢弃（`Dropped()==0`）、明细结构失败 → `partial`
 
-- [ ] 9. hydrate：续跑时的内存候选重建
+- [x] 9. hydrate：续跑时的内存候选重建
   - `TaskRead.LoadWeekMatrixTasks` 取 `week_matrix` 任务，筛 `done` 且 `pages` 里没有的 (楼,周)；这一步在规划第一段**之前**执行（阶段仍停在 `week_matrix`）
   - 对每个缺失键补抓一次并只累计内存候选：不写 `collect_run_week`、不改 `sync_task`
   - 补抓失败 → `FailRun`（无码，原因点名楼与周），不进入发布

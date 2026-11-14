@@ -420,6 +420,16 @@ func (r SyncTaskRepo) RecountSyncTasks(ctx context.Context, runID int64, now tim
 	return RecountSyncTasks(ctx, r.q, runID, now)
 }
 
+// LoadWeekMatrixTasks 读回本轮全部周矩阵任务（含状态），按 task_id 升序。
+//
+// hydrate 在第一段规划之前用这份清单找出「库里已经 done、内存里却没有该楼该周页面」
+// 的键：续跑时 pipeline.Run 会跳过 done 任务，这些周的矩阵结果只能靠这次补抓重建。
+// 只读：不写 collect_run_week、也不改 sync_task 的状态（design 第 3 节）——补抓的
+// 结果只进内存候选，任务与周结果仍以库里上一轮写下的事实为准。
+func (r SyncTaskRepo) LoadWeekMatrixTasks(ctx context.Context, runID int64) ([]SyncTask, error) {
+	return loadSyncTasksByKind(ctx, r.q, runID, SyncTaskKindWeekMatrix)
+}
+
 // RecordWeekFetch 见同名函数。
 func (r SyncTaskRepo) RecordWeekFetch(ctx context.Context, fetch RunWeekFetch) error {
 	return RecordWeekFetch(ctx, r.q, fetch)
