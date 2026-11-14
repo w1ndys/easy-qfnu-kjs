@@ -47,7 +47,7 @@
   - DTO 形状：`released_at` / `from_state` / `to_state` / 归属字段用指针输出 `null`；`items` 空为 `[]`；时间 RFC3339 UTC；`data` 键集合与 design 一致
   - 契约测试：无会话 40101、缺 CSRF 40301、40401 / 40904 / 40905 / 40906 / 50000 各一条、所有响应（含错误）带 `no-store`、日志只有五字段白名单、`invalidate` 只在回退成功时调用一次
 
-- [ ] 8. 端到端检查点
+- [x] 8. 端到端检查点
   - `e2e/admin_release_test.go`（真实库 + `httptest`）：init → login → 种子两版（含归属冲突与缺周）→ 列表与详情 → 对比三类差异与分页 → 回退
   - 回退后同一进程内先预热 `/api/query` 缓存、再回退、再用同参数查询，断言读到新 current 的结果（不等 30 秒）；`/api/screen` 的版本标识同步切换
   - 列表仍为两行、`is_current` 恰好一条且指向回退目标、`collect_run` 未变；响应带 `Cache-Control: no-store`
