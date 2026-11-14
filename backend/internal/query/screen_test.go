@@ -900,3 +900,57 @@ func mustJSON(t *testing.T, value any) []byte {
 func closeTo(got, want float64) bool {
 	return math.Abs(got-want) <= 1e-9
 }
+
+// TestScreenCacheClearedByInvalidate 覆盖 ScreenService.Invalidate 的可见性：
+// 同一业务日期与峰值窗口先预热（第二次命中缓存），换一份新当前版本的事实后仍读到旧缓存；
+// Invalidate 之后同一时刻再查，必须重新读取存储并返回新版本的 release_id（design D8、CP10）。
+func TestScreenCacheClearedByInvalidate(t *testing.T) {
+	before := fullScreenFacts()
+	harness := newScreenTestService(before, screenFreshnessFacts(), screenSnapshotFixture())
+	now := screenNow()
+
+	first, err := harness.svc.Screen(t.Context(), now, ScreenParams{})
+	if err != nil {
+		t.Fatalf("首次大屏查询失败: %v", err)
+	}
+	if first.Release == nil || first.Release.ReleaseID != before.Release.ReleaseID {
+		t.Fatalf("首次应返回预热版本 %q，实际 %+v", before.Release.ReleaseID, first.Release)
+	}
+	// 同键再查一次，确认预热真的进了缓存。
+	if _, err := harness.svc.Screen(t.Context(), now, ScreenParams{}); err != nil {
+		t.Fatalf("缓存命中不应失败: %v", err)
+	}
+	if harness.lookup.calls != 1 {
+		t.Fatalf("预热后同键应只查一次存储，实际 %d 次", harness.lookup.calls)
+	}
+
+	// 模拟回退：同一天、同一窗口，只有当前版本标识变了。
+	after := fullScreenFacts()
+	after.Release.ReleaseID = "20261114T030512Z"
+	harness.lookup.facts = after
+
+	// TTL 未到期：没有 Invalidate 时仍然读旧缓存，替身不再被调用。
+	cached, err := harness.svc.Screen(t.Context(), now, ScreenParams{})
+	if err != nil {
+		t.Fatalf("缓存命中不应失败: %v", err)
+	}
+	if harness.lookup.calls != 1 {
+		t.Fatalf("TTL 内应命中缓存，实际查存储 %d 次", harness.lookup.calls)
+	}
+	if cached.Release == nil || cached.Release.ReleaseID != before.Release.ReleaseID {
+		t.Fatalf("TTL 内应返回旧缓存版本 %q，实际 %+v", before.Release.ReleaseID, cached.Release)
+	}
+
+	harness.svc.Invalidate()
+
+	refreshed, err := harness.svc.Screen(t.Context(), now, ScreenParams{})
+	if err != nil {
+		t.Fatalf("失效后查询失败: %v", err)
+	}
+	if harness.lookup.calls != 2 {
+		t.Fatalf("Invalidate 后同键应重新查存储，期望 2 次，实际 %d 次", harness.lookup.calls)
+	}
+	if refreshed.Release == nil || refreshed.Release.ReleaseID != after.Release.ReleaseID {
+		t.Fatalf("Invalidate 后应返回新版本 %q，实际 %+v", after.Release.ReleaseID, refreshed.Release)
+	}
+}

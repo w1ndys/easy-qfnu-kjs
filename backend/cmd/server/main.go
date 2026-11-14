@@ -44,6 +44,11 @@ var _ auth.AdminStore = store.AdminRepo{}
 // 与上面的 auth.AdminStore 并列，把「settings 服务能不能直接用这个仓储」钉在编译期。
 var _ settings.Store = store.SettingsRepo{}
 
+// 版本管理仓储同理：api.ReleaseAdminReader 是消费侧接口（定义在 api/admin_releases.go），
+// store.ReleaseAdminRepo 靠同名方法结构匹配，store 不 import api。两边方法集一旦漂移
+// 就在编译期失败，而不是等到第一次打开版本列表或点回退才发现取不到数据。
+var _ api.ReleaseAdminReader = store.ReleaseAdminRepo{}
+
 // 采集执行器的三条仓储窄接口同理：collector.RunLifecycle / TermCalendar / SnapshotReader
 // 是消费侧接口，实现留在 internal/store（store 不 import collector），方法集一旦漂移就
 // 在编译期失败，而不是等到第一次手动同步才在后台轮次里报「缺依赖」。
@@ -141,6 +146,12 @@ func run() int {
 	// 运行状态的读侧与 blocked 建轮共用同一个仓储：列表、详情、冲突判定与阻止轮次
 	// 都读同一张 collect_run，不另建第二份查询实现。
 	runStatusRepo := store.NewRunStatusRepo(pool)
+
+	// 版本管理仓储：列表、详情、对比与回退事务都走它（设计 D1 的 store 侧）；
+	// 异常视图 `Anomalies` 属于 tasklist 第 6 项，第 6 项实现 `Anomalies` 后走该仓储。
+	// 这里只构造，端点注册在 tasklist 第 7 项；回退提交成功后的缓存失效由下方
+	// api.WithReleaseAdmin 的第二个参数接上，仓储本身不碰 query 包。
+	releaseAdminRepo := store.NewReleaseAdminRepo(pool)
 
 	// 采集链路的装配顺序固定（collect-runner design「依赖方向」的装配段）：
 	// 上游客户端 → 采集执行器 → runner 的 Collect 端口。三步都必须在 runner.New 之前完成：
@@ -502,6 +513,14 @@ func run() int {
 			api.WithAdminSettings(settingsSvc, sched.Reload),
 			api.WithRunStatus(runStatusRepo),
 			api.WithSync(syncSvc),
+			// 版本管理：数据来源是上面的 releaseAdminRepo；第二个参数是回退成功后的
+			// 公开查询缓存失效（design D8）——回退切换 current 版本后，空教室、全天状态
+			// 与大屏三张 30 秒缓存必须立即清空，否则访客最多要等 30 秒才看到新版本。
+			// 回调只在回退提交成功后、写响应前被调用（CP10），由 handler 保证时机。
+			api.WithReleaseAdmin(releaseAdminRepo, func() {
+				queries.Invalidate()
+				screenService.Invalidate()
+			}),
 		).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

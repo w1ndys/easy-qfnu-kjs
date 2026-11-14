@@ -63,6 +63,10 @@ type Server struct {
 	settingsSvc  *settings.Service    // 业务设置读写；nil 表示未装配，设置端点按内部错误处理
 	runStatus    RunReader            // 轮次只读视图；nil 表示未装配，runs 端点按内部错误处理
 	syncStarter  SyncStarter          // 手动同步的启动端口；nil 表示未装配，sync 端点按内部错误处理
+	releaseAdmin ReleaseAdminReader   // 版本读取与回退；nil 表示未装配，第 7 项注册端点后按 50000 返回
+	// releaseInvalidate 是回退成功后的公开查询缓存失效回调；nil 表示跳过失效，
+	// 回退照常成功（design D8、CP15）。它不返回错误：失效只是缓存，失败不该改成功响应。
+	releaseInvalidate func()
 	// settingsMu 把一次 PUT 的「Patch → reloadCron」串成一段临界区：两次并发保存若交错
 	// 成「A 写库、B 写库、B 重排、A 重排」，进程内的计划会停在 A，而库里已经是 B，
 	// 直到下次重启才对得上。GET 不加这把锁：只读快照不需要与保存串行。

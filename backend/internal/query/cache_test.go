@@ -357,3 +357,107 @@ func TestTTLCacheDoesNotGrowBeyondMax(t *testing.T) {
 		t.Fatal("超出上限的新键不应被缓存")
 	}
 }
+
+// TestTTLCacheClearDropsUnexpiredEntries 覆盖 clear 的语义：未过期的条目也一起丢，
+// 与只清过期项的 purgeExpiredLocked 区分开。回退切换当前版本后必须走这条路径，
+// 否则剩余 TTL 内访客仍会读到旧版本的结果（design D8）。
+func TestTTLCacheClearDropsUnexpiredEntries(t *testing.T) {
+	cache := newTTLCache[int](DefaultCacheTTL, 0)
+	now := availabilityNow()
+	key := cacheKey{view: "a"}
+
+	cache.put(key, 1, now)
+	if _, ok := cache.get(key, now); !ok {
+		t.Fatal("预热后应命中缓存")
+	}
+
+	cache.clear()
+
+	if _, ok := cache.get(key, now); ok {
+		t.Fatal("clear 后未过期的条目也必须失效")
+	}
+	if len(cache.entries) != 0 {
+		t.Fatalf("clear 后表应为空，实际 %d 条", len(cache.entries))
+	}
+}
+
+// TestAvailabilityCacheClearedByInvalidate 覆盖 Service.Invalidate 对空教室缓存的作用：
+// 同一键先预热（第二次命中缓存、替身只被调用一次），Invalidate 后 TTL 远未到期，
+// 同键必须重新查库（替身被第二次调用）。
+func TestAvailabilityCacheClearedByInvalidate(t *testing.T) {
+	fake := &fakeAvailability{page: AvailabilityPage{
+		Total:              1,
+		Rooms:              []AvailabilityRoom{{RoomID: "0899", Name: "F126", BuildingID: "Q10"}},
+		HasRelease:         true,
+		WeekHasObservation: true,
+	}}
+	svc := New(availabilityWeekLookup(nil), fake.lookup, nil, WithCache(DefaultCacheTTL))
+	now := availabilityNow()
+	params := cacheAvailabilityParams()
+
+	// 预热：同键查两次，第二次命中缓存。
+	if _, err := svc.Availability(t.Context(), now, params); err != nil {
+		t.Fatalf("首次查询失败: %v", err)
+	}
+	if _, err := svc.Availability(t.Context(), now.Add(time.Second), params); err != nil {
+		t.Fatalf("缓存命中不应失败: %v", err)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("预热后相同查询应只查一次存储，实际 %d 次", fake.calls)
+	}
+
+	svc.Invalidate()
+
+	// 只过了 2 秒，TTL 远未到期；缓存被清后同键必须重新查库。
+	if _, err := svc.Availability(t.Context(), now.Add(2*time.Second), params); err != nil {
+		t.Fatalf("失效后查询失败: %v", err)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("Invalidate 后同键应重新查存储，期望 2 次，实际 %d 次", fake.calls)
+	}
+}
+
+// TestDayCacheClearedByInvalidate 覆盖 Service.Invalidate 对全天状态缓存的作用，
+// 断言方式与空教室一致：预热 → 失效 → 同键重新查库。
+func TestDayCacheClearedByInvalidate(t *testing.T) {
+	fake := &fakeDay{page: DayPage{
+		HasRelease:         true,
+		WeekHasObservation: true,
+		Room:               dayFixtureRoom(),
+		Nodes:              dayFixtureNodes(map[string]bool{"03": true}),
+	}}
+	svc := New(availabilityWeekLookup(nil), nil, fake.lookup, WithCache(DefaultCacheTTL))
+	now := availabilityNow()
+	params := DayParams{DateOffset: 2, RoomID: "0899", Building: "Q10"}
+
+	if _, err := svc.DayStatus(t.Context(), now, params); err != nil {
+		t.Fatalf("首次查询失败: %v", err)
+	}
+	if _, err := svc.DayStatus(t.Context(), now.Add(time.Second), params); err != nil {
+		t.Fatalf("缓存命中不应失败: %v", err)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("预热后相同查询应只查一次存储，实际 %d 次", fake.calls)
+	}
+
+	svc.Invalidate()
+
+	if _, err := svc.DayStatus(t.Context(), now.Add(2*time.Second), params); err != nil {
+		t.Fatalf("失效后查询失败: %v", err)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("Invalidate 后同键应重新查存储，期望 2 次，实际 %d 次", fake.calls)
+	}
+}
+
+// TestServiceInvalidateWithoutCacheIsNoop 覆盖未传 WithCache 的进程：
+// 两张缓存表都是 nil，Invalidate 直接返回，装配层的失效回调可以无条件调用。
+func TestServiceInvalidateWithoutCacheIsNoop(t *testing.T) {
+	svc := New(availabilityWeekLookup(nil), nil, nil)
+	if svc.availabilityCache != nil || svc.dayCache != nil {
+		t.Fatalf("未传 WithCache 时两张缓存表应为 nil，实际 %p / %p",
+			svc.availabilityCache, svc.dayCache)
+	}
+
+	svc.Invalidate()
+}

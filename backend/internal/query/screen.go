@@ -172,6 +172,17 @@ func NewScreen(lookup ScreenLookup, freshness *FreshnessService, traffic ScreenT
 	}
 }
 
+// Invalidate 清空大屏结果缓存。
+//
+// 与 Service.Invalidate 同一调用时机：回退提交成功后、写响应之前（design D8、CP10）。
+// 大屏缓存固定开启，所以这里不需要 nil 判断之外的分支；保留判断是为了让这个函数
+// 在零值 ScreenService（未经过 NewScreen）上也不会 panic。
+func (s *ScreenService) Invalidate() {
+	if s.cache != nil {
+		s.cache.clear()
+	}
+}
+
 // Screen 返回大屏载荷；同一业务日期与同一峰值窗口内 30 秒复用同一份结果（Requirement 33.7、CP15）。
 // 只缓存成功结果：失败不入缓存，一次数据库抖动不该让大屏在这个窗口里一直报错。
 func (s *ScreenService) Screen(ctx context.Context, now time.Time, params ScreenParams) (ScreenResult, error) {

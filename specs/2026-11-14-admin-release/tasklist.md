@@ -29,7 +29,7 @@
   - 集成：成功后 current 交换、`release` / `observation` / `release_room_building` 行数不变、`collect_run` 的 `release_id` / `released_at` 不变；三种拒绝分支各一条，断言 `release` 表零变更
   - 并发：两个 goroutine 同时回退同一目标，恰好一个成功、另一个 40904 或 40906，结束后恰有一个 current
 
-- [ ] 5. 公开查询缓存失效钩子
+- [x] 5. 公开查询缓存失效钩子
   - `query/ttlCache` 增加 `clear()`；`query.Service.Invalidate()` 清空空教室与全天状态两张表；`query.ScreenService.Invalidate()` 清空大屏表
   - `api.WithReleaseAdmin(reader, invalidate func())`：`reader` 为 nil 时五个端点按 50000；`invalidate` 为 nil 时回退照常成功、跳过失效；回退**提交成功后、写响应前**调用，失败路径零调用
   - 单测：预热同键 → `Invalidate` → 同键重新查库（替身被第二次调用）；screen 同理

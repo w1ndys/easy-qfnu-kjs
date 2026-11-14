@@ -99,6 +99,23 @@ func (c *ttlCache[T]) purgeExpiredLocked(now time.Time) {
 	}
 }
 
+// clear 清空整张表，不区分条目是否过期。
+//
+// 它与 purgeExpiredLocked 的差别只在「为什么清」：purge 是容量兜底，只丢已过期的；
+// clear 是回退切换当前版本后的显式失效，未过期的条目也必须一起丢——留着它们，
+// 访客在剩余 TTL 内仍会读到旧版本的结果（design D8、CP10）。
+// 容量上限不因 clear 而改变：表结构原样保留，下一条查询照常写入。
+//
+// 并发边界：本项只保证串行失效——clear 与 get/put 互斥，清空当场生效；但一条在 clear
+// 之前已从库里读到旧版本的并发查询，仍可能在 clear 之后把旧结果 put 回去，让旧版本在
+// 剩余 TTL 内再存活一次。generation 方案（缓存带代数、读侧校验代数）不在本 spec 范围。
+func (c *ttlCache[T]) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	clear(c.entries)
+}
+
 // Option 调整 Service 的可选装配项；不传任何 Option 时行为与 9.3–9.6 完全一致。
 type Option func(*Service)
 
@@ -111,6 +128,25 @@ func WithCache(ttl time.Duration) Option {
 		}
 		s.availabilityCache = newTTLCache[AvailabilityResult](ttl, maxCacheEntries)
 		s.dayCache = newTTLCache[DayResult](ttl, maxCacheEntries)
+	}
+}
+
+// Invalidate 清空本服务的两张结果缓存：空教室与全天状态。
+//
+// 调用时机由装配层决定：回退切换当前版本成功之后、写响应之前（design D8、CP10），
+// 这样下一次公开查询不会在剩余 30 秒 TTL 内继续读旧版本的结果。
+// 未开启缓存时两张表都是 nil，这里直接跳过：装配层不必先判断 WithCache 是否传过，
+// 失效回调可以无条件调用。
+//
+// 并发边界：本项只保证串行失效，不保证「清空之后绝不会再出现旧版本」——一条在 clear
+// 之前已读到旧版本的并发查询，仍可能在 clear 之后把旧结果写回缓存。generation 方案
+// （缓存带代数、读侧校验代数）不在本 spec 范围。
+func (s *Service) Invalidate() {
+	if s.availabilityCache != nil {
+		s.availabilityCache.clear()
+	}
+	if s.dayCache != nil {
+		s.dayCache.clear()
 	}
 }
 
