@@ -63,7 +63,7 @@ type Server struct {
 	settingsSvc  *settings.Service    // 业务设置读写；nil 表示未装配，设置端点按内部错误处理
 	runStatus    RunReader            // 轮次只读视图；nil 表示未装配，runs 端点按内部错误处理
 	syncStarter  SyncStarter          // 手动同步的启动端口；nil 表示未装配，sync 端点按内部错误处理
-	releaseAdmin ReleaseAdminReader   // 版本读取与回退；nil 表示未装配，第 7 项注册端点后按 50000 返回
+	releaseAdmin ReleaseAdminReader   // 版本读取与回退；nil 表示未装配，五个版本端点按 50000 返回
 	// releaseInvalidate 是回退成功后的公开查询缓存失效回调；nil 表示跳过失效，
 	// 回退照常成功（design D8、CP15）。它不返回错误：失效只是缓存，失败不该改成功响应。
 	releaseInvalidate func()
@@ -172,6 +172,17 @@ func (s *Server) Handler() http.Handler {
 	// （Requirement 8.7）。同步会建轮次，CSRF 不能省；202 由 `writeSuccessStatus` 写出，
 	// 与 200 共用成功信封。
 	mux.Handle("POST /api/admin/sync", s.adminWriteNoBody(s.adminSync))
+
+	// 版本管理（tasklist 第 7 项）：列表、对比、详情与异常视图都是只读的会话端点，
+	// 链与 runs / settings 的 GET 相同（no-store → 会话 → 业务）。回退是写端点但没有
+	// 请求体，走 adminWriteNoBody（no-store → 会话 → CSRF），不装体门、不要求
+	// Content-Type。`/api/admin/releases/diff` 是字面量模式，比 `{release_id}` 通配
+	// 更具体，ServeMux 的优先级规则保证它不会被当成一个版本 id 的详情请求。
+	mux.Handle("GET /api/admin/releases", s.adminRead(s.adminReleasesList))
+	mux.Handle("GET /api/admin/releases/diff", s.adminRead(s.adminReleaseDiff))
+	mux.Handle("GET /api/admin/releases/{release_id}", s.adminRead(s.adminReleaseDetail))
+	mux.Handle("POST /api/admin/releases/{release_id}/rollback", s.adminWriteNoBody(s.adminReleaseRollback))
+	mux.Handle("GET /api/admin/anomalies", s.adminRead(s.adminAnomalies))
 	return withAdminNoStore(mux)
 }
 

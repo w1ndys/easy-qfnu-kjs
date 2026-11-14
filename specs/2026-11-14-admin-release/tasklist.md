@@ -41,7 +41,7 @@
   - 冲突清单：`collect_run_room` 按 `run_id` 取该版最新一轮的 `conflict=true` 行，每版最多 200 条，出现第 201 条时 `conflict_rooms_truncated=true`
   - 集成：未知/复合按大节计数与手工数一致、`ratio` 4 位小数、`week_gaps` 命中缺周、冲突清单与截断断言、无版本时 `releases` 为 `[]`
 
-- [ ] 7. HTTP 端点、参数门与契约
+- [x] 7. HTTP 端点、参数门与契约
   - 路由：`GET /api/admin/releases`、`GET /api/admin/releases/diff`、`GET /api/admin/releases/{release_id}`、`POST /api/admin/releases/{release_id}/rollback`（`adminWriteNoBody`，无请求体）、`GET /api/admin/anomalies`；读端点走 `adminRead`
   - 参数门在查库前：`release_id` 形状 `^\d{8}T\d{6}Z$`、`from`/`to` 必填且不等、`section` / `kind` 组合、`limit` 1–200、`offset ≥ 0`；任一非法 400 + 40001 且替身零调用
   - DTO 形状：`released_at` / `from_state` / `to_state` / 归属字段用指针输出 `null`；`items` 空为 `[]`；时间 RFC3339 UTC；`data` 键集合与 design 一致

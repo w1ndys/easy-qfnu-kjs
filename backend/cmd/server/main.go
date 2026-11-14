@@ -147,10 +147,9 @@ func run() int {
 	// 都读同一张 collect_run，不另建第二份查询实现。
 	runStatusRepo := store.NewRunStatusRepo(pool)
 
-	// 版本管理仓储：列表、详情、对比与回退事务都走它（设计 D1 的 store 侧）；
-	// 异常视图 `Anomalies` 属于 tasklist 第 6 项，第 6 项实现 `Anomalies` 后走该仓储。
-	// 这里只构造，端点注册在 tasklist 第 7 项；回退提交成功后的缓存失效由下方
-	// api.WithReleaseAdmin 的第二个参数接上，仓储本身不碰 query 包。
+	// 版本管理仓储：列表、详情、对比、异常视图与回退事务都走它（设计 D1 的 store 侧）。
+	// 端点由 api.Handler 注册在管理前缀下（tasklist 第 7 项）；回退提交成功后的缓存失效
+	// 由下方 api.WithReleaseAdmin 的第二个参数接上，仓储本身不碰 query 包。
 	releaseAdminRepo := store.NewReleaseAdminRepo(pool)
 
 	// 采集链路的装配顺序固定（collect-runner design「依赖方向」的装配段）：
