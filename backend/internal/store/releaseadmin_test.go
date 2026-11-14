@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 )
@@ -1713,4 +1714,423 @@ func TestLoadReleaseDiffPageRowsErrorWraps(t *testing.T) {
 	if !rows.closed {
 		t.Fatal("遍历失败也要关闭行集")
 	}
+}
+
+// releaseRollbackTxStub 是 releaseRollbackTx 的替身：按 SQL 常量回放两条加锁单行读、
+// 两条 UPDATE 与提交/回滚，并把每次调用记进 calls。
+//
+// 回退的正确性一半在「做了什么」，一半在「按什么顺序做」：锁序写反、先抬后降，
+// 单看最终状态或返回值都可能照样通过，只有顺序断言能拦住。所以这里的记录粒度是
+// 每条语句（current / target / demote / promote / commit），不是「有没有调用」。
+type releaseRollbackTxStub struct {
+	pgx.Tx // 只覆盖被测路径用到的方法，其余调用即 panic
+
+	currentRow pgx.Row // 锁当前行（releaseLockCurrentSQL）的回放结果
+	targetRow  pgx.Row // 锁目标行（releaseLockTargetSQL）的回放结果
+
+	demoteErr   error // 降原 current 的错误（非空时不发命令标签）
+	demoteRows  int64 // 降原 current 的影响行数
+	promoteErr  error // 抬目标的错误
+	promoteRows int64 // 抬目标的影响行数
+
+	commitErr error // 提交错误，由外层 Rollback 映射
+
+	calls       []string // current / target / demote / promote / commit
+	targetArgs  []any    // 锁目标行收到的参数
+	promoteArgs []any    // 抬目标收到的参数
+
+	committed  bool // Commit 是否成功
+	rolledBack bool // Rollback 是否被调用：失败路径必须靠它收尾
+}
+
+// QueryRow 按 SQL 常量分派两条加锁读，并记下顺序。
+func (s *releaseRollbackTxStub) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	switch sql {
+	case releaseLockCurrentSQL:
+		s.calls = append(s.calls, "current")
+		return s.currentRow
+	case releaseLockTargetSQL:
+		s.calls = append(s.calls, "target")
+		s.targetArgs = append([]any(nil), args...)
+		return s.targetRow
+	default:
+		panic("未知的单行读语句")
+	}
+}
+
+// Exec 按 SQL 常量分派两条 UPDATE，按预设的行数造命令标签。
+func (s *releaseRollbackTxStub) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	switch sql {
+	case releaseDemoteCurrentSQL:
+		s.calls = append(s.calls, "demote")
+		if s.demoteErr != nil {
+			return pgconn.CommandTag{}, s.demoteErr
+		}
+		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", s.demoteRows)), nil
+	case releasePromoteTargetSQL:
+		s.calls = append(s.calls, "promote")
+		s.promoteArgs = append([]any(nil), args...)
+		if s.promoteErr != nil {
+			return pgconn.CommandTag{}, s.promoteErr
+		}
+		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", s.promoteRows)), nil
+	default:
+		panic("未知的写入语句")
+	}
+}
+
+// Commit 记下提交，并回放预设错误。
+func (s *releaseRollbackTxStub) Commit(context.Context) error {
+	s.calls = append(s.calls, "commit")
+	if s.commitErr != nil {
+		return s.commitErr
+	}
+	s.committed = true
+	return nil
+}
+
+// Rollback 记录收尾调用。成功提交后 defer 也会调它，所以它不是失败标志。
+func (s *releaseRollbackTxStub) Rollback(context.Context) error {
+	s.rolledBack = true
+	return nil
+}
+
+// releaseRollbackDefaultCurrentRow 造一行「当前版本」回放数据，列序与
+// releaseLockCurrentSQL 一致。当前行在回退用例里只有这一个身份：能成功回退的夹具与
+// 各条拒绝分支比的都是「当前版本是 20261114T030512Z、学期 2026-2027-1」。
+func releaseRollbackDefaultCurrentRow() pgx.Row {
+	return &releaseAdminRowStub{values: []any{"20261114T030512Z", "2026-2027-1"}}
+}
+
+// releaseRollbackTargetRow 造一行「回退目标」回放数据，列序与 releaseLockTargetSQL 一致。
+func releaseRollbackTargetRow(id, term string, isCurrent bool) pgx.Row {
+	return &releaseAdminRowStub{values: []any{id, term, isCurrent}}
+}
+
+// releaseRollbackTxFixture 是一套「可以成功回退」的默认回放：当前版本较新、目标是
+// 同学期的非 current 版本、两条 UPDATE 各命中 1 行。
+func releaseRollbackTxFixture() *releaseRollbackTxStub {
+	return &releaseRollbackTxStub{
+		currentRow:  releaseRollbackDefaultCurrentRow(),
+		targetRow:   releaseRollbackTargetRow("20261028T041500Z", "2026-2027-1", false),
+		demoteRows:  1,
+		promoteRows: 1,
+	}
+}
+
+// TestReleaseRollbackSQLClauses 锁定四条语句的关键子句：两条加锁读都带 FOR UPDATE，
+// 降 current 不带版本标识，抬目标带 NOT is_current 守卫。
+//
+// 这些子句是锁序（CP8）与「目标行数必须为 1」的载体：改成普通 SELECT 或去掉守卫后，
+// 单元用例仍然能过，只有真实库的并发与拒绝分支才会偶尔暴露。
+func TestReleaseRollbackSQLClauses(t *testing.T) {
+	cases := []struct {
+		name     string
+		sql      string
+		contains []string
+	}{
+		{"锁当前行", releaseLockCurrentSQL, []string{"FROM release", "WHERE is_current", "FOR UPDATE"}},
+		{"锁目标行", releaseLockTargetSQL, []string{"WHERE release_id = $1", "FOR UPDATE"}},
+		{"降原 current", releaseDemoteCurrentSQL, []string{"SET is_current = false", "WHERE is_current"}},
+		{"抬目标", releasePromoteTargetSQL, []string{"SET is_current = true", "WHERE release_id = $1", "AND NOT is_current"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, want := range tc.contains {
+				if !strings.Contains(tc.sql, want) {
+					t.Fatalf("%s 缺少子句 %q：\n%s", tc.name, want, tc.sql)
+				}
+			}
+		})
+	}
+
+	// 降 current 必须不按 release_id 过滤：current 至多一行，带上标识只会让「锁的
+	// 那一行」与「更新的一行」多出一个需要证明相等的地方。
+	if strings.Contains(releaseDemoteCurrentSQL, "release_id") {
+		t.Fatalf("降原 current 不应带版本标识：\n%s", releaseDemoteCurrentSQL)
+	}
+}
+
+// TestRollbackReleaseSwapsCurrent 断言成功路径的语句顺序与参数：先锁当前、再锁目标、
+// 先降后抬，结果字段来自读回的两行。
+func TestRollbackReleaseSwapsCurrent(t *testing.T) {
+	tx := releaseRollbackTxFixture()
+
+	result, err := rollbackRelease(context.Background(), tx, "20261028T041500Z")
+	if err != nil {
+		t.Fatalf("回退应成功，实际 %v", err)
+	}
+	want := RollbackResult{
+		RolledBackFrom:   "20261114T030512Z",
+		CurrentReleaseID: "20261028T041500Z",
+		Term:             "2026-2027-1",
+	}
+	if result != want {
+		t.Fatalf("回退结果不符：期望 %+v，实际 %+v", want, result)
+	}
+
+	wantCalls := []string{"current", "target", "demote", "promote"}
+	if !reflect.DeepEqual(tx.calls, wantCalls) {
+		t.Fatalf("语句顺序不符：期望 %v，实际 %v", wantCalls, tx.calls)
+	}
+	if !reflect.DeepEqual(tx.targetArgs, []any{"20261028T041500Z"}) {
+		t.Fatalf("锁目标行的参数不符：%v", tx.targetArgs)
+	}
+	if !reflect.DeepEqual(tx.promoteArgs, []any{"20261028T041500Z"}) {
+		t.Fatalf("抬目标的参数不符：%v", tx.promoteArgs)
+	}
+	if tx.committed {
+		t.Fatal("事务体不应自己提交：提交属于外层 Rollback")
+	}
+}
+
+// TestRollbackReleaseRejects 覆盖四条拒绝分支：每条都必须在任何 UPDATE 之前返回，
+// 且返回零值结果。
+func TestRollbackReleaseRejects(t *testing.T) {
+	cases := []struct {
+		name      string
+		current   pgx.Row
+		target    pgx.Row
+		targetID  string
+		wantErr   error
+		wantCalls []string
+	}{
+		{
+			name:      "目标不存在",
+			current:   releaseRollbackDefaultCurrentRow(),
+			target:    &releaseAdminRowStub{err: pgx.ErrNoRows},
+			targetID:  "20200101T000000Z",
+			wantErr:   ErrReleaseNotFound,
+			wantCalls: []string{"current", "target"},
+		},
+		{
+			name:      "目标已是当前版本",
+			current:   releaseRollbackDefaultCurrentRow(),
+			target:    releaseRollbackTargetRow("20261114T030512Z", "2026-2027-1", true),
+			targetID:  "20261114T030512Z",
+			wantErr:   ErrReleaseNotRollbackable,
+			wantCalls: []string{"current", "target"},
+		},
+		{
+			name:      "库中没有当前版本",
+			current:   &releaseAdminRowStub{err: pgx.ErrNoRows},
+			target:    releaseRollbackTargetRow("20261028T041500Z", "2026-2027-1", false),
+			targetID:  "20261028T041500Z",
+			wantErr:   ErrReleaseNotRollbackable,
+			wantCalls: []string{"current", "target"},
+		},
+		{
+			name:      "跨学期",
+			current:   releaseRollbackDefaultCurrentRow(),
+			target:    releaseRollbackTargetRow("20260901T010203Z", "2025-2026-2", false),
+			targetID:  "20260901T010203Z",
+			wantErr:   ErrReleaseTermMismatch,
+			wantCalls: []string{"current", "target"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := &releaseRollbackTxStub{
+				currentRow:  tc.current,
+				targetRow:   tc.target,
+				demoteRows:  1,
+				promoteRows: 1,
+			}
+			result, err := rollbackRelease(context.Background(), tx, tc.targetID)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("期望 %v，实际 %v", tc.wantErr, err)
+			}
+			if result != (RollbackResult{}) {
+				t.Fatalf("拒绝路径必须返回零值结果，实际 %+v", result)
+			}
+			if !reflect.DeepEqual(tx.calls, tc.wantCalls) {
+				t.Fatalf("拒绝路径不应发 UPDATE：期望调用 %v，实际 %v", tc.wantCalls, tx.calls)
+			}
+		})
+	}
+}
+
+// TestRollbackReleaseRowCountGuards 覆盖两条 UPDATE 的行数守卫：抬目标 0 行按
+// 「不可回退」收口；降 current 0 行说明库的 current 不变量已被破坏，按内部错误暴露。
+func TestRollbackReleaseRowCountGuards(t *testing.T) {
+	t.Run("抬目标命中0行", func(t *testing.T) {
+		tx := releaseRollbackTxFixture()
+		tx.promoteRows = 0
+		_, err := rollbackRelease(context.Background(), tx, "20261028T041500Z")
+		if !errors.Is(err, ErrReleaseNotRollbackable) {
+			t.Fatalf("期望 ErrReleaseNotRollbackable，实际 %v", err)
+		}
+	})
+
+	t.Run("降current命中0行", func(t *testing.T) {
+		tx := releaseRollbackTxFixture()
+		tx.demoteRows = 0
+		_, err := rollbackRelease(context.Background(), tx, "20261028T041500Z")
+		if !errors.Is(err, model.ErrQueryFailed) {
+			t.Fatalf("期望 model.ErrQueryFailed，实际 %v", err)
+		}
+		if containsString(tx.calls, "promote") {
+			t.Fatalf("降 current 失败后不应继续抬目标：%v", tx.calls)
+		}
+	})
+}
+
+// TestRollbackReleaseMapsRetryableSQLStates 断言三个可重试 SQLSTATE 在各条写入上
+// 都映射成 ErrReleaseConflict，而不是 50000。
+func TestRollbackReleaseMapsRetryableSQLStates(t *testing.T) {
+	for _, code := range []string{"23505", "40P01", "40001"} {
+		for _, stage := range []string{"demote", "promote"} {
+			t.Run(code+"-"+stage, func(t *testing.T) {
+				tx := releaseRollbackTxFixture()
+				pgErr := &pgconn.PgError{Code: code}
+				if stage == "demote" {
+					tx.demoteErr = pgErr
+				} else {
+					tx.promoteErr = pgErr
+				}
+				_, err := rollbackRelease(context.Background(), tx, "20261028T041500Z")
+				if !errors.Is(err, ErrReleaseConflict) {
+					t.Fatalf("SQLSTATE %s 应映射 ErrReleaseConflict，实际 %v", code, err)
+				}
+				if errors.Is(err, model.ErrQueryFailed) {
+					t.Fatalf("并发冲突不应同时被当成读失败：%v", err)
+				}
+			})
+		}
+	}
+}
+
+// TestRollbackReleaseWrapsOtherErrors 覆盖非并发冲突的错误口径：一律包
+// model.ErrQueryFailed，且不误报成 ErrReleaseConflict。
+func TestRollbackReleaseWrapsOtherErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		tx   func() *releaseRollbackTxStub
+	}{
+		{
+			name: "锁当前行失败",
+			tx: func() *releaseRollbackTxStub {
+				tx := releaseRollbackTxFixture()
+				tx.currentRow = &releaseAdminRowStub{err: errors.New("连接中断")}
+				return tx
+			},
+		},
+		{
+			name: "锁目标行失败",
+			tx: func() *releaseRollbackTxStub {
+				tx := releaseRollbackTxFixture()
+				tx.targetRow = &releaseAdminRowStub{err: errors.New("连接中断")}
+				return tx
+			},
+		},
+		{
+			name: "降current失败（非并发）",
+			tx: func() *releaseRollbackTxStub {
+				tx := releaseRollbackTxFixture()
+				tx.demoteErr = &pgconn.PgError{Code: "22021"}
+				return tx
+			},
+		},
+		{
+			name: "抬目标失败（非并发）",
+			tx: func() *releaseRollbackTxStub {
+				tx := releaseRollbackTxFixture()
+				tx.promoteErr = &pgconn.PgError{Code: "22021"}
+				return tx
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := rollbackRelease(context.Background(), tc.tx(), "20261028T041500Z")
+			if !errors.Is(err, model.ErrQueryFailed) {
+				t.Fatalf("期望 model.ErrQueryFailed，实际 %v", err)
+			}
+			if errors.Is(err, ErrReleaseConflict) {
+				t.Fatalf("非并发冲突不应映射 ErrReleaseConflict: %v", err)
+			}
+		})
+	}
+}
+
+// TestReleaseAdminRepoRollbackOpensReadCommittedTx 断言仓储用 READ COMMITTED 开事务、
+// 成功后提交，并把事务体结果原样返回。
+func TestReleaseAdminRepoRollbackOpensReadCommittedTx(t *testing.T) {
+	tx := releaseRollbackTxFixture()
+	pool := &releaseAdminPoolStub{tx: tx}
+	repo := NewReleaseAdminRepo(pool)
+
+	result, err := repo.Rollback(context.Background(), "20261028T041500Z")
+	if err != nil {
+		t.Fatalf("回退应成功，实际 %v", err)
+	}
+	if pool.txOptions.IsoLevel != pgx.ReadCommitted {
+		t.Fatalf("隔离级别应为 READ COMMITTED，实际 %v", pool.txOptions.IsoLevel)
+	}
+	// 访问模式留零值（PostgreSQL 默认读写）；只读事务会让两条 UPDATE 在库上直接失败。
+	if pool.txOptions.AccessMode == pgx.ReadOnly {
+		t.Fatalf("回退必须是可写事务，实际访问模式 %v", pool.txOptions.AccessMode)
+	}
+	if !tx.committed {
+		t.Fatal("成功路径必须提交事务")
+	}
+	if result.CurrentReleaseID != "20261028T041500Z" {
+		t.Fatalf("返回的当前版本不符：%+v", result)
+	}
+}
+
+// TestReleaseAdminRepoRollbackBeginTxError 断言开事务失败包 model.ErrQueryFailed。
+func TestReleaseAdminRepoRollbackBeginTxError(t *testing.T) {
+	pool := &releaseAdminPoolStub{beginErr: errors.New("连接池耗尽")}
+	repo := NewReleaseAdminRepo(pool)
+
+	if _, err := repo.Rollback(context.Background(), "20261028T041500Z"); !errors.Is(err, model.ErrQueryFailed) {
+		t.Fatalf("期望 model.ErrQueryFailed，实际 %v", err)
+	}
+}
+
+// TestReleaseAdminRepoRollbackCommitError 断言提交失败的两类口径：可重试 SQLSTATE
+// 映射 ErrReleaseConflict，其余映射 model.ErrQueryFailed；失败都不返回结果。
+func TestReleaseAdminRepoRollbackCommitError(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		wantErr error
+	}{
+		{"提交撞唯一索引", &pgconn.PgError{Code: "23505"}, ErrReleaseConflict},
+		{"提交死锁", &pgconn.PgError{Code: "40P01"}, ErrReleaseConflict},
+		{"提交普通失败", errors.New("连接断开"), model.ErrQueryFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := releaseRollbackTxFixture()
+			tx.commitErr = tc.err
+			pool := &releaseAdminPoolStub{tx: tx}
+			repo := NewReleaseAdminRepo(pool)
+
+			result, err := repo.Rollback(context.Background(), "20261028T041500Z")
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("期望 %v，实际 %v", tc.wantErr, err)
+			}
+			if result != (RollbackResult{}) {
+				t.Fatalf("提交失败必须返回零值结果，实际 %+v", result)
+			}
+			if tx.committed {
+				t.Fatal("提交失败不应记成已提交")
+			}
+			if !tx.rolledBack {
+				t.Fatal("失败路径必须回滚收尾")
+			}
+		})
+	}
+}
+
+// containsString 判断切片里是否出现过 want，用于「某条语句一次都不该出现」的断言。
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

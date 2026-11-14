@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/w1ndys/easy-qfnu-kjs/internal/model"
 )
@@ -331,6 +332,36 @@ func DiffTotal(section DiffSection, kind DiffKind, summary ReleaseDiffSummary) i
 // 发布事务删掉的正常失败，不是数据库故障，不能当 50000。
 var ErrReleaseNotFound = errors.New("发布版本不存在")
 
+// RollbackResult 是一次成功回退的结果：谁退位、谁上位、上位版本属于哪个学期。
+//
+// 只有提交成功才会走到返回：任一失败路径都返回零值 + 错误，调用方据此区分
+// 「回退成功」与「什么都没发生」（Requirement 5.2 要求失败时原 current 不动）。
+//
+// CurrentReleaseID 是从行锁里读回的版本标识而不是直接回显入参——入参与库中主键
+// 相等由 $1 命中保证，回显读回的值让「返回的版本确实是库里那一行」不依赖推断。
+type RollbackResult struct {
+	RolledBackFrom   string // 操作前的当前版本；走到成功路径时必然存在
+	CurrentReleaseID string // 回退后的当前版本，即回退目标
+	Term             string // 目标版本的学期，api 原样放进响应
+}
+
+// 回退的失败原因由哨兵区分，api 按 errors.Is 映射 40401 / 40904 / 40905 / 40906。
+//
+//   - ErrReleaseNotFound：目标版本不在库里（40401）。读侧对比复用同一个哨兵。
+//   - ErrReleaseNotRollbackable：目标已是 current、库中没有 current，或目标在锁与
+//     更新之间不再满足「非 current」（40904）。这三种都表示「这次回退没有意义」，
+//     不是数据故障，所以不能压成 50000。
+//   - ErrReleaseTermMismatch：目标与当前版本的 term 不同（40905）。current 是一版
+//     完整数据集，跨学期切换等于让访客看到另一学期的课表，不是「回退」。
+//   - ErrReleaseConflict：数据库层的并发冲突（SQLSTATE 23505 / 40P01 / 40001，
+//     40906）。它表示「另一条版本变更语句与你撞上了」，重试即可；与「目标不可回退」
+//     分开，调用方才能给出不同的提示（design D9）。
+var (
+	ErrReleaseNotRollbackable = errors.New("版本不可回退")
+	ErrReleaseTermMismatch    = errors.New("回退目标与当前版本学期不同")
+	ErrReleaseConflict        = errors.New("回退并发冲突")
+)
+
 // releaseAdminPool 是版本读取仓储需要的最小能力：多行读、单行读与只读事务。
 //
 // 用窄接口而不是 *pgxpool.Pool，与 publishQuerier / runStatusQuerier 同一写法：
@@ -363,6 +394,16 @@ type releaseDetailQuerier interface {
 type releaseDiffQuerier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// releaseRollbackTx 是回退事务体需要的最小能力：两条加锁单行读与两条 UPDATE。
+//
+// 与 releaseDetailQuerier / releaseDiffQuerier 同一写法：把事务体与开事务拆开，
+// 让锁序、判定顺序与「先降后抬」能用一个记录型替身单独验证，不必连库。*pgx.Tx
+// 天然满足；Commit 与 Rollback 留在外层 Rollback 方法里，事务体只负责读写。
+type releaseRollbackTx interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
 // releaseListSQL 列出库中全部版本，按 generated_at 倒序、同刻按版本标识倒序。
@@ -697,12 +738,65 @@ SELECT p.*, COALESCE(r.name, '') AS room_name
   FROM page p LEFT JOIN room r ON r.room_id = p.room_id
  ORDER BY p.room_id`
 
-// ReleaseAdminRepo 把管理端版本读取的 SQL 与只读事务闭在内部。
+// 回退要识别的两个「可重试」SQLSTATE。唯一冲突复用 collectrun.go 的
+// pgUniqueViolation（23505），不在这里重复声明。
+const (
+	pgDeadlockDetected     = "40P01" // deadlock_detected：两个事务交叉持锁
+	pgSerializationFailure = "40001" // serialization_failure：可串行化事务被中止
+)
+
+// releaseLockCurrentSQL 是回退事务的第一条语句：锁住当前版本行并读出它的身份与学期。
+//
+// 先锁当前行、再锁目标行的锁序与发布事务对齐（store/publish.go 的
+// demoteCurrentSQL 先降原 current）：两边都从当前行开始持锁，就不会出现「回退持目标
+// 等当前、发布持当前等目标」的环（design D7、CP8）。并发下仍可能撞上数据库层冲突，
+// 那时交给 40906 让调用方重试。
+//
+// 用 SELECT ... FOR UPDATE 而不是「先读后改」：判定与后续 UPDATE 都基于本事务持有
+// 的行锁，并发回退或发布改不动这两行，判定结论不会在锁与更新之间失效。
+const releaseLockCurrentSQL = `
+SELECT release_id, term
+  FROM release
+ WHERE is_current
+ FOR UPDATE`
+
+// releaseLockTargetSQL 是回退事务的第二条语句：锁住目标版本行并读出它是否已是 current。
+//
+// 必须在 releaseLockCurrentSQL 之后执行（锁序固定）。目标缺行由调用方映射
+// ErrReleaseNotFound；目标与当前是同一行时（目标已是 current）第二次加锁是同一事务内
+// 的重入，不会自锁。
+const releaseLockTargetSQL = `
+SELECT release_id, term, is_current
+  FROM release
+ WHERE release_id = $1
+ FOR UPDATE`
+
+// releaseDemoteCurrentSQL 降原 current。条件不带版本标识：release_one_current 部分
+// 唯一索引保证同时至多一行 current，带 id 只会让「锁的那一行与更新的一行是否同一行」
+// 变成一个新的不确定点。
+const releaseDemoteCurrentSQL = `
+UPDATE release
+   SET is_current = false
+ WHERE is_current`
+
+// releasePromoteTargetSQL 抬目标为 current，AND NOT is_current 让「目标行数必须为 1」
+// 成为可断言的事实。
+//
+// 0 行说明目标在锁与更新之间不再是非 current（并发回退抢先把它抬成 current，或版本
+// 被发布事务删掉）。两条路都靠行锁挡住，理论上不可达；真出现就整个事务回滚，按
+// ErrReleaseNotRollbackable 收口，不留下「0 个 current」的库。
+const releasePromoteTargetSQL = `
+UPDATE release
+   SET is_current = true
+ WHERE release_id = $1
+   AND NOT is_current`
+
+// ReleaseAdminRepo 把管理端版本的 SQL 与事务闭在内部。
 //
 // 它是 api.ReleaseAdminReader 的结构匹配实现：store 不 import api（依赖方向见
 // backend/.golangci.yml 的 store 规则），接口定义在消费侧，方法集在这里一一对应。
-// 本文件当前有列表、详情、对比（汇总 + 小节分页）三个读方法（tasklist 第 1–3 项）；
-// 异常与回退由后续条目补到同一类型上。
+// 本文件有列表、详情、对比（汇总 + 小节分页）三个读方法与回退一个写方法（tasklist
+// 第 1–4 项）；异常由后续条目补到同一类型上。
 type ReleaseAdminRepo struct {
 	pool releaseAdminPool // 通常是 *pgxpool.Pool
 }
@@ -1234,4 +1328,142 @@ func loadReleaseDiffSummary(
 	summary.Unknown = StateDelta{From: fromUnknown, To: toUnknown, Delta: toUnknown - fromUnknown}
 	summary.Composite = StateDelta{From: fromComposite, To: toComposite, Delta: toComposite - fromComposite}
 	return summary, nil
+}
+
+// Rollback 把目标版本置为当前版本，并在同一个事务里把原当前版本置为非当前版本。
+//
+// 事务顺序固定（design「回退事务」、CP8）：
+//  1. 锁当前版本行（releaseLockCurrentSQL）；
+//  2. 锁目标版本行（releaseLockTargetSQL）；
+//  3. Go 侧判定：目标存在 → 目标非 current → 有当前 → 同 term；
+//  4. 先降后抬：demoteCurrent → promoteTarget（目标必须命中 1 行）；
+//  5. 提交。
+//
+// 两条 UPDATE 在同一事务内、提交前对外不可见；release_one_current 是只约束
+// is_current = true 的部分唯一索引，所以「先降后抬」之间零个 current 是允许的。
+// 任一步失败都回滚整个事务，原 current 保持原状（Requirement 5.2、CP8）。
+//
+// 隔离级别用 READ COMMITTED（design 的 BEGIN ISOLATION LEVEL READ COMMITTED）：
+// 回退不靠「同一快照的多语句读」，靠的是两条 FOR UPDATE 行锁；提高隔离级别只会把
+// 并发回退从「40904 目标已 current」变成「40001 → 40906」，并不会更安全。
+//
+// 成功返回后的公开查询缓存失效不在这里做：它由装配层（api.WithReleaseAdmin 的
+// invalidate 回调）在提交成功后、写响应前调用；仓储只保证提交成功（CP10）。
+func (r ReleaseAdminRepo) Rollback(ctx context.Context, targetID string) (RollbackResult, error) {
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return RollbackResult{}, fmt.Errorf("%w: 开启回退事务失败: %w", model.ErrQueryFailed, err)
+	}
+	// 提交成功后回滚是空操作；所有失败路径都靠这里收尾（与 CommitRelease 同一写法）。
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	result, err := rollbackRelease(ctx, tx, targetID)
+	if err != nil {
+		return RollbackResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return RollbackResult{}, releaseRollbackError(err, "提交回退事务失败")
+	}
+	return result, nil
+}
+
+// rollbackRelease 是 Rollback 的事务体：锁两行、判定、先降后抬、拼结果，不负责
+// 开事务与提交。
+//
+// 判定顺序在两条 SELECT 都执行完之后，且「目标缺行」优先于其它原因：只有目标存在，
+// 后面那些比较才有意义。目标已 current 先于「没有当前」判定——目标已 current 时
+// 库里通常也有一行 current（就是它自己），先报 40904 能让消息说清「你点的是当前版本」，
+// 而不是「库里没有当前版本」。
+//
+// 判定一律返回哨兵错误，不做任何写入：拒绝路径的 release 表零变更是调用方可以直接
+// 断言的（tasklist 第 4 项的集成要求）。
+func rollbackRelease(ctx context.Context, tx releaseRollbackTx, targetID string) (RollbackResult, error) {
+	var (
+		currentID, currentTerm string
+		hasCurrent             bool
+	)
+	err := tx.QueryRow(ctx, releaseLockCurrentSQL).Scan(&currentID, &currentTerm)
+	switch {
+	case err == nil:
+		hasCurrent = true
+	case errors.Is(err, pgx.ErrNoRows):
+		// 没有 current 不是读失败：继续锁目标，按判定顺序给 40904（无 current）。
+		// 先不返回，是为了让「目标缺行」在无 current 的库里仍然报 404。
+	default:
+		return RollbackResult{}, releaseRollbackError(err, "锁定当前版本失败")
+	}
+
+	var (
+		targetIDRead string
+		targetTerm   string
+		targetNow    bool
+	)
+	err = tx.QueryRow(ctx, releaseLockTargetSQL, targetID).Scan(&targetIDRead, &targetTerm, &targetNow)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return RollbackResult{}, fmt.Errorf("%w: 回退目标版本 %s 不存在", ErrReleaseNotFound, targetID)
+	case err != nil:
+		return RollbackResult{}, releaseRollbackError(err, fmt.Sprintf("锁定回退目标 %s 失败", targetID))
+	}
+
+	if targetNow {
+		return RollbackResult{}, fmt.Errorf("%w: 目标版本 %s 已是当前版本，不能回退",
+			ErrReleaseNotRollbackable, targetIDRead)
+	}
+	if !hasCurrent {
+		return RollbackResult{}, fmt.Errorf("%w: 库中没有当前版本，版本 %s 不能回退",
+			ErrReleaseNotRollbackable, targetIDRead)
+	}
+	if currentTerm != targetTerm {
+		return RollbackResult{}, fmt.Errorf("%w: 目标版本属于学期 %s，当前版本属于学期 %s，不能跨学期回退",
+			ErrReleaseTermMismatch, targetTerm, currentTerm)
+	}
+
+	tag, err := tx.Exec(ctx, releaseDemoteCurrentSQL)
+	if err != nil {
+		return RollbackResult{}, releaseRollbackError(err, "降原当前版本失败")
+	}
+	if tag.RowsAffected() != 1 {
+		// 刚才在同一个事务里锁住并读到了 current，别的会话改不动这一行；命不中 1 行
+		// 说明库的「恰有一个 current」不变量已被破坏。按内部错误暴露，不装成 40904。
+		return RollbackResult{}, fmt.Errorf("%w: 降原当前版本命中 %d 行，期望 1 行",
+			model.ErrQueryFailed, tag.RowsAffected())
+	}
+
+	tag, err = tx.Exec(ctx, releasePromoteTargetSQL, targetIDRead)
+	if err != nil {
+		return RollbackResult{}, releaseRollbackError(err, "抬目标版本为当前失败")
+	}
+	if tag.RowsAffected() != 1 {
+		return RollbackResult{}, fmt.Errorf("%w: 目标版本 %s 在锁与更新之间不再是可回退状态，回退中止",
+			ErrReleaseNotRollbackable, targetIDRead)
+	}
+
+	return RollbackResult{
+		RolledBackFrom:   currentID,
+		CurrentReleaseID: targetIDRead,
+		Term:             targetTerm,
+	}, nil
+}
+
+// releaseRollbackError 把回退事务里的数据库错误折成两类哨兵。
+//
+// 可重试的并发冲突（唯一索引冲突 23505、死锁 40P01、序列化失败 40001）包
+// ErrReleaseConflict（409 / 40906）：它们表示「另一条版本变更语句和你撞上了」，
+// 重试就能成功，不是数据或装配问题。其余一律包 model.ErrQueryFailed（50000）。
+//
+// 注意 40001 是 SQLSTATE，与业务码 40001（参数非法）同名但域不同：一个来自
+// PostgreSQL，一个来自 api；这里只认 *pgconn.PgError 里的那个。
+//
+// 必须用 errors.As 取 *pgconn.PgError：pgx 在事务失败时会把原始错误再包一层，
+// 直接类型断言会漏掉。
+func releaseRollbackError(err error, action string) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case pgUniqueViolation, pgDeadlockDetected, pgSerializationFailure:
+			return fmt.Errorf("%w: %s: %w", ErrReleaseConflict, action, err)
+		}
+	}
+	return fmt.Errorf("%w: %s: %w", model.ErrQueryFailed, action, err)
 }

@@ -23,8 +23,8 @@
   - `offset` 超过末页返回空 `items` 且 `total` 不变；同一请求重复执行返回同一页
   - 集成：逐小节断言条数与字段（含 `room_name`、归属字段的 `null` 形状）；相邻页无重复、无遗漏
 
-- [ ] 4. 回退事务
-  - `store.ReleaseAdminRepo.Rollback`：`BEGIN` → `SELECT ... WHERE is_current FOR UPDATE` → `SELECT ... WHERE release_id = $1 FOR UPDATE` → Go 侧判定目标存在 / 非 current / 同 `term` / 有当前 → 先降后抬，目标行数必须为 1 → `COMMIT`
+- [x] 4. 回退事务
+  - `store.ReleaseAdminRepo.Rollback`：`BEGIN` → `SELECT ... WHERE is_current FOR UPDATE` → `SELECT ... WHERE release_id = $1 FOR UPDATE` → Go 侧判定目标存在 → 非 current → 有当前 → 同 `term` → 先降后抬，目标行数必须为 1 → `COMMIT`
   - 错误映射：缺目标 → `ErrReleaseNotFound`（40401）；已 current / 无 current → `ErrReleaseNotRollbackable`（40904）；跨学期 → `ErrReleaseTermMismatch`（40905）；SQLSTATE `23505` / `40P01` / `40001` → `ErrReleaseConflict`（40906）；其余包装 `model.ErrQueryFailed`
   - 集成：成功后 current 交换、`release` / `observation` / `release_room_building` 行数不变、`collect_run` 的 `release_id` / `released_at` 不变；三种拒绝分支各一条，断言 `release` 表零变更
   - 并发：两个 goroutine 同时回退同一目标，恰好一个成功、另一个 40904 或 40906，结束后恰有一个 current

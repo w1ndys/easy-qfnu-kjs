@@ -6,9 +6,11 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -1435,5 +1437,323 @@ func TestReleaseAdminRepoDiffPaginationAgainstRealDB(t *testing.T) {
 	}
 	if got := DiffTotal(DiffSectionCells, DiffKindAll, swapped.Summary); got != len(all) {
 		t.Fatalf("交换两侧后 total 应不变: got %d want %d", got, len(all))
+	}
+}
+
+// releaseAdminRollbackOtherTerm / releaseAdminRollbackForeignID 是跨学期回退用例的
+// 另一学期与非 current 版本。只在这条用例里单独铺，不并进共享夹具：列表/详情用例
+// 按三版夹具写死断言，多插一版会让它们一起偏。
+const (
+	releaseAdminRollbackOtherTerm = "2025-2026-2"
+	releaseAdminRollbackForeignID = "20260901T010203Z"
+)
+
+// seedReleaseAdminForeignTermRelease 追加一个另一学期的非 current 版本。
+func seedReleaseAdminForeignTermRelease(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	mustExec(ctx, t, pool,
+		"INSERT INTO term (term, total_weeks) VALUES ($1, 20)",
+		releaseAdminRollbackOtherTerm)
+	mustExec(ctx, t, pool, `
+INSERT INTO release (release_id, term, generated_at, dict_version, axis_version, has_attr_conflict, is_current)
+VALUES ($1, $2, $3, 1, 1, false, false)`,
+		releaseAdminRollbackForeignID, releaseAdminRollbackOtherTerm,
+		mustParseReleaseAdminTime(t, "2026-09-01T01:02:03Z"))
+}
+
+// releaseAdminCountRows 统计一张表的行数；表名走 pgx.Identifier 转义，调用方只传常量。
+func releaseAdminCountRows(ctx context.Context, t *testing.T, pool *pgxpool.Pool, table string) int64 {
+	t.Helper()
+	var count int64
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{table}.Sanitize()).Scan(&count); err != nil {
+		t.Fatalf("统计 %s 行数失败: %v", table, err)
+	}
+	return count
+}
+
+// releaseAdminReleaseState 是 release 表一行的 (release_id, is_current)：拒绝分支要断言
+// 「版本表零变更」，行集合与 current 标记都不能动。
+type releaseAdminReleaseState struct {
+	ReleaseID string
+	IsCurrent bool
+}
+
+// releaseAdminReleaseStates 按 release_id 升序取 release 表的 (标识, current) 全集。
+func releaseAdminReleaseStates(ctx context.Context, t *testing.T, pool *pgxpool.Pool) []releaseAdminReleaseState {
+	t.Helper()
+	rows, err := pool.Query(ctx, "SELECT release_id, is_current FROM release ORDER BY release_id")
+	if err != nil {
+		t.Fatalf("读取 release 表状态失败: %v", err)
+	}
+	defer rows.Close()
+
+	states := make([]releaseAdminReleaseState, 0)
+	for rows.Next() {
+		var state releaseAdminReleaseState
+		if err := rows.Scan(&state.ReleaseID, &state.IsCurrent); err != nil {
+			t.Fatalf("扫描 release 表状态失败: %v", err)
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 release 表状态失败: %v", err)
+	}
+	return states
+}
+
+// releaseAdminRunState 是 collect_run 一行里回退不该改动的三列。
+type releaseAdminRunState struct {
+	RunID      int64
+	ReleaseID  *string
+	ReleasedAt *time.Time
+}
+
+// releaseAdminRunStates 按 run_id 升序取 collect_run 的 (轮次, 关联版本, 发布时刻)。
+func releaseAdminRunStates(ctx context.Context, t *testing.T, pool *pgxpool.Pool) []releaseAdminRunState {
+	t.Helper()
+	rows, err := pool.Query(ctx, "SELECT run_id, release_id, released_at FROM collect_run ORDER BY run_id")
+	if err != nil {
+		t.Fatalf("读取 collect_run 状态失败: %v", err)
+	}
+	defer rows.Close()
+
+	states := make([]releaseAdminRunState, 0)
+	for rows.Next() {
+		var state releaseAdminRunState
+		if err := rows.Scan(&state.RunID, &state.ReleaseID, &state.ReleasedAt); err != nil {
+			t.Fatalf("扫描 collect_run 状态失败: %v", err)
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 collect_run 状态失败: %v", err)
+	}
+	return states
+}
+
+// releaseAdminCurrentIDs 返回库中 is_current 的版本标识；多于一行说明唯一索引的
+// 不变量已被破坏，用例直接失败。
+func releaseAdminCurrentIDs(ctx context.Context, t *testing.T, pool *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := pool.Query(ctx, "SELECT release_id FROM release WHERE is_current ORDER BY release_id")
+	if err != nil {
+		t.Fatalf("读取当前版本失败: %v", err)
+	}
+	defer rows.Close()
+
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("扫描当前版本失败: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历当前版本失败: %v", err)
+	}
+	return ids
+}
+
+// TestReleaseAdminRepoRollbackAgainstRealDB 覆盖成功回退的真实库口径（Requirement 5.1、
+// 6.2、6.3、6.4）：current 在目标与原当前之间交换；release / observation /
+// release_room_building 行数不变；collect_run 的 release_id 与 released_at 不变。
+func TestReleaseAdminRepoRollbackAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseAdminFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	releasesBefore := releaseAdminReleaseStates(ctx, t, pool)
+	observationRowsBefore := releaseAdminCountRows(ctx, t, pool, "observation")
+	roomBuildingRowsBefore := releaseAdminCountRows(ctx, t, pool, "release_room_building")
+	runsBefore := releaseAdminRunStates(ctx, t, pool)
+
+	result, err := repo.Rollback(ctx, releaseAdminPreviousID)
+	if err != nil {
+		t.Fatalf("回退到 %s 应成功，实际 %v", releaseAdminPreviousID, err)
+	}
+	wantResult := RollbackResult{
+		RolledBackFrom:   releaseAdminCurrentID,
+		CurrentReleaseID: releaseAdminPreviousID,
+		Term:             releaseAdminFixtureTerm,
+	}
+	if result != wantResult {
+		t.Fatalf("回退结果不符：期望 %+v，实际 %+v", wantResult, result)
+	}
+
+	// current 交换：恰有一个 current，且是回退目标。
+	if ids := releaseAdminCurrentIDs(ctx, t, pool); !reflect.DeepEqual(ids, []string{releaseAdminPreviousID}) {
+		t.Fatalf("回退后应恰有目标版本一个 current，实际 %v", ids)
+	}
+
+	// 版本集合不变，只是 current 标记移动：release 表的行数与标识都不动。
+	releasesAfter := releaseAdminReleaseStates(ctx, t, pool)
+	if len(releasesAfter) != len(releasesBefore) {
+		t.Fatalf("回退不应改变版本行数：回退前 %d，回退后 %d", len(releasesBefore), len(releasesAfter))
+	}
+	for index, before := range releasesBefore {
+		if after := releasesAfter[index]; after.ReleaseID != before.ReleaseID {
+			t.Fatalf("回退不应改动版本集合：第 %d 行 %s → %s", index, before.ReleaseID, after.ReleaseID)
+		}
+		if want := before.ReleaseID == releaseAdminPreviousID; releasesAfter[index].IsCurrent != want {
+			t.Fatalf("版本 %s 的 current 标记应为 %t，实际 %t",
+				before.ReleaseID, want, releasesAfter[index].IsCurrent)
+		}
+	}
+
+	// 回退不重建、不删除版本数据（CP9）。
+	if got := releaseAdminCountRows(ctx, t, pool, "observation"); got != observationRowsBefore {
+		t.Fatalf("回退不应改变观测行数：回退前 %d，回退后 %d", observationRowsBefore, got)
+	}
+	if got := releaseAdminCountRows(ctx, t, pool, "release_room_building"); got != roomBuildingRowsBefore {
+		t.Fatalf("回退不应改变归属快照行数：回退前 %d，回退后 %d", roomBuildingRowsBefore, got)
+	}
+
+	// 回退不写 collect_run：轮次记录「这一轮发布了哪一版」，回退是管理动作（design）。
+	if runsAfter := releaseAdminRunStates(ctx, t, pool); !reflect.DeepEqual(runsAfter, runsBefore) {
+		t.Fatalf("回退不应改动 collect_run：回退前 %+v，回退后 %+v", runsBefore, runsAfter)
+	}
+
+	// 列表口径（Requirement 6.3）：is_current 只出现一次，且指向目标版本；排序不变。
+	summaries, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("回退后读版本列表失败: %v", err)
+	}
+	currentCount := 0
+	for _, summary := range summaries {
+		if summary.IsCurrent {
+			currentCount++
+			if summary.ReleaseID != releaseAdminPreviousID {
+				t.Fatalf("current 应指向回退目标 %s，实际 %s", releaseAdminPreviousID, summary.ReleaseID)
+			}
+		}
+	}
+	if currentCount != 1 {
+		t.Fatalf("列表里应恰有一个 current，实际 %d 个", currentCount)
+	}
+	if len(summaries) != len(releasesBefore) {
+		t.Fatalf("列表版本数应保持 %d，实际 %d", len(releasesBefore), len(summaries))
+	}
+}
+
+// TestReleaseAdminRepoRollbackRejectsAgainstRealDB 覆盖三条拒绝分支（Requirement 5.3–5.5）：
+// 缺目标 40401、已 current 40904、跨学期 40905；每条都断言 release 表零变更
+// （行集合与 current 标记都不动）。
+func TestReleaseAdminRepoRollbackRejectsAgainstRealDB(t *testing.T) {
+	cases := []struct {
+		name    string
+		target  string
+		foreign bool // 是否追加另一学期的非 current 版本
+		wantErr error
+	}{
+		{name: "目标不存在", target: "20200101T000000Z", wantErr: ErrReleaseNotFound},
+		{name: "目标已是当前版本", target: releaseAdminCurrentID, wantErr: ErrReleaseNotRollbackable},
+		{name: "目标跨学期", target: releaseAdminRollbackForeignID, foreign: true, wantErr: ErrReleaseTermMismatch},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, pool := openReleaseAdminTestDB(t)
+			seedReleaseAdminFixture(ctx, t, pool)
+			if tc.foreign {
+				seedReleaseAdminForeignTermRelease(ctx, t, pool)
+			}
+			repo := NewReleaseAdminRepo(pool)
+
+			before := releaseAdminReleaseStates(ctx, t, pool)
+			result, err := repo.Rollback(ctx, tc.target)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("期望 %v，实际 %v", tc.wantErr, err)
+			}
+			if result != (RollbackResult{}) {
+				t.Fatalf("拒绝路径必须返回零值结果，实际 %+v", result)
+			}
+			after := releaseAdminReleaseStates(ctx, t, pool)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("拒绝的回退必须让 release 表零变更：拒绝前 %+v，拒绝后 %+v", before, after)
+			}
+		})
+	}
+}
+
+// TestReleaseAdminRepoRollbackNoCurrentAgainstRealDB 覆盖「库中没有当前版本」的 40904：
+// design 把它与「目标已是 current」归为同一个错误码。这里手工清掉 current 标记后回退，
+// 同样断言 release 表零变更。
+func TestReleaseAdminRepoRollbackNoCurrentAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseAdminFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	mustExec(ctx, t, pool, "UPDATE release SET is_current = false WHERE is_current")
+	before := releaseAdminReleaseStates(ctx, t, pool)
+
+	result, err := repo.Rollback(ctx, releaseAdminPreviousID)
+	if !errors.Is(err, ErrReleaseNotRollbackable) {
+		t.Fatalf("没有 current 时应返回 ErrReleaseNotRollbackable，实际 %v", err)
+	}
+	if result != (RollbackResult{}) {
+		t.Fatalf("拒绝路径必须返回零值结果，实际 %+v", result)
+	}
+	if after := releaseAdminReleaseStates(ctx, t, pool); !reflect.DeepEqual(after, before) {
+		t.Fatalf("没有 current 时的回退必须零变更：拒绝前 %+v，拒绝后 %+v", before, after)
+	}
+}
+
+// TestReleaseAdminRepoRollbackConcurrentAgainstRealDB 让两个 goroutine 同时回退同一目标：
+// 恰好一个成功，另一个拿到 40904（目标已被抬成 current 或锁后看不到 current），
+// 或极少数情况下撞上数据库层冲突的 40906；结束后恰有一个 current，且是目标版本。
+//
+// 两个事务的锁序相同（先当前行、再目标行），所以正常情况下不产生死锁：后到者要么在
+// 第一条 SELECT 上等锁、EPQ 重检后发现原 current 已不再是 current，要么直接看到目标
+// 已是 current。两者都落在 ErrReleaseNotRollbackable。
+func TestReleaseAdminRepoRollbackConcurrentAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseAdminFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	releasesBefore := releaseAdminReleaseStates(ctx, t, pool)
+
+	type outcome struct {
+		result RollbackResult
+		err    error
+	}
+	const racers = 2
+	start := make(chan struct{})
+	outcomes := make(chan outcome, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result, err := repo.Rollback(ctx, releaseAdminPreviousID)
+			outcomes <- outcome{result: result, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(outcomes)
+
+	succeeded := 0
+	for got := range outcomes {
+		if got.err == nil {
+			succeeded++
+			if got.result.CurrentReleaseID != releaseAdminPreviousID {
+				t.Fatalf("成功的回退应把 %s 置为 current，实际 %+v", releaseAdminPreviousID, got.result)
+			}
+			continue
+		}
+		if !errors.Is(got.err, ErrReleaseNotRollbackable) && !errors.Is(got.err, ErrReleaseConflict) {
+			t.Fatalf("后到的回退只允许 40904 或 40906，实际 %v", got.err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("两个并发回退应恰好成功一个，实际成功 %d 个", succeeded)
+	}
+
+	if ids := releaseAdminCurrentIDs(ctx, t, pool); !reflect.DeepEqual(ids, []string{releaseAdminPreviousID}) {
+		t.Fatalf("并发回退后应恰有目标版本一个 current，实际 %v", ids)
+	}
+	if after := releaseAdminReleaseStates(ctx, t, pool); len(after) != len(releasesBefore) {
+		t.Fatalf("并发回退不应改变版本行数：并发前 %d，并发后 %d", len(releasesBefore), len(after))
 	}
 }

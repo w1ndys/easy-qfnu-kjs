@@ -88,10 +88,11 @@
 #### Acceptance Criteria
 
 1. WHEN 携带有效会话与正确 CSRF 令牌的请求到达 `POST /api/admin/releases/{release_id}/rollback`，且目标版本存在、`is_current = false`、`term` 与当前版本相同，系统 SHALL 在单个事务内把目标版本置为当前版本、把原当前版本置为非当前版本，并返回 `rolled_back_from`、`current_release_id` 与 `term`。
-2. WHEN 回退事务任一步失败，系统 SHALL 回滚事务、保持原当前版本为当前版本，并返回 HTTP 500 与业务码 `50000`。
-3. WHEN 目标版本不存在，系统 SHALL 返回 HTTP 404 与业务码 `40401`。
-4. WHEN 目标版本已是当前版本、库中没有当前版本，或同一目标的并发回退请求后到，系统 SHALL 返回 HTTP 409 与业务码 `40904`。
-5. WHEN 目标版本与当前版本的 `term` 不同，系统 SHALL 返回 HTTP 409 与业务码 `40905`。
+2. WHEN 回退事务因并发版本变更冲突（SQLSTATE `23505`、`40P01` 或 `40001`）失败，系统 SHALL 回滚事务、保持原当前版本为当前版本，并返回 HTTP 409 与业务码 `40906`，允许调用方重试。
+3. WHEN 回退事务因并发冲突以外的原因失败，系统 SHALL 回滚事务、保持原当前版本为当前版本，并返回 HTTP 500 与业务码 `50000`。
+4. WHEN 目标版本不存在，系统 SHALL 返回 HTTP 404 与业务码 `40401`。
+5. WHEN 目标版本已是当前版本、库中没有当前版本，或同一目标的并发回退请求后到，系统 SHALL 返回 HTTP 409 与业务码 `40904`。
+6. WHEN 目标版本与当前版本的 `term` 不同，系统 SHALL 返回 HTTP 409 与业务码 `40905`。
 
 ### Requirement 6 回退后的可见性与版本保留
 

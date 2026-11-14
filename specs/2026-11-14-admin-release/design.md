@@ -20,7 +20,7 @@ Updated: 2026-11-14
 | D4 | **大节折叠按各版本自己的 `axis_version`**，格状态取块内 `min(state_key)`；块内出现多个 `state_key` 时计入 `inconsistent_blocks`，不静默 | 发布侧按大节计数未知/复合（`publish/build.go:168`），异常视图必须同口径；正常数据块内一致（Requirement 7.6 的展开规则），异常时用 `min` 保证结果确定并把异常暴露给管理员 |
 | D5 | **三类格差异之外，保留房间与归属两个小节**（`section=rooms|buildings`） | PRD 5.4 / 8.3 与原 spec Requirement 24.1 要求「房间新增/消失、归属变化」可查；只在汇总里给计数会让这两类无法定位到房号，因此在同一端点用 `section` 提供两个附加分页小节，默认仍是 `cells` |
 | D6 | **分页用 `limit`/`offset`，`total` 由同一快照的汇总块推导**，明细语句不再算一次 `count(*)` | 与 `/api/query`、`/api/admin/runs` 的既有分页写法一致；汇总已在同一只读事务里算过三类计数，再算一次 count 等于把最重的折叠做第三遍 |
-| D7 | **回退事务锁序固定为「当前版本行 → 目标版本行」**，唯一索引 `release_one_current` 兜底；`40P01` 映射 `40906`，`23505` 映射 `40904` | 发布事务的顺序是 demote 当前（`store/publish.go:215`）→ promote 新版本（`:222`）→ 删更早版本（`:239`）。回退先锁当前行与该顺序对齐，避免「回退持目标等当前、发布持当前等目标」的环；并发下仍可能死锁，交给 40906 让调用方重试 |
+| D7 | **回退事务锁序固定为「当前版本行 → 目标版本行」**，唯一索引 `release_one_current` 兜底；`40P01` 映射 `40906`，`23505` 映射 `40906` | 发布事务的顺序是 demote 当前（`store/publish.go:215`）→ promote 新版本（`:222`）→ 删更早版本（`:239`）。回退先锁当前行与该顺序对齐，避免「回退持目标等当前、发布持当前等目标」的环；并发下仍可能死锁，交给 40906 让调用方重试 |
 | D8 | **回退成功后清公开查询缓存**：`query.Service.Invalidate()` + `query.ScreenService.Invalidate()`，由 `api.WithReleaseAdmin` 的 `invalidate func()` 回调在写响应前调用 | 空教室与全天状态有 30 秒 TTL（`query/cache.go:10`、`:107`），大屏固定 30 秒（`query/screen.go:163`）。不清缓存时回退最多 30 秒后才对访客生效，违背 Requirement 24.3 / 6.1 |
 | D9 | **新增业务码 `40904`（不可回退）、`40905`（跨学期）、`40906`（并发冲突）**；`40401` 复用 `api/admin_runs.go` 的数值但独立常量 | 409 家族已有 `40901`（同步进行中）、`40902`（已初始化）、`40903`（密钥文件已存在）；前端按码分支，不能把三种原因压成一个 |
 | D10 | **不改表、不加索引、不新增迁移** | 既有主键前缀已覆盖全部访问路径：`observation(release_id, room_id, term, week, weekday, node)` 的前缀就是按版本扫描；`axis_node(axis_version, node)` 是主键；`release_room_building(release_id, room_id)` 是主键；`release` 行数上限 2，不需要额外索引 |
@@ -906,6 +906,7 @@ COMMIT;
 
 - 第 3 步的两条 UPDATE 在同一事务内，提交前对外不可见；`release_one_current` 是部分唯一索引，只约束 `is_current = true` 的行，因此「先降后抬」之间零个 current 是允许的。
 - `UPDATE ... AND NOT is_current` 让目标行数必须为 1：0 行说明目标在锁与更新之间被改成 current（并发回退）或被删除，整个事务回滚并按 40904 / 40401 映射。
+- 降 current 那条 UPDATE 同样要求命中 1 行（`UPDATE release SET is_current = false WHERE is_current`）：第 1 步已锁定并判定存在 current，0 行说明内部不变量被破坏，整个事务回滚并映射 50000。
 - 错误映射：SQLSTATE `23505`（`release_one_current` 冲突）→ `ErrReleaseConflict` → 40906；SQLSTATE `40P01`（死锁）与 `40001`（序列化失败，注意与业务码 40001 同名不同域）→ 40906；其余 → 包装 `model.ErrQueryFailed`，api 映射 50000。锁序见 CP8。
 - 回退不写 `collect_run`：轮次记录的是「这一轮发布了哪一版」，回退是管理动作，不改历史。回退后 current 与「生成时间最新」可能不是同一行：列表首条仍是生成时间最新的版本，`is_current` 标在目标版本上。管理端按 `is_current` 判断当前版本，不能假定首条就是当前版本（CP1）。
 - 提交成功后，handler 调 `invalidate`（空教室、全天状态、大屏三处缓存清空），再写 200；失效在响应写出之前完成（CP10）。
