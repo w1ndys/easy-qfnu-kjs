@@ -662,3 +662,428 @@ func TestLoadReleaseDetailScanErrorWraps(t *testing.T) {
 		t.Fatal("失败路径也要关闭行集")
 	}
 }
+
+// releaseDiffQuerierStub 是 releaseDiffQuerier 的替身：按 SQL 常量分派「两侧版本头」
+// 与「汇总」两类单行读，并记下调用顺序与参数。
+//
+// heads 按 release_id 回放：键不存在时回 pgx.ErrNoRows，这样「缺一版」走的是与真实库
+// 完全相同的那条分支，不需要在测试里伪造一个特例。
+type releaseDiffQuerierStub struct {
+	heads   map[string]pgx.Row // 按 release_id 回放版本头；缺键即「这一版不存在」
+	summary pgx.Row            // 汇总单行
+
+	headIDs     []string // 依次收到的版本头参数，用来断言 from 先于 to
+	summaryArgs []any    // 汇总语句收到的参数，顺序为 (from 轴版本, from 版, to 轴版本, to 版)
+	summaryRead bool     // 汇总是否被读过：缺一版时它必须一次都不被读
+}
+
+// QueryRow 按 SQL 常量分派：两侧头与汇总都是单行读。
+func (s *releaseDiffQuerierStub) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	switch sql {
+	case releaseDiffHeadSQL:
+		id, _ := args[0].(string)
+		s.headIDs = append(s.headIDs, id)
+		head, ok := s.heads[id]
+		if !ok {
+			return &releaseAdminRowStub{err: pgx.ErrNoRows}
+		}
+		return head
+	case releaseDiffSummarySQL:
+		s.summaryArgs = append([]any(nil), args...)
+		s.summaryRead = true
+		return s.summary
+	default:
+		panic("未知的单行读语句")
+	}
+}
+
+// releaseDiffTxStub 是 pgx.Tx 的替身：事务体内的单行读转发给查询替身，Rollback 由
+// Diff 的 defer 调用（只读事务也靠它结束快照并归还连接），其余方法嵌入接口、调用
+// 即 panic，避免替身放行被测路径之外的行为。
+type releaseDiffTxStub struct {
+	pgx.Tx
+	querier    *releaseDiffQuerierStub
+	rolledBack bool // Rollback 是否被调用：漏掉收尾会让连接一直占着事务
+}
+
+// QueryRow 转发给查询替身，服务两侧头与汇总。
+func (s *releaseDiffTxStub) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return s.querier.QueryRow(ctx, sql, args...)
+}
+
+// Rollback 记下收尾调用；只读事务不需要提交，回滚与提交等价。
+func (s *releaseDiffTxStub) Rollback(context.Context) error {
+	s.rolledBack = true
+	return nil
+}
+
+// releaseDiffFromSide / releaseDiffToSide 是两侧版本头的夹具。
+//
+// 两侧的每个同类型字段都取不同值（学期、字典版本、轴版本、两个布尔、时刻）：
+// 一旦列序或某一侧被写反，逐字段相等断言就会失败——取同值能让「两侧串了」
+// 照样通过。
+func releaseDiffFromSide() ReleaseSide {
+	return ReleaseSide{
+		ReleaseID:       "20261028T041500Z",
+		Term:            "2026-2027-1",
+		GeneratedAt:     releaseAdminTestNow().Add(-17 * 24 * time.Hour),
+		DictVersion:     1,
+		AxisVersion:     2,
+		IsCurrent:       false,
+		HasAttrConflict: true,
+	}
+}
+
+// releaseDiffToSide 是 to 侧版本头夹具。
+func releaseDiffToSide() ReleaseSide {
+	return ReleaseSide{
+		ReleaseID:       "20261114T030512Z",
+		Term:            "2026-2027-1",
+		GeneratedAt:     releaseAdminTestNow(),
+		DictVersion:     3,
+		AxisVersion:     4,
+		IsCurrent:       true,
+		HasAttrConflict: false,
+	}
+}
+
+// releaseSideRow 把一侧版本头折成一行，列序与 releaseDiffHeadSQL 一致。
+func releaseSideRow(side ReleaseSide) []any {
+	return []any{
+		side.ReleaseID,
+		side.Term,
+		side.GeneratedAt,
+		side.DictVersion,
+		side.AxisVersion,
+		side.IsCurrent,
+		side.HasAttrConflict,
+	}
+}
+
+// releaseDiffSummaryRow 是汇总语句一行的值序列，列序与 releaseDiffSummarySQL 一致。
+func releaseDiffSummaryRow(
+	added int, removed int, changed int, inconsistent int,
+	fromUnknown int, fromComposite int, toUnknown int, toComposite int,
+	roomAdded int, roomRemoved int, roomShared int, roomBuildingChanged int,
+) []any {
+	return []any{
+		added, removed, changed, inconsistent,
+		fromUnknown, fromComposite, toUnknown, toComposite,
+		roomAdded, roomRemoved, roomShared, roomBuildingChanged,
+	}
+}
+
+// TestReleaseDiffSQLClauses 锁定折叠 CTE 与汇总语句的口径：
+// 两侧各按自己的 axis_version 折叠、键是四元组、min/max 判块内一致、汇总一条语句、
+// 未知/复合按格计数、归属变化只在两侧都存在时才算。
+func TestReleaseDiffSQLClauses(t *testing.T) {
+	foldClauses := []string{
+		// 两侧各用自己版本的轴折叠：轴改版后同一个 node 可能落到不同 block。
+		"JOIN axis_node an ON an.axis_version = $1 AND an.node = o.node",
+		"JOIN axis_node an ON an.axis_version = $3 AND an.node = o.node",
+		"WHERE o.release_id = $2",
+		"WHERE o.release_id = $4",
+		// 折叠键是 (room_id, week, weekday, block)，min 决定格状态、max 判块内一致。
+		"min(o.state_key) AS state_key",
+		"max(o.state_key) AS max_state",
+		"GROUP BY o.room_id, o.week, o.weekday, an.block",
+		"FULL JOIN t USING (room_id, week, weekday, block)",
+		// 两侧任一出现块内多状态都算不一致（不是只看一侧）。
+		"f.max_state <> f.state_key",
+		"t.max_state <> t.state_key",
+	}
+	for _, clause := range foldClauses {
+		if !strings.Contains(releaseDiffFoldCTE, clause) {
+			t.Fatalf("折叠 CTE 缺少 %q:\n%s", clause, releaseDiffFoldCTE)
+		}
+	}
+	if got := strings.Count(releaseDiffFoldCTE, "GROUP BY o.room_id, o.week, o.weekday, an.block"); got != 2 {
+		t.Fatalf("两侧各折叠一次，GROUP BY 应出现 2 次，实际 %d 次:\n%s", got, releaseDiffFoldCTE)
+	}
+
+	// 汇总必须复用同一段折叠，否则汇总与明细会在两套口径上各算一遍。
+	if !strings.HasPrefix(releaseDiffSummarySQL, releaseDiffFoldCTE) {
+		t.Fatal("汇总语句必须以同一段折叠 CTE 开头")
+	}
+	summaryClauses := []string{
+		"count(*) FILTER (WHERE kind = 'added')",
+		"count(*) FILTER (WHERE kind = 'removed')",
+		"count(*) FILTER (WHERE kind = 'changed')",
+		"count(*) FILTER (WHERE inconsistent)",
+		"state_key = 'unknown'",
+		"state_key = 'composite'",
+		"UNION ALL", // 两侧状态只扫一遍
+		"FROM rf FULL JOIN rt USING (room_id)",
+		"rf.building_id <> rt.building_id",
+		"FROM cells CROSS JOIN states CROSS JOIN rooms",
+	}
+	for _, clause := range summaryClauses {
+		if !strings.Contains(releaseDiffSummarySQL, clause) {
+			t.Fatalf("汇总 SQL 缺少 %q:\n%s", clause, releaseDiffSummarySQL)
+		}
+	}
+	// 两侧各只折叠一次：折叠是最重的一段，重复出现说明又扫了一遍 87 万行。
+	if got := strings.Count(releaseDiffSummarySQL, "FROM observation o"); got != 2 {
+		t.Fatalf("两侧各折叠一次，观测扫描应出现 2 次，实际 %d 次:\n%s", got, releaseDiffSummarySQL)
+	}
+	// 汇总是一条语句（供 QueryRow 单行读），不带分页（分页属第 3 项）。
+	if strings.Contains(releaseDiffSummarySQL, ";") {
+		t.Fatalf("汇总必须是单条语句，不能带分号:\n%s", releaseDiffSummarySQL)
+	}
+	if got := strings.Count(releaseDiffSummarySQL, "\nSELECT "); got != 1 {
+		t.Fatalf("汇总只应有一个顶层 SELECT，实际 %d 个:\n%s", got, releaseDiffSummarySQL)
+	}
+	if strings.Contains(releaseDiffSummarySQL, "LIMIT") || strings.Contains(releaseDiffSummarySQL, "OFFSET") {
+		t.Fatalf("汇总不分页，不应带 LIMIT/OFFSET:\n%s", releaseDiffSummarySQL)
+	}
+	// same_term 是版本头的事实，由 Go 侧比较两个 term，不在汇总 SQL 里判。
+	if strings.Contains(releaseDiffSummarySQL, "same_term") {
+		t.Fatalf("same_term 不应出现在汇总 SQL 里:\n%s", releaseDiffSummarySQL)
+	}
+}
+
+// TestReleaseAdminRepoDiffOpensRepeatableReadReadOnlyTx 覆盖对比的事务外观：
+// REPEATABLE READ 让两侧头与汇总看同一快照（CP7），READ ONLY 让误写直接失败（CP2）；
+// 顺序固定为「from 头 → to 头 → 汇总」，汇总参数取自读回的头而不是外部入参，
+// 结束后 Rollback 收尾。
+func TestReleaseAdminRepoDiffOpensRepeatableReadReadOnlyTx(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary: &releaseAdminRowStub{values: releaseDiffSummaryRow(
+			1, 2, 3, 1, 4, 5, 6, 7, 8, 9, 10, 11)},
+	}
+	tx := &releaseDiffTxStub{querier: querier}
+	pool := &releaseAdminPoolStub{tx: tx}
+	repo := NewReleaseAdminRepo(pool)
+
+	diff, err := repo.Diff(context.Background(), ReleaseDiffParams{
+		From: from.ReleaseID,
+		To:   to.ReleaseID,
+	})
+	if err != nil {
+		t.Fatalf("对比两版失败: %v", err)
+	}
+	if !reflect.DeepEqual(diff.From, from) || !reflect.DeepEqual(diff.To, to) {
+		t.Fatalf("两侧头扫描不符: got %+v / %+v want %+v / %+v", diff.From, diff.To, from, to)
+	}
+	if fmt.Sprint(querier.headIDs) != fmt.Sprint([]string{from.ReleaseID, to.ReleaseID}) {
+		t.Fatalf("必须先读 from 头、再读 to 头，实际 %v", querier.headIDs)
+	}
+
+	wantArgs := []any{from.AxisVersion, from.ReleaseID, to.AxisVersion, to.ReleaseID}
+	if fmt.Sprint(querier.summaryArgs) != fmt.Sprint(wantArgs) {
+		t.Fatalf("汇总参数应取自两侧头（轴版本, 版本, 轴版本, 版本），got %v want %v",
+			querier.summaryArgs, wantArgs)
+	}
+
+	if pool.txOptions.IsoLevel != pgx.RepeatableRead {
+		t.Fatalf("对比事务隔离级别应为 REPEATABLE READ，实际 %v", pool.txOptions.IsoLevel)
+	}
+	if pool.txOptions.AccessMode != pgx.ReadOnly {
+		t.Fatalf("对比事务应为 READ ONLY，实际 %v", pool.txOptions.AccessMode)
+	}
+	if !tx.rolledBack {
+		t.Fatal("对比事务结束后必须 Rollback 收尾")
+	}
+}
+
+// TestLoadReleaseDiffSummaryComposition 覆盖汇总的拼装：
+// 12 列逐列落到对的位置、total 是三类之和、delta = to - from、same_term 由两个头比出。
+func TestLoadReleaseDiffSummaryComposition(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary: &releaseAdminRowStub{values: releaseDiffSummaryRow(
+			1, 2, 3, 1, // cells: added / removed / changed / inconsistent_blocks
+			4, 5, 6, 7, // unknown: from / to，composite: from / to
+			8, 9, 10, 11, // rooms: added / removed / shared / building_changed
+		)},
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID,
+		To:   to.ReleaseID,
+	})
+	if err != nil {
+		t.Fatalf("对比失败: %v", err)
+	}
+
+	want := ReleaseDiffSummary{
+		Cells:              DiffCellsSummary{Added: 1, Removed: 2, Changed: 3, Total: 6},
+		Rooms:              DiffRoomsSummary{Added: 8, Removed: 9, Shared: 10, BuildingChanged: 11},
+		Unknown:            StateDelta{From: 4, To: 6, Delta: 2},
+		Composite:          StateDelta{From: 5, To: 7, Delta: 2},
+		InconsistentBlocks: 1,
+		SameTerm:           true,
+	}
+	if diff.Summary != want {
+		t.Fatalf("汇总拼装不符:\n got %+v\nwant %+v", diff.Summary, want)
+	}
+	if !querier.summaryRead {
+		t.Fatal("两侧头都读到后必须读汇总")
+	}
+}
+
+// TestLoadReleaseDiffDifferentTermKeepsDiff 覆盖不同 term 的两版：same_term=false，
+// 差异照常给出（Requirement 3.4），delta 由各侧计数算出。
+func TestLoadReleaseDiffDifferentTermKeepsDiff(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	to.Term = "2025-2026-2" // 跨学期
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary: &releaseAdminRowStub{values: releaseDiffSummaryRow(
+			3, 0, 5, 0, 12, 51, 0, 48, 1, 2, 30, 4)},
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID,
+		To:   to.ReleaseID,
+	})
+	if err != nil {
+		t.Fatalf("跨学期对比不应报错: %v", err)
+	}
+	if diff.Summary.SameTerm {
+		t.Fatal("两侧 term 不同时 same_term 应为 false")
+	}
+	if diff.Summary.Cells != (DiffCellsSummary{Added: 3, Removed: 0, Changed: 5, Total: 8}) {
+		t.Fatalf("跨学期也要照常给差异: %+v", diff.Summary.Cells)
+	}
+	if diff.Summary.Unknown != (StateDelta{From: 12, To: 0, Delta: -12}) {
+		t.Fatalf("unknown 计数不符: %+v", diff.Summary.Unknown)
+	}
+	if diff.Summary.Composite != (StateDelta{From: 51, To: 48, Delta: -3}) {
+		t.Fatalf("composite 计数不符: %+v", diff.Summary.Composite)
+	}
+}
+
+// TestLoadReleaseDiffMissingSideReturnsNotFound 覆盖缺一版：分别点名 from / to，
+// 返回包着 ErrReleaseNotFound 的错误、零值结果，并且不再读汇总（省一次全量折叠）。
+func TestLoadReleaseDiffMissingSideReturnsNotFound(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+
+	cases := []struct {
+		name     string
+		heads    map[string]pgx.Row
+		params   ReleaseDiffParams
+		wantSide string
+		wantID   string
+	}{
+		{
+			name: "缺 from",
+			heads: map[string]pgx.Row{
+				to.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(to)},
+			},
+			params:   ReleaseDiffParams{From: from.ReleaseID, To: to.ReleaseID},
+			wantSide: "from",
+			wantID:   from.ReleaseID,
+		},
+		{
+			name: "缺 to",
+			heads: map[string]pgx.Row{
+				from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			},
+			params:   ReleaseDiffParams{From: from.ReleaseID, To: to.ReleaseID},
+			wantSide: "to",
+			wantID:   to.ReleaseID,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			querier := &releaseDiffQuerierStub{heads: testCase.heads}
+			diff, err := loadReleaseDiff(context.Background(), querier, testCase.params)
+			if !errors.Is(err, ErrReleaseNotFound) {
+				t.Fatalf("期望 ErrReleaseNotFound，实际 err=%v", err)
+			}
+			if !strings.Contains(err.Error(), testCase.wantSide) ||
+				!strings.Contains(err.Error(), testCase.wantID) {
+				t.Fatalf("错误消息应点名 %s 侧与版本 %s，实际 %q",
+					testCase.wantSide, testCase.wantID, err)
+			}
+			if !reflect.DeepEqual(diff, ReleaseDiff{}) {
+				t.Fatalf("缺一版时应返回零值，实际 %+v", diff)
+			}
+			if querier.summaryRead {
+				t.Fatal("缺一版时不应再读汇总")
+			}
+		})
+	}
+}
+
+// TestReleaseAdminRepoDiffBeginTxError 覆盖事务开不起来：包 model.ErrQueryFailed。
+func TestReleaseAdminRepoDiffBeginTxError(t *testing.T) {
+	repo := NewReleaseAdminRepo(&releaseAdminPoolStub{beginErr: errors.New("连接池耗尽")})
+
+	diff, err := repo.Diff(context.Background(), ReleaseDiffParams{
+		From: "20261028T041500Z",
+		To:   "20261114T030512Z",
+	})
+	if !errors.Is(err, model.ErrQueryFailed) {
+		t.Fatalf("期望包装 model.ErrQueryFailed，实际 err=%v", err)
+	}
+	if !reflect.DeepEqual(diff, ReleaseDiff{}) {
+		t.Fatalf("失败时应返回零值，实际 %+v", diff)
+	}
+}
+
+// TestReleaseAdminRepoDiffHeadQueryErrorWraps 覆盖读版本头时的库错误：
+// 包 model.ErrQueryFailed，且不是 ErrReleaseNotFound（缺版本与读库故障不能混）。
+func TestReleaseAdminRepoDiffHeadQueryErrorWraps(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{err: errors.New("连接断了")},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID,
+		To:   to.ReleaseID,
+	})
+	if !errors.Is(err, model.ErrQueryFailed) {
+		t.Fatalf("期望包装 model.ErrQueryFailed，实际 err=%v", err)
+	}
+	if errors.Is(err, ErrReleaseNotFound) {
+		t.Fatalf("读库故障不能报成版本不存在: %v", err)
+	}
+	if !reflect.DeepEqual(diff, ReleaseDiff{}) {
+		t.Fatalf("失败时应返回零值，实际 %+v", diff)
+	}
+	if querier.summaryRead {
+		t.Fatal("头都读不出来时不应再读汇总")
+	}
+}
+
+// TestReleaseAdminRepoDiffSummaryScanErrorWraps 覆盖汇总扫描失败：
+// 包 model.ErrQueryFailed 且不返回半份汇总。
+func TestReleaseAdminRepoDiffSummaryScanErrorWraps(t *testing.T) {
+	from, to := releaseDiffFromSide(), releaseDiffToSide()
+	querier := &releaseDiffQuerierStub{
+		heads: map[string]pgx.Row{
+			from.ReleaseID: &releaseAdminRowStub{values: releaseSideRow(from)},
+			to.ReleaseID:   &releaseAdminRowStub{values: releaseSideRow(to)},
+		},
+		summary: &releaseAdminRowStub{err: errors.New("列不可解")},
+	}
+
+	diff, err := loadReleaseDiff(context.Background(), querier, ReleaseDiffParams{
+		From: from.ReleaseID,
+		To:   to.ReleaseID,
+	})
+	if !errors.Is(err, model.ErrQueryFailed) {
+		t.Fatalf("期望包装 model.ErrQueryFailed，实际 err=%v", err)
+	}
+	if !reflect.DeepEqual(diff, ReleaseDiff{}) {
+		t.Fatalf("失败时应返回零值，实际 %+v", diff)
+	}
+}

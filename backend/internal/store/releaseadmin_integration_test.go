@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -384,5 +386,503 @@ VALUES ($1, $2, $3, 1, 1, false)`,
 	}
 	if empty.Stats != (ReleaseStats{}) || empty.Release.ObservationRows != 0 || empty.Release.WeekCount != 0 {
 		t.Fatalf("空版本 stats 应全零: %+v", empty)
+	}
+}
+
+// 对比汇总集成用例的标识与学期。版本 id 形状与 publish 的真实版本一致，但仓储把
+// 它当不透明主键，不在这里解析。
+const (
+	releaseDiffTerm      = "2026-2027-1"
+	releaseDiffOtherTerm = "2025-2026-2"
+	releaseDiffFromID    = "20261001T000000Z" // 对比基准（旧版本）
+	releaseDiffToID      = "20261015T030512Z" // 对比目标（新版本，current）
+	releaseDiffMissingID = "20990101T000000Z" // 库里不存在的版本
+)
+
+// releaseDiffCellSeed 是一条观测种子：nodes 里的每个小节各写一行，共用同一状态。
+//
+// 同一个 (房号, 周, 星期, 大节) 可以有多条种子（见下面 r205 的 to 侧），它们在库里
+// 折叠成一个格——那正是「块内不一致」夹具的造法，不必写一条专门的 SQL。
+type releaseDiffCellSeed struct {
+	releaseID string
+	roomID    string
+	week      int
+	weekday   int
+	nodes     []string
+	stateKey  string
+}
+
+// releaseDiffRoomSeed 是归属快照的一行：房号与它在该版本的楼。
+type releaseDiffRoomSeed struct {
+	roomID       string
+	buildingID   string
+	buildingName string
+}
+
+// releaseDiffFixtureCells 是两版夹具的全部观测，覆盖五类差异与两侧各一个块内不一致的格。
+//
+// 手工折叠（按 (房号, 周, 星期, 大节)）：
+//   - r201 第 9 周 0102：两侧 free → 未变格；
+//   - r202 第 9 周 0102：只在 from → 消失格；
+//   - r203 第 9 周 0102：from free、to class → 状态变化；
+//   - r204 第 9 周 0102：两侧 free → 未变格（这间房换了楼，属归属变化，不是格变化）；
+//   - r205 第 9 周 0607：from 06/07 都 free、to 06 free + 07 class → 状态变化，
+//     且 to 侧块内出现两个 state_key（min 取 class）→ 计入 inconsistent_blocks；
+//   - r206 第 9 周 0102：只在 from → 消失格；
+//   - r207 第 9 周 0809：from unknown、to free → 状态变化，unknown 由 1 变 0；
+//   - r208 第 9 周 0809：只在 to，状态 composite → 新增格，composite 由 0 变 1；
+//   - r209 第 9 周 0102：两侧 free → 未变格；
+//   - r209 第 10 周 0102：from class、to free → 状态变化（周在键里，第 9 周不受影响）；
+//   - r201 第 11 周 0102：from 01 free + 02 class、to 01/02 都 class → 两侧折叠后的
+//     state_key 都是 class（未变格），只有 from 侧块内不一致。这一格钉住
+//     inconsistent 取自「from 或 to」两侧的并集 OR，而不是只看 to 侧。
+//
+// 于是并集 11 个格：added 1 / removed 2 / changed 4 / same 4，unknown 1→0，
+// composite 0→1，inconsistent_blocks 2；cells.total 是前三类之和 7，不含 same。
+func releaseDiffFixtureCells() []releaseDiffCellSeed {
+	return []releaseDiffCellSeed{
+		// from 侧
+		{releaseDiffFromID, "r201", 9, 1, []string{"01", "02"}, "free"},
+		{releaseDiffFromID, "r202", 9, 1, []string{"01", "02"}, "free"},
+		{releaseDiffFromID, "r203", 9, 1, []string{"01", "02"}, "free"},
+		{releaseDiffFromID, "r204", 9, 1, []string{"01", "02"}, "free"},
+		{releaseDiffFromID, "r205", 9, 1, []string{"06", "07"}, "free"},
+		{releaseDiffFromID, "r206", 9, 1, []string{"01", "02"}, "free"},
+		{releaseDiffFromID, "r207", 9, 1, []string{"08", "09"}, "unknown"},
+		{releaseDiffFromID, "r209", 9, 1, []string{"01", "02"}, "free"},
+		{releaseDiffFromID, "r209", 10, 1, []string{"01", "02"}, "class"},
+		// 第 11 周这一格的 from 侧两行状态不同：折叠后 state_key = min = class，
+		// max = free ≠ min，于是这一格计入 inconsistent_blocks（to 侧折成同一个
+		// class，kind 是 same——不一致与「状态是否变化」是两件事）。
+		{releaseDiffFromID, "r201", 11, 1, []string{"01"}, "free"},
+		{releaseDiffFromID, "r201", 11, 1, []string{"02"}, "class"},
+
+		// to 侧
+		{releaseDiffToID, "r201", 9, 1, []string{"01", "02"}, "free"},
+		{releaseDiffToID, "r203", 9, 1, []string{"01", "02"}, "class"},
+		{releaseDiffToID, "r204", 9, 1, []string{"01", "02"}, "free"},
+		// 同一个格的两行状态不同：折叠后 state_key = min('class','free') = class，
+		// max = free ≠ min，这一格计入 inconsistent_blocks。
+		{releaseDiffToID, "r205", 9, 1, []string{"06"}, "free"},
+		{releaseDiffToID, "r205", 9, 1, []string{"07"}, "class"},
+		{releaseDiffToID, "r207", 9, 1, []string{"08", "09"}, "free"},
+		{releaseDiffToID, "r208", 9, 1, []string{"08", "09"}, "composite"},
+		{releaseDiffToID, "r209", 9, 1, []string{"01", "02"}, "free"},
+		{releaseDiffToID, "r209", 10, 1, []string{"01", "02"}, "free"},
+		// 与 from 侧 r201 第 11 周那一格折叠后同为 class，to 侧本身一致（min = max）。
+		{releaseDiffToID, "r201", 11, 1, []string{"01", "02"}, "class"},
+	}
+}
+
+// releaseDiffFixtureRooms 是两版归属快照，覆盖房号新增 / 消失 / 保留 / 换楼：
+//   - from：r201 r202 r203 r204 r205 r206 r207 r209（8 间）；
+//   - to：  r201 r203 r204 r205 r207 r208 r209（7 间，r204 从 Q10 换到 Q03）。
+//
+// 于是 rooms = added 1（r208）/ removed 2（r202、r206）/ shared 6 / building_changed 1。
+func releaseDiffFixtureRooms() map[string][]releaseDiffRoomSeed {
+	return map[string][]releaseDiffRoomSeed{
+		releaseDiffFromID: {
+			{"r201", "Q10", "综合教学楼"},
+			{"r202", "Q10", "综合教学楼"},
+			{"r203", "Q10", "综合教学楼"},
+			{"r204", "Q10", "综合教学楼"},
+			{"r205", "Q10", "综合教学楼"},
+			{"r206", "Q03", "老文史楼"},
+			{"r207", "Q03", "老文史楼"},
+			{"r209", "Q10", "综合教学楼"},
+		},
+		releaseDiffToID: {
+			{"r201", "Q10", "综合教学楼"},
+			{"r203", "Q10", "综合教学楼"},
+			{"r204", "Q03", "老文史楼"}, // 归属变化
+			{"r205", "Q10", "综合教学楼"},
+			{"r207", "Q03", "老文史楼"},
+			{"r208", "Q10", "综合教学楼"}, // 新增房号
+			{"r209", "Q10", "综合教学楼"},
+		},
+	}
+}
+
+// seedReleaseDiffFixture 铺对比夹具：学期、教室目录、两个版本（to 为 current）与
+// 各自的归属快照和观测。字典 v1 与轴 v1 直接用基线种子。
+func seedReleaseDiffFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+
+	mustExec(ctx, t, pool, "INSERT INTO term (term, total_weeks) VALUES ($1, 20)", releaseDiffTerm)
+
+	mustExec(ctx, t, pool, `
+INSERT INTO room (room_id, name, name_raw, building_id, building_name)
+VALUES ('r201', 'F201', 'F201', 'Q10', '综合教学楼'),
+       ('r202', 'F202', 'F202', 'Q10', '综合教学楼'),
+       ('r203', 'F203', 'F203', 'Q10', '综合教学楼'),
+       ('r204', 'F204', 'F204', 'Q10', '综合教学楼'),
+       ('r205', 'F205', 'F205', 'Q10', '综合教学楼'),
+       ('r206', 'JA101', 'JA101', 'Q03', '老文史楼'),
+       ('r207', 'JA102', 'JA102', 'Q03', '老文史楼'),
+       ('r208', 'F208', 'F208', 'Q10', '综合教学楼'),
+       ('r209', 'F209', 'F209', 'Q10', '综合教学楼')`)
+
+	// 两个版本：from 带归属冲突标记且非 current；to 为 current。
+	mustExec(ctx, t, pool, `
+INSERT INTO release (release_id, term, generated_at, dict_version, axis_version, has_attr_conflict, is_current)
+VALUES ($1, $2, $3, 1, 1, true, false),
+       ($4, $2, $5, 1, 1, false, true)`,
+		releaseDiffFromID, releaseDiffTerm,
+		mustParseReleaseAdminTime(t, "2026-10-01T00:00:00Z"),
+		releaseDiffToID, mustParseReleaseAdminTime(t, "2026-10-15T03:05:12Z"))
+
+	for releaseID, rooms := range releaseDiffFixtureRooms() {
+		for _, room := range rooms {
+			mustExec(ctx, t, pool, `
+INSERT INTO release_room_building (release_id, room_id, building_id, building_name)
+VALUES ($1, $2, $3, $4)`,
+				releaseID, room.roomID, room.buildingID, room.buildingName)
+		}
+	}
+
+	for _, seed := range releaseDiffFixtureCells() {
+		for _, node := range seed.nodes {
+			mustExec(ctx, t, pool, `
+INSERT INTO observation (release_id, room_id, term, week, weekday, node, state_key, available)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+				seed.releaseID, seed.roomID, releaseDiffTerm, seed.week, seed.weekday,
+				node, seed.stateKey, seed.stateKey == "free")
+		}
+	}
+}
+
+// TestReleaseAdminRepoDiffAgainstRealDB 覆盖对比汇总的真实库口径（Requirement 3.1–3.4）：
+// 五类差异逐项断言计数、折叠 CTE 的并集逐格计数（含 same）、两侧各一个块内不一致的
+// 格都计一次且取 min、交换 from/to 断言 CP5、同一请求两次结果一致、
+// 缺一版返回 ErrReleaseNotFound。
+func TestReleaseAdminRepoDiffAgainstRealDB(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseDiffFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	diff, err := repo.Diff(ctx, ReleaseDiffParams{From: releaseDiffFromID, To: releaseDiffToID})
+	if err != nil {
+		t.Fatalf("对比两版失败: %v", err)
+	}
+
+	// 两侧版本头：身份、折叠口径与状态标记都来自 release 行。
+	if diff.From.ReleaseID != releaseDiffFromID || diff.From.Term != releaseDiffTerm ||
+		diff.From.DictVersion != 1 || diff.From.AxisVersion != 1 ||
+		diff.From.IsCurrent || !diff.From.HasAttrConflict {
+		t.Fatalf("from 侧版本头不符: %+v", diff.From)
+	}
+	if diff.To.ReleaseID != releaseDiffToID || diff.To.Term != releaseDiffTerm ||
+		diff.To.DictVersion != 1 || diff.To.AxisVersion != 1 ||
+		!diff.To.IsCurrent || diff.To.HasAttrConflict {
+		t.Fatalf("to 侧版本头不符: %+v", diff.To)
+	}
+
+	want := ReleaseDiffSummary{
+		Cells:              DiffCellsSummary{Added: 1, Removed: 2, Changed: 4, Total: 7},
+		Rooms:              DiffRoomsSummary{Added: 1, Removed: 2, Shared: 6, BuildingChanged: 1},
+		Unknown:            StateDelta{From: 1, To: 0, Delta: -1},
+		Composite:          StateDelta{From: 0, To: 1, Delta: 1},
+		InconsistentBlocks: 2,
+		SameTerm:           true,
+	}
+	if diff.Summary != want {
+		t.Fatalf("汇总不符:\n got %+v\nwant %+v", diff.Summary, want)
+	}
+
+	// 折叠 CTE 的逐格计数：并集 11 行，四种 kind 各数一遍。'same' 必须真的被数到
+	// （4 个），否则「未变格」只写在注释里、没进断言；inconsistent 数 2，钉住它取
+	// from / to 两侧的并集 OR，而不是只看 to 侧。
+	var foldedCounts struct {
+		total, same, added, removed, changed, inconsistent int
+	}
+	err = pool.QueryRow(ctx, releaseDiffFoldCTE+`
+SELECT count(*),
+       count(*) FILTER (WHERE kind = 'same'),
+       count(*) FILTER (WHERE kind = 'added'),
+       count(*) FILTER (WHERE kind = 'removed'),
+       count(*) FILTER (WHERE kind = 'changed'),
+       count(*) FILTER (WHERE inconsistent)
+  FROM j`,
+		1, releaseDiffFromID, 1, releaseDiffToID).
+		Scan(&foldedCounts.total, &foldedCounts.same, &foldedCounts.added,
+			&foldedCounts.removed, &foldedCounts.changed, &foldedCounts.inconsistent)
+	if err != nil {
+		t.Fatalf("数折叠后的格失败: %v", err)
+	}
+	wantFolded := struct {
+		total, same, added, removed, changed, inconsistent int
+	}{11, 4, 1, 2, 4, 2}
+	if foldedCounts != wantFolded {
+		t.Fatalf("折叠后的逐格计数不符:\n got %+v\nwant %+v", foldedCounts, wantFolded)
+	}
+
+	// to 侧块内不一致的格 r205/第 9 周/0607：折叠后取 min(state_key)=class，max 仍是
+	// free —— 这条断言直接跑生产用的折叠 CTE，锁住「min 决定格状态、max 用来标记异常」
+	// 的口径。
+	var foldedTo struct {
+		kind         string
+		inconsistent bool
+		stateKey     string
+		maxState     string
+	}
+	err = pool.QueryRow(ctx, releaseDiffFoldCTE+`
+SELECT j.kind, j.inconsistent, t.state_key, t.max_state
+  FROM j
+  JOIN t USING (room_id, week, weekday, block)
+ WHERE j.room_id = $5 AND j.week = 9 AND j.weekday = 1 AND j.block = '0607'`,
+		1, releaseDiffFromID, 1, releaseDiffToID, "r205").
+		Scan(&foldedTo.kind, &foldedTo.inconsistent, &foldedTo.stateKey, &foldedTo.maxState)
+	if err != nil {
+		t.Fatalf("读折叠后的 to 侧格失败: %v", err)
+	}
+	if foldedTo.kind != "changed" || !foldedTo.inconsistent ||
+		foldedTo.stateKey != "class" || foldedTo.maxState != "free" {
+		t.Fatalf("to 侧块内不一致的格应为 changed、inconsistent、min=class、max=free，实际 %+v", foldedTo)
+	}
+
+	// from 侧块内不一致的格 r201/第 11 周/0102：to 侧一致，两侧折叠后同为 class，所以
+	// kind 是 same 但 inconsistent 仍为 true——不一致只由 from 侧的 max ≠ min 触发，
+	// 这就是并集 OR 的左半边。
+	var foldedFrom struct {
+		kind         string
+		inconsistent bool
+		stateKey     string
+		maxState     string
+	}
+	err = pool.QueryRow(ctx, releaseDiffFoldCTE+`
+SELECT j.kind, j.inconsistent, f.state_key, f.max_state
+  FROM j
+  JOIN f USING (room_id, week, weekday, block)
+ WHERE j.room_id = $5 AND j.week = 11 AND j.weekday = 1 AND j.block = '0102'`,
+		1, releaseDiffFromID, 1, releaseDiffToID, "r201").
+		Scan(&foldedFrom.kind, &foldedFrom.inconsistent, &foldedFrom.stateKey, &foldedFrom.maxState)
+	if err != nil {
+		t.Fatalf("读折叠后的 from 侧格失败: %v", err)
+	}
+	if foldedFrom.kind != "same" || !foldedFrom.inconsistent ||
+		foldedFrom.stateKey != "class" || foldedFrom.maxState != "free" {
+		t.Fatalf("from 侧块内不一致的格应为 same、inconsistent、min=class、max=free，实际 %+v", foldedFrom)
+	}
+
+	// 同一请求再执行一次：计数完全一致（排序与聚合的确定性，CP6 的前置）。
+	again, err := repo.Diff(ctx, ReleaseDiffParams{From: releaseDiffFromID, To: releaseDiffToID})
+	if err != nil {
+		t.Fatalf("第二次对比失败: %v", err)
+	}
+	if again.Summary != want {
+		t.Fatalf("同一数据两次对比的汇总必须一致:\n got %+v\nwant %+v", again.Summary, want)
+	}
+
+	// 交换 from / to（CP5）：added 与 removed 互换、changed 不变、unknown/composite
+	// 两侧互换且 delta 取反、rooms 的 added/removed 互换、shared 与 building_changed
+	// 不变、inconsistent_blocks 与 same_term 不变。
+	swapped, err := repo.Diff(ctx, ReleaseDiffParams{From: releaseDiffToID, To: releaseDiffFromID})
+	if err != nil {
+		t.Fatalf("交换两侧后对比失败: %v", err)
+	}
+	wantSwapped := ReleaseDiffSummary{
+		Cells:              DiffCellsSummary{Added: 2, Removed: 1, Changed: 4, Total: 7},
+		Rooms:              DiffRoomsSummary{Added: 2, Removed: 1, Shared: 6, BuildingChanged: 1},
+		Unknown:            StateDelta{From: 0, To: 1, Delta: 1},
+		Composite:          StateDelta{From: 1, To: 0, Delta: -1},
+		InconsistentBlocks: 2,
+		SameTerm:           true,
+	}
+	if swapped.Summary != wantSwapped {
+		t.Fatalf("交换两侧后的汇总不符:\n got %+v\nwant %+v", swapped.Summary, wantSwapped)
+	}
+	if swapped.From.ReleaseID != releaseDiffToID || swapped.To.ReleaseID != releaseDiffFromID {
+		t.Fatalf("交换两侧后版本头也应互换: %+v / %+v", swapped.From, swapped.To)
+	}
+}
+
+// TestReleaseAdminRepoDiffCrossTermAndAxis 覆盖两件「照常比较」的事：
+//   - 不同 term 的两版 same_term=false，差异照常给出（Requirement 3.4）；
+//   - 两版 axis_version 不同时仍按 block 编码比较：轴 v2 把小节 05 单独成块 '0304'，
+//     于是同一格在两侧落到不同 block（added 1 + removed 1），而不是被某一边的轴
+//     版本折成同一个格。
+func TestReleaseAdminRepoDiffCrossTermAndAxis(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+
+	mustExec(ctx, t, pool, `
+INSERT INTO term (term, total_weeks) VALUES ($1, 20), ($2, 20)`,
+		releaseDiffTerm, releaseDiffOtherTerm)
+
+	// 轴 v2 与 v1 的唯一差别：小节 05 单独成块 '0304'（v1 里它与 03/04 同块 030405）。
+	mustExec(ctx, t, pool, "INSERT INTO axis (version, note) VALUES (2, '夹具轴：05 单独成块')")
+	mustExec(ctx, t, pool, `
+INSERT INTO axis_node (axis_version, node, ordinal, block, block_ordinal) VALUES
+  (2, '01', 1,  '0102',    1),
+  (2, '02', 2,  '0102',    1),
+  (2, '03', 3,  '030405',  2),
+  (2, '04', 4,  '030405',  2),
+  (2, '05', 5,  '0304',    2),
+  (2, '06', 6,  '0607',    3),
+  (2, '07', 7,  '0607',    3),
+  (2, '08', 8,  '0809',    4),
+  (2, '09', 9,  '0809',    4),
+  (2, '10', 10, '101112',  5),
+  (2, '11', 11, '101112',  5),
+  (2, '12', 12, '101112',  5)`)
+
+	mustExec(ctx, t, pool, `
+INSERT INTO room (room_id, name, name_raw, building_id, building_name)
+VALUES ('r210', 'F210', 'F210', 'Q10', '综合教学楼'),
+       ('r211', 'F211', 'F211', 'Q10', '综合教学楼')`)
+
+	// 三个版本：F 与 D 同学期不同轴；C 另一学期同轴。
+	const (
+		crossTermID = "20260920T000000Z"
+		crossAxisID = "20261005T000000Z"
+	)
+	mustExec(ctx, t, pool, `
+INSERT INTO release (release_id, term, generated_at, dict_version, axis_version, has_attr_conflict, is_current)
+VALUES ($1, $2, $3, 1, 1, false, true),
+       ($4, $2, $5, 1, 2, false, false),
+       ($6, $7, $8, 1, 1, false, false)`,
+		releaseDiffFromID, releaseDiffTerm,
+		mustParseReleaseAdminTime(t, "2026-10-01T00:00:00Z"),
+		crossAxisID, mustParseReleaseAdminTime(t, "2026-10-05T00:00:00Z"),
+		crossTermID, releaseDiffOtherTerm,
+		mustParseReleaseAdminTime(t, "2026-09-20T00:00:00Z"))
+
+	// 三版同样的两格：r210 的 01/02（v1 与 v2 都折成 0102）与 r211 的 05
+	// （v1 → 030405，v2 → 0304）。C 只有 r210 变成 class。
+	for _, releaseID := range []string{releaseDiffFromID, crossAxisID, crossTermID} {
+		mustExec(ctx, t, pool, `
+INSERT INTO release_room_building (release_id, room_id, building_id, building_name)
+VALUES ($1, 'r210', 'Q10', '综合教学楼'),
+       ($1, 'r211', 'Q10', '综合教学楼')`, releaseID)
+	}
+
+	stateOf := func(releaseID string) map[string]string {
+		if releaseID == crossTermID {
+			return map[string]string{"r210": "class", "r211": "free"}
+		}
+		return map[string]string{"r210": "free", "r211": "free"}
+	}
+	for _, releaseID := range []string{releaseDiffFromID, crossAxisID, crossTermID} {
+		term := releaseDiffTerm
+		if releaseID == crossTermID {
+			term = releaseDiffOtherTerm
+		}
+		states := stateOf(releaseID)
+		for roomID, nodes := range map[string][]string{
+			"r210": {"01", "02"},
+			"r211": {"05"},
+		} {
+			for _, node := range nodes {
+				mustExec(ctx, t, pool, `
+INSERT INTO observation (release_id, room_id, term, week, weekday, node, state_key, available)
+VALUES ($1, $2, $3, 9, 1, $4, $5, $6)`,
+					releaseID, roomID, term, node, states[roomID], states[roomID] == "free")
+			}
+		}
+	}
+
+	repo := NewReleaseAdminRepo(pool)
+
+	// 轴改版：同一小节 05 在两侧折成不同 block，所以是一增一删，不是「未变」。
+	axisDiff, err := repo.Diff(ctx, ReleaseDiffParams{From: releaseDiffFromID, To: crossAxisID})
+	if err != nil {
+		t.Fatalf("跨轴版本对比失败: %v", err)
+	}
+	if axisDiff.From.AxisVersion != 1 || axisDiff.To.AxisVersion != 2 {
+		t.Fatalf("两侧轴版本应如实回显: %+v / %+v", axisDiff.From, axisDiff.To)
+	}
+	wantAxis := ReleaseDiffSummary{
+		Cells:    DiffCellsSummary{Added: 1, Removed: 1, Changed: 0, Total: 2},
+		Rooms:    DiffRoomsSummary{Shared: 2},
+		SameTerm: true,
+	}
+	if axisDiff.Summary != wantAxis {
+		t.Fatalf("跨轴对比汇总不符:\n got %+v\nwant %+v", axisDiff.Summary, wantAxis)
+	}
+
+	// 跨学期：same_term=false，但差异照常给出（r210 的 0102 状态不同）。
+	termDiff, err := repo.Diff(ctx, ReleaseDiffParams{From: releaseDiffFromID, To: crossTermID})
+	if err != nil {
+		t.Fatalf("跨学期版本对比失败: %v", err)
+	}
+	wantTerm := ReleaseDiffSummary{
+		Cells:    DiffCellsSummary{Changed: 1, Total: 1},
+		Rooms:    DiffRoomsSummary{Shared: 2},
+		SameTerm: false,
+	}
+	if termDiff.Summary != wantTerm {
+		t.Fatalf("跨学期对比汇总不符:\n got %+v\nwant %+v", termDiff.Summary, wantTerm)
+	}
+}
+
+// TestReleaseAdminRepoDiffMissingRelease 覆盖缺一版：分别点名 from / to，
+// 返回包着 ErrReleaseNotFound 的错误与零值结果。
+func TestReleaseAdminRepoDiffMissingRelease(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+	seedReleaseDiffFixture(ctx, t, pool)
+	repo := NewReleaseAdminRepo(pool)
+
+	cases := []struct {
+		name     string
+		params   ReleaseDiffParams
+		wantSide string
+	}{
+		{
+			name:     "缺 to",
+			params:   ReleaseDiffParams{From: releaseDiffFromID, To: releaseDiffMissingID},
+			wantSide: "to",
+		},
+		{
+			name:     "缺 from",
+			params:   ReleaseDiffParams{From: releaseDiffMissingID, To: releaseDiffToID},
+			wantSide: "from",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			diff, err := repo.Diff(ctx, testCase.params)
+			if !errors.Is(err, ErrReleaseNotFound) {
+				t.Fatalf("期望 ErrReleaseNotFound，实际 err=%v", err)
+			}
+			if !strings.Contains(err.Error(), testCase.wantSide) ||
+				!strings.Contains(err.Error(), releaseDiffMissingID) {
+				t.Fatalf("错误消息应点名 %s 侧与缺失的版本，实际 %q", testCase.wantSide, err)
+			}
+			if diff.From.ReleaseID != "" || diff.To.ReleaseID != "" ||
+				diff.Summary != (ReleaseDiffSummary{}) {
+				t.Fatalf("缺一版时应返回零值，实际 %+v", diff)
+			}
+		})
+	}
+}
+
+// TestReleaseAdminRepoDiffEmptySides 覆盖两侧都没有观测与归属快照的版本：
+// 汇总语句的每个 CTE 在空集上仍各出一行，CROSS JOIN 后是一行全零，而不是零行。
+// same_term 仍由两个头比出，与有没有数据无关。
+func TestReleaseAdminRepoDiffEmptySides(t *testing.T) {
+	ctx, pool := openReleaseAdminTestDB(t)
+
+	const (
+		emptyFromID = "20260601T000000Z"
+		emptyToID   = "20260608T000000Z"
+	)
+	mustExec(ctx, t, pool, "INSERT INTO term (term, total_weeks) VALUES ($1, 20)", releaseDiffTerm)
+	mustExec(ctx, t, pool, `
+INSERT INTO release (release_id, term, generated_at, dict_version, axis_version, is_current)
+VALUES ($1, $2, $3, 1, 1, false),
+       ($4, $2, $5, 1, 1, false)`,
+		emptyFromID, releaseDiffTerm, mustParseReleaseAdminTime(t, "2026-06-01T00:00:00Z"),
+		emptyToID, mustParseReleaseAdminTime(t, "2026-06-08T00:00:00Z"))
+
+	repo := NewReleaseAdminRepo(pool)
+	diff, err := repo.Diff(ctx, ReleaseDiffParams{From: emptyFromID, To: emptyToID})
+	if err != nil {
+		t.Fatalf("对比两个空版本失败: %v", err)
+	}
+	if diff.From.ReleaseID != emptyFromID || diff.To.ReleaseID != emptyToID {
+		t.Fatalf("版本头不符: %+v / %+v", diff.From, diff.To)
+	}
+	want := ReleaseDiffSummary{SameTerm: true}
+	if diff.Summary != want {
+		t.Fatalf("空版本之间的汇总应全零:\n got %+v\nwant %+v", diff.Summary, want)
 	}
 }

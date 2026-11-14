@@ -11,7 +11,7 @@
   - 空库列表返回空切片与 `total=0`；`week_counts` / `building_counts` 的切片恒非 nil（JSON 输出 `[]`）
   - 集成（真实库）：两版夹具断言排序、`released_at`、计数与手工折叠一致；删除全部版本后列表为空
 
-- [ ] 2. 大节折叠与对比汇总
+- [x] 2. 大节折叠与对比汇总
   - 折叠 CTE：按各版 `axis_version` join `axis_node`，`min(state_key)` 作为格状态、`max(state_key) <> min` 计入 `inconsistent_blocks`；键为 `(room_id, week, weekday, block)`
   - 汇总一条语句给出 `cells`（added/removed/changed/total）、`rooms`（added/removed/shared/building_changed）、`unknown`/`composite` 两侧计数与 `delta`、`same_term`；两侧版本头在同一只读事务内先解析，缺一版返回 `ErrReleaseNotFound`
   - 夹具覆盖五类差异（新增格 / 消失格 / 状态变化 / 未变格 / 归属变化）与一个块内不一致的格，逐项断言计数；交换 `from` / `to` 断言 added↔removed、changed 不变
