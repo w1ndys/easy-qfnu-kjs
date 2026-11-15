@@ -5,7 +5,7 @@
 > 每项完成后跑该项涉及的 `pnpm test -- --run` 与 `pnpm exec tsc --noEmit`；第 10 项跑 `task gate`。
 > 验收以 [requirements.md](requirements.md) 的条目为准，实现细节以 [design.md](design.md) 为准；以下条目在实现阶段执行。
 
-- [ ] 1. 前端工程骨架与工具链
+- [x] 1. 前端工程骨架与工具链
   - `frontend/` 建 Vite + React 19 + TypeScript + antd 6.7 工程：`package.json`（含 `packageManager` 钉 pnpm）、`vite.config.ts`（`@vitejs/plugin-react`、`/api` 代理 `http://127.0.0.1:18080`、vitest `jsdom` + `setup.ts`）、`tsconfig.json`（strict）、`eslint.config.js`、`index.html`（`lang="zh-CN"`）
   - 脚本与根 `Taskfile.yml` 的 `frontend:install/dev/build/test/lint/fmt` 对齐：`dev`、`build`（含 `tsc --noEmit`）、`preview`、`test`、`lint`、`type-check`、`format`
   - `src/main.tsx` + `src/App.tsx`：`ConfigProvider`（品牌色 `#884F22`）、`createBrowserRouter` 四条路由（`/`、`/day/:roomId`、`/screen`、`*`）、根 `ErrorBoundary`

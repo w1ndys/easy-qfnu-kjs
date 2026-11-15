@@ -83,7 +83,7 @@ Updated: 2026-11-15
 flowchart TB
     subgraph browser["浏览器（单一 Vite 构建）"]
         router["react-router 8<br/>/ · /day/:roomId · /screen · *"]
-        err["根 ErrorBoundary"]
+        err["根 errorElement（RouteErrorPage）"]
         pub["PublicLayout 移动优先"]
         scr["ScreenLayout 1920×1080 缩放"]
         api["api/client.ts 信封解析<br/>+ errors.ts 业务码映射"]
@@ -103,14 +103,14 @@ flowchart TB
 图渲染不出来时看这段同义结构：
 
 ```text
-浏览器 ──> react-router ──> 根 ErrorBoundary ──┬──> PublicLayout ──> QueryPage / DayPage / NotFound
+浏览器 ──> react-router ──> 根 errorElement ──┬──> PublicLayout ──> QueryPage / DayPage / NotFound
                                                 └──> ScreenLayout ──> ScreenPage
 页面 ──> hooks(useApi/useMeta/useScreenPolling) ──> api/client.ts ──> fetch(/api/*) ──> 反代 ──> server
 ```
 
 数据流是单向的：URL → 筛选参数 → `useApi` 发请求 → 信封解析 → 页面渲染；页面不写回任何全局状态，只写回 URL。大屏多一条时钟分支：`useScreenPolling` 每 30 秒发一次请求，失败只更新「离线」局部状态，不动已渲染的数据。
 
-开发期 `vite.config.ts` 把 `/api` 代理到 `http://127.0.0.1:18080`（后端默认监听，`backend/internal/config/config.go:27`）；生产期由 `web` 容器托管 `dist/` 并反代 `/api`，属于 `deploy-ops`，本 spec 只保证 `pnpm build` 产出 `frontend/dist`。
+开发期 `vite.config.ts` 把 `/api` 代理到 `http://127.0.0.1:18080`（后端默认监听 `:18080`，本机用 `127.0.0.1:18080` 访问，见 `backend/internal/config/config.go:27`）；生产期由 `web` 容器托管 `dist/` 并反代 `/api`，属于 `deploy-ops`，本 spec 只保证 `pnpm build` 产出 `frontend/dist`。
 
 ## Components and Interfaces
 
@@ -118,13 +118,14 @@ flowchart TB
 
 ```
 frontend/
-  package.json              脚本：dev / build / preview / test / lint / type-check / format；packageManager 钉 pnpm
+  package.json              脚本：dev / build / preview / test（一次性）/ test:watch（交互）/ lint / type-check / format；packageManager 钉 pnpm
   vite.config.ts            @vitejs/plugin-react、/api 代理、vitest 配置（environment: jsdom, setupFiles）
   tsconfig.json             strict、禁止隐式 any
   eslint.config.js          flat config；prettier 作为格式化
   index.html                lang="zh-CN"、viewport、主题色
-  src/main.tsx              createRoot + ConfigProvider + RouterProvider
-  src/App.tsx               路由表、根 ErrorBoundary、页面级 Provider
+  README.md / .prettierignore  工程文件：命令说明与目录约定；prettier 忽略 node_modules、dist、coverage 与 lockfile
+  src/main.tsx              createRoot + App
+  src/App.tsx               路由表、ConfigProvider、根 errorElement
   src/theme/index.ts        antd 主题：品牌色 #884F22、大屏暗色算法、状态视觉映射
   src/api/client.ts         信封解析、超时、AbortSignal、ApiError
   src/api/errors.ts         业务码 → 文案（只映射后端已有码）
@@ -143,6 +144,7 @@ frontend/
   src/components/NodeGrid.tsx     12 小节网格
   src/components/OccupancyHeatmap.tsx  7×5 SVG 热力图 + 图例
   src/components/PageFooter.tsx   数据来源 / 更新频率 / 仅供参考
+  src/components/RouteErrorPage.tsx  根路由 errorElement：渲染失败时显示错误页而非白屏
   src/layouts/PublicLayout.tsx    公开页壳：单列优先、页脚、底部主操作区
   src/layouts/ScreenLayout.tsx    大屏壳：暗色、无导航、等比缩放
   src/pages/public/QueryPage.tsx
@@ -165,7 +167,7 @@ frontend/
 | `/screen` | `ScreenPage` | 数据大屏，暗色、无导航、30 秒轮询 |
 | `*` | `NotFoundPage` | 404，给出回查询页的入口 |
 
-`createBrowserRouter` 的根路由挂 `ErrorBoundary`（`errorElement`），渲染失败时显示错误页而不是白屏；`NotFoundPage` 与错误页共用同一套 `Result` 结构。
+`createBrowserRouter` 的根路由把 `RouteErrorPage` 挂成 `errorElement`，渲染失败时显示错误页而不是白屏；`NotFoundPage` 与错误页共用同一套 `Result` 结构。
 
 ### API 客户端
 
@@ -193,7 +195,7 @@ class ApiError extends Error { code: number; requestId: string; retriable: boole
 ### 组件树
 
 ```text
-App（ErrorBoundary + ConfigProvider + RouterProvider）
+App（ConfigProvider + RouterProvider + 根 errorElement）
 ├─ PublicLayout
 │  ├─ QueryPage
 │  │  ├─ ContextBar（今天 / 第几周 / 星期 / 是否教学周）
