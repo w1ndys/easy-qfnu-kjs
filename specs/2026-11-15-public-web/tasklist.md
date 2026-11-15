@@ -29,7 +29,7 @@
   - 每行提供「看全天状态」入口，跳 `/day/:roomId` 并带上当前 `date_offset` 与 `building`
   - 验收：夹具两间同名房渲染出不同标签；翻页请求参数正确；结果顺序与夹具顺序一致（前端不重排）
 
-- [ ] 5. 全天状态视图
+- [x] 5. 全天状态视图
   - `DayPage` 从 `roomId` + `searchParams` 请求 `view=day`，`NodeGrid` 用 `meta.axis.nodes` 顺序渲染 12 个小节
   - `StatusCell` 同时用文字、图标与颜色表达状态；`has_data=false` 显示「无数据」且呈现为不可用样式
   - 房间头显示房名/房号/楼名/日期（周次与星期取自响应 `week`/`weekday`；缺 `roomId` 时显示空态并给回查询页入口）

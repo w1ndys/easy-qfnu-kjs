@@ -25,7 +25,9 @@ export const createAppRoutes = (
     errorElement: <RouteErrorPage />,
     children: [
       { index: true, element: <QueryPage /> },
-      { path: "day/:roomId", element: <DayPage /> },
+      // roomId 可选：链接缺房号时也要落到 DayPage 的空态（Requirement 4.4），
+      // 而不是掉进下面的 `*` 变成 404。
+      { path: "day/:roomId?", element: <DayPage /> },
       { path: "screen", element: <ScreenPage /> },
       { path: "*", element: <NotFoundPage /> },
       ...extraChildren,
