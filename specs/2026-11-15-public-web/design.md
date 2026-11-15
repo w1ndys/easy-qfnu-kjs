@@ -180,7 +180,8 @@ class ApiError extends Error { code: number; requestId: string; retriable: boole
 - `request<T>(path, { query, signal })`：拼 query（camelCase → snake_case 由调用点显式给出键名，不做自动转换）、`fetch` + `AbortSignal`、非 2xx 也尝试解析信封、`code !== 0` 抛 `ApiError`、未知 `code` 走兜底文案。
 - 每个端点一个薄函数（`queryAvailability` / `queryDay` / …），页面不直接 `fetch`。
 - `errors.ts` 只导出四类文案：`40001`「参数有误」、`40401`「数据不存在」、`42901`「请求过于频繁，请稍后重试」、`50000`「服务异常」；`message` 仅在兜底时展示，`request_id` 始终附在错误态。
-- 超时：`AbortSignal.timeout(15_000)` 与筛选切换的 `AbortController` 合并；`AbortError` 不进入错误态（D1 + Requirement 1.5）。
+- 超时：15 秒，由客户端自己用 `AbortController` + `setTimeout` 手动合并「超时」与筛选切换的 `signal`（调用方 signal 与超时各挂一个 listener，请求结束后 `clearTimeout` 并解绑 listener）；`AbortError` 不进入错误态（D1 + Requirement 1.5）。
+- 浏览器支持基线：**Chrome 116+ / Safari 17.4+ / Firefox 124+**（`AbortSignal.any` 的落地版本）。低于此版本用 `AbortController` 手动合并兜底：实现不依赖 `AbortSignal.any`，也不依赖 `AbortSignal.timeout`（Safari 16+），缺失这两个静态方法时超时与取消照常工作。
 
 ### 状态管理（尽量轻）
 

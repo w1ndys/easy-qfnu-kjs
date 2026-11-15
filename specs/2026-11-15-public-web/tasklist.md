@@ -11,7 +11,7 @@
   - `src/main.tsx` + `src/App.tsx`：`ConfigProvider`（品牌色 `#884F22`）、`createBrowserRouter` 四条路由（`/`、`/day/:roomId`、`/screen`、`*`）、根 `ErrorBoundary`
   - 验收：`pnpm build` 产出 `frontend/dist`；故意抛错的临时路由被错误页接住而不是白屏；`task frontend:lint` 零错误
 
-- [ ] 2. API 客户端与错误映射
+- [x] 2. API 客户端与错误映射
   - `src/api/client.ts`：`fetch` + `AbortSignal` + 15s 超时，解析信封 `{code, message, data, request_id}`，非 JSON 与 HTTP 非 2xx 都走同一失败路径，`code !== 0` 抛 `ApiError{code, requestId, retriable}`
   - `src/api/errors.ts`：只映射后端已有码 `40001`/`40401`/`42901`/`50000`，未知码兜底「服务异常」，`message` 仅作副标题
   - `src/api/types.ts` + `src/api/public.ts`：五个薄函数（`getContext`、`getMeta`、`queryAvailability`、`queryDay`、`getScreen`），`date_offset`/`room_id`/`start_node` 等参数名显式写出，不做自动大小写转换
