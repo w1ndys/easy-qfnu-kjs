@@ -17,7 +17,7 @@
   - `src/api/types.ts` + `src/api/public.ts`：五个薄函数（`getContext`、`getMeta`、`queryAvailability`、`queryDay`、`getScreen`），`date_offset`/`room_id`/`start_node` 等参数名显式写出，不做自动大小写转换
   - 验收：单测覆盖成功、`code` 非 0、非 JSON、网络中断、`AbortError` 五条路径；`AbortError` 不进入错误态；错误对象带 `request_id`
 
-- [ ] 3. 公开查询页输入区与默认值
+- [x] 3. 公开查询页输入区与默认值
   - `useMeta` 一次加载 `/api/context` + `/api/meta`，未完成时显示加载态；`useQueryFilters` 把 `date_offset`/`building`/`start_node`/`end_node`/`keyword`/`page` 读写到 URL
   - `FilterPanel`：11 个日期项（偏移 0..10，显示「今天/明天/M-D」）、教学楼下拉（首位「全部」+ 白名单）、节次区间、关键词、查询按钮；回车与点击发同一请求
   - `lib/nodes.ts` 三档预填：<12:00 → 01–05，12:00–18:00 → 06–09，≥18:00 → 10–12；选非当天日期时沿用当前时段

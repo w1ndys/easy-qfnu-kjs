@@ -2,7 +2,8 @@
 
 `public-web` 的前端工程骨架：Vite 8 + React 19 + TypeScript（strict）+ antd 6.7，路由用 `react-router` 8。
 
-页面与请求层从第 2 项起逐项实现；本目录当前只有可运行的路由骨架、主题与错误边界。
+请求层（第 2 项）与公开查询页输入区（第 3 项）已落地：上下文/元数据加载、URL 驱动的筛选参数、
+日期/教学楼/节次区间/关键词筛选与查询请求；结果列表与分页在第 4 项接上。
 
 ## 命令
 
@@ -44,7 +45,10 @@ antd 按 `ai-kit/docs/dev-conventions/stacks/react-frontend.md` 作为基础组�
 ## 结构约定
 
 - `src/theme/`：antd 主题 token，品牌色 `#884F22`；大屏 `darkAlgorithm` 在第 7 项叠加。
-- `src/api/`、`src/hooks/`、`src/lib/`：第 2 项起的请求层与纯函数。
-- `src/components/`：共享组件；`RouteErrorPage.tsx` 是根路由 `errorElement`。
-- `src/pages/public/`：四个页面，本项只有占位内容。
+- `src/api/`：请求层（信封解析、业务码文案、五个端点薄函数）。
+- `src/hooks/`：`useApi`（取消/重载）、`useMeta`（上下文 + 元数据并行加载一次）、`useQueryFilters`（URL 唯一读写点）。
+- `src/lib/`：纯函数；`nodes.ts` 是节次三档预填、`dateOffset.ts` 是日期项文案。
+- `src/components/`：共享组件；`FilterPanel.tsx` 是公开查询页输入区，`RouteErrorPage.tsx` 是根路由 `errorElement`。
+- `src/pages/public/`：四个页面路由已挂；`/` 已落输入区，结果区与其余页面在后续项实现。
+- `src/test/fixtures/`：与 `src/api/types.ts` 用 `satisfies` 对齐的响应夹具。
 - `src/test/setup.ts`：jest-dom、`matchMedia`、`ResizeObserver` 垫片。

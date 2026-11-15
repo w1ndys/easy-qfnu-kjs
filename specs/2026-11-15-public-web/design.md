@@ -136,6 +136,7 @@ frontend/
   src/hooks/useScreenPolling.ts  30 秒轮询 + 可见性 + 离线标记
   src/hooks/useQueryFilters.ts   URL ↔ 筛选参数的唯一读写点
   src/lib/datetime.ts       RFC3339 UTC → Asia/Shanghai 展示
+  src/lib/dateOffset.ts     日期项文案：偏移 0/1 → 今天/明天，其余目标日的 M-D（纯日历日加减，不碰时区）
   src/lib/nodes.ts          时段默认区间、小节标签、大节列头（从轴定义派生）
   src/lib/roomName.ts       同名房间追加房间标识后缀
   src/lib/scale.ts          大屏缩放系数计算（纯函数，可单测）
@@ -220,6 +221,11 @@ App（ConfigProvider + RouterProvider + 根 errorElement）
       ├─ OccupancyHeatmap（7×5 SVG · 图例） + BuildingOccupancyList（按楼占用率）
       └─ EmptyState（empty=true 时各区块标题 + 「暂无数据」）
 ```
+
+### 组件说明
+
+- `QueryPage`：`now?: Date` 是**测试注入点**——按本地时间预填节次区间要能对齐 11:59/12:00/17:59/18:00 三档边界，测试注入固定时刻；生产不传，默认 `new Date()`。预填区间在页面打开时算一次并冻结，之后换日期（含非当天）沿用当前时段，页面停留跨档也不会换掉用户正在看的区间。
+- `FilterPanel`：关键词是唯一不逐字写进 URL 的输入，只留本地草稿；后退/前进（`location.key` 变化的 POP 导航）时清空草稿，让 URL 上的已提交关键词优先，URL 仍是单一事实来源（D1）。
 
 ### 响应式断点
 
