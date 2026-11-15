@@ -83,3 +83,91 @@ export const availabilityFixture = {
   week: 11,
   weekday: 2,
 } satisfies AvailabilityResult;
+
+/**
+ * 第 4 项同名房夹具：两间展示名都叫「综合楼101」（分属不同楼、房间标识不同），
+ * 中间夹一间异名房。顺序故意既不是房名字典序（同名两行不相邻），
+ * 也不是房间标识升序（Q12 → Q11 → Q10），用来断言前端不重排。
+ *
+ * 注意：使用方以 `building=Q10` 请求，这里却返回 Q12/Q11 的房间——真实后端
+ * （`backend/internal/store/availability.go` 的 `$6 = '' OR rrb.building_id = $6`）
+ * 不可能出现这种响应。这是刻意构造的对抗性夹具，钉住两件事：
+ * 1) 「看全天状态」的 `building` 取**当前筛选楼**（Q10），不是房间自己的楼（Q12/Q11）；
+ * 2) 同名后缀只看房名，不因两间房分属不同楼就免掉后缀。
+ */
+export const duplicateNameAvailabilityFixture = {
+  total: 3,
+  items: [
+    {
+      room_id: "Q12-101",
+      name: "综合楼101",
+      building_id: "Q12",
+      building_name: "文科教学楼",
+    },
+    {
+      room_id: "Q11-302",
+      name: "理工楼302",
+      building_id: "Q11",
+      building_name: "理工教学楼",
+    },
+    {
+      room_id: "Q10-101",
+      name: "综合楼101",
+      building_id: "Q10",
+      building_name: "综合教学楼",
+    },
+  ],
+  date: "2026-11-17",
+  term: "2026-2027-1",
+  week: 11,
+  weekday: 2,
+} satisfies AvailabilityResult;
+
+/** 第 4 项分页夹具第 1 页：total 45 超过单页容量 20，分页控件才会出现第 2 页。 */
+export const pagedAvailabilityFixture = {
+  total: 45,
+  items: [
+    {
+      room_id: "Q10-201",
+      name: "综合楼201",
+      building_id: "Q10",
+      building_name: "综合教学楼",
+    },
+    {
+      room_id: "Q10-202",
+      name: "综合楼202",
+      building_id: "Q10",
+      building_name: "综合教学楼",
+    },
+  ],
+  date: "2026-11-17",
+  term: "2026-2027-1",
+  week: 11,
+  weekday: 2,
+} satisfies AvailabilityResult;
+
+/** 第 4 项分页夹具第 2 页：offset=20 时返回，用来区分「确实换了页」。 */
+export const pagedAvailabilitySecondPageFixture = {
+  ...pagedAvailabilityFixture,
+  items: [
+    {
+      room_id: "Q10-301",
+      name: "综合楼301",
+      building_id: "Q10",
+      building_name: "综合教学楼",
+    },
+  ],
+} satisfies AvailabilityResult;
+
+/** 第 4 项分页夹具最后一页：total=45、单页 20 → 第 3 页（offset=40），页码越界时钳到这里。 */
+export const pagedAvailabilityLastPageFixture = {
+  ...pagedAvailabilityFixture,
+  items: [
+    {
+      room_id: "Q10-401",
+      name: "综合楼401",
+      building_id: "Q10",
+      building_name: "综合教学楼",
+    },
+  ],
+} satisfies AvailabilityResult;

@@ -4,15 +4,21 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AvailabilityResult } from "../../api/types";
 import {
   availabilityFixture,
   contextFixture,
+  duplicateNameAvailabilityFixture,
   metaFixture,
+  pagedAvailabilityFixture,
+  pagedAvailabilityLastPageFixture,
+  pagedAvailabilitySecondPageFixture,
 } from "../../test/fixtures/publicApi";
-import { QueryPage } from "./QueryPage";
+import { QueryPage, RESULT_PAGE_SIZE } from "./QueryPage";
 
 /** 上午档（12:00 前）与下午档（12:00–18:00）两个打开时刻。 */
 const OPEN_AT_1159 = new Date(2026, 10, 15, 11, 59);
@@ -33,6 +39,8 @@ function envelope(data: unknown, requestId: string): Response {
 interface StubOptions {
   /** true 时所有请求挂起，直到调用 release()：用来观察加载态。 */
   holdUntilRelease?: boolean;
+  /** 覆盖 /api/query 的响应；入参是本次请求的 offset（0 起）。 */
+  availability?: (offset: number) => AvailabilityResult;
 }
 
 function stubPublicApi(options: StubOptions = {}) {
@@ -51,7 +59,7 @@ function stubPublicApi(options: StubOptions = {}) {
         const url = new URL(String(input), "http://localhost");
         requests.push(url);
         await gate;
-        return respond(url);
+        return respond(url, options);
       }),
     );
   } else {
@@ -60,7 +68,7 @@ function stubPublicApi(options: StubOptions = {}) {
       vi.fn(async (input: RequestInfo | URL) => {
         const url = new URL(String(input), "http://localhost");
         requests.push(url);
-        return respond(url);
+        return respond(url, options);
       }),
     );
   }
@@ -73,7 +81,7 @@ function stubPublicApi(options: StubOptions = {}) {
   };
 }
 
-function respond(url: URL): Response {
+function respond(url: URL, options: StubOptions = {}): Response {
   if (url.pathname === "/api/context") {
     return envelope(contextFixture, "req_context");
   }
@@ -81,7 +89,11 @@ function respond(url: URL): Response {
     return envelope(metaFixture, "req_meta");
   }
   if (url.pathname === "/api/query") {
-    return envelope(availabilityFixture, "req_query");
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    return envelope(
+      options.availability?.(offset) ?? availabilityFixture,
+      "req_query",
+    );
   }
   throw new Error(`测试未处理的请求：${url.pathname}`);
 }
@@ -107,6 +119,12 @@ async function waitForQuerySettled(
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
+}
+
+/** 点页码：rc-pagination 把 title 放在 <li> 上、把点击处理挂在里面的 <a> 上。 */
+function clickPage(page: number) {
+  const item = screen.getByTitle(String(page));
+  fireEvent.click(within(item).getByText(String(page)));
 }
 
 afterEach(() => {
@@ -305,5 +323,172 @@ describe("URL 为单一事实来源", () => {
     await waitFor(() => expect(stub.queryRequests()).toHaveLength(1));
 
     expect(stub.queryRequests()[0].search).toBe(beforeRefresh);
+  });
+});
+
+describe("结果列表与分页", () => {
+  it("首页按 limit/offset 请求，并在结果区展示命中总数", async () => {
+    const stub = stubPublicApi({
+      availability: () => pagedAvailabilityFixture,
+    });
+
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    const query = stub.queryRequests()[0].searchParams;
+    expect(query.get("limit")).toBe(String(RESULT_PAGE_SIZE));
+    expect(query.get("offset")).toBe("0");
+
+    expect(
+      screen.getByRole("list", { name: "空教室结果" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("共 45 间空教室")).toBeInTheDocument();
+  });
+
+  it("翻到第 2 页时 offset 按页容量推进，URL 记录页码并渲染第 2 页数据", async () => {
+    const stub = stubPublicApi({
+      availability: (offset) =>
+        offset === 0
+          ? pagedAvailabilityFixture
+          : pagedAvailabilitySecondPageFixture,
+    });
+
+    const { router } = renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+    expect(screen.getByText("综合楼201")).toBeInTheDocument();
+
+    clickPage(2);
+
+    await waitFor(() => expect(stub.queryRequests()).toHaveLength(2));
+    const second = stub.queryRequests()[1].searchParams;
+    expect(second.get("limit")).toBe(String(RESULT_PAGE_SIZE));
+    expect(second.get("offset")).toBe(String(RESULT_PAGE_SIZE));
+    expect(router.state.location.search).toContain("page=2");
+
+    expect(await screen.findByText("综合楼301")).toBeInTheDocument();
+    expect(screen.queryByText("综合楼201")).not.toBeInTheDocument();
+  });
+
+  it("URL 上的页码越界时钳到最后一页，并用 replace 规范化 URL", async () => {
+    const stub = stubPublicApi({
+      availability: (offset) =>
+        offset === 2 * RESULT_PAGE_SIZE
+          ? pagedAvailabilityLastPageFixture
+          : pagedAvailabilityFixture,
+    });
+
+    const { router } = renderQueryPage(
+      "/?date_offset=0&start_node=01&end_node=05&page=999",
+      OPEN_AT_1159,
+    );
+
+    // 第一次仍按 URL 上的页码请求（越界 offset），拿到 total=45 后才纠正。
+    await waitForQuerySettled(stub, 2);
+    expect(stub.queryRequests()[0].searchParams.get("offset")).toBe(
+      String((999 - 1) * RESULT_PAGE_SIZE),
+    );
+
+    // total=45、单页 20 → 最后一页是第 3 页，最终请求的 offset 落在 40。
+    const requests = stub.queryRequests();
+    const last = requests[requests.length - 1];
+    expect(last.searchParams.get("offset")).toBe(String(2 * RESULT_PAGE_SIZE));
+    expect(router.state.location.search).toBe(
+      "?date_offset=0&start_node=01&end_node=05&page=3",
+    );
+    // 钳制用 replace：初始为 POP，纠正后为 REPLACE，不新增历史记录。
+    expect(router.state.historyAction).toBe("REPLACE");
+
+    expect(await screen.findByText("综合楼401")).toBeInTheDocument();
+  });
+
+  it("改日期、教学楼或关键词都会回到第一页", async () => {
+    const stub = stubPublicApi({
+      availability: () => pagedAvailabilityFixture,
+    });
+
+    const { router } = renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    // 先翻到第 2 页，再分别改三类筛选：每次都应回到 offset=0、page=1。
+    clickPage(2);
+    await waitForQuerySettled(stub, 2);
+    expect(stub.queryRequests()[1].searchParams.get("offset")).toBe(
+      String(RESULT_PAGE_SIZE),
+    );
+
+    fireEvent.click(screen.getByRole("radio", { name: "11-17" }));
+    await waitForQuerySettled(stub, 3);
+    expect(stub.queryRequests()[2].searchParams.get("offset")).toBe("0");
+    expect(router.state.location.search).toContain("page=1");
+
+    clickPage(2);
+    await waitForQuerySettled(stub, 4);
+    expect(stub.queryRequests()[3].searchParams.get("offset")).toBe(
+      String(RESULT_PAGE_SIZE),
+    );
+
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "教学楼" }));
+    const buildingOption = await screen.findByRole("option", {
+      name: "综合教学楼",
+    });
+    fireEvent.click(buildingOption);
+    await waitForQuerySettled(stub, 5);
+    expect(stub.queryRequests()[4].searchParams.get("offset")).toBe("0");
+    expect(router.state.location.search).toContain("page=1");
+
+    clickPage(2);
+    await waitForQuerySettled(stub, 6);
+    expect(stub.queryRequests()[5].searchParams.get("offset")).toBe(
+      String(RESULT_PAGE_SIZE),
+    );
+
+    const input = screen.getByRole("textbox", { name: "关键词" });
+    fireEvent.change(input, { target: { value: "综合" } });
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitForQuerySettled(stub, 7);
+    expect(stub.queryRequests()[6].searchParams.get("offset")).toBe("0");
+    expect(router.state.location.search).toContain("page=1");
+  });
+
+  it("结果区按服务端返回顺序渲染，同名房渲染出不同标签", async () => {
+    const stub = stubPublicApi({
+      availability: () => duplicateNameAvailabilityFixture,
+    });
+
+    renderQueryPage(
+      "/?date_offset=2&building=Q10&start_node=01&end_node=05&page=1",
+      OPEN_AT_1159,
+    );
+    await waitForQuerySettled(stub, 1);
+
+    const list = screen.getByRole("list", { name: "空教室结果" });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(3);
+    expect(
+      within(rows[0]).getByText("综合楼101（Q12-101）"),
+    ).toBeInTheDocument();
+    expect(within(rows[1]).getByText("理工楼302")).toBeInTheDocument();
+    expect(
+      within(rows[2]).getByText("综合楼101（Q10-101）"),
+    ).toBeInTheDocument();
+  });
+
+  it("每行的「看全天状态」入口带上当前 date_offset 与 building", async () => {
+    const stub = stubPublicApi({
+      availability: () => duplicateNameAvailabilityFixture,
+    });
+
+    renderQueryPage(
+      "/?date_offset=2&building=Q10&start_node=01&end_node=05&page=1",
+      OPEN_AT_1159,
+    );
+    await waitForQuerySettled(stub, 1);
+
+    expect(
+      screen.getByRole("link", { name: "看 综合楼101（Q12-101） 的全天状态" }),
+    ).toHaveAttribute("href", "/day/Q12-101?date_offset=2&building=Q10");
+    expect(
+      screen.getByRole("link", { name: "看 理工楼302 的全天状态" }),
+    ).toHaveAttribute("href", "/day/Q11-302?date_offset=2&building=Q10");
   });
 });

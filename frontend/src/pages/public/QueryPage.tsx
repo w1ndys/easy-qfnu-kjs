@@ -1,15 +1,22 @@
-// 公开查询页（tasklist 第 3 项）：页面上下文/元数据加载 + 筛选输入区 + 查询请求。
-// 本项只落输入区与请求；结果列表、分页、四态由第 4–6 项接在这里。
+// 公开查询页（tasklist 第 3–4 项）：页面上下文/元数据加载 + 筛选输入区 + 查询请求 + 结果列表与分页。
+// 加载/空/过期/错误四态由第 6 项接在结果区；本项只落「有结果时」的列表与分页。
 
-import { Alert, Button, Card, Skeleton, Typography } from "antd";
+import { Alert, Button, Card, Pagination, Skeleton, Typography } from "antd";
 import { useCallback, useEffect, useState } from "react";
 import { getErrorTitle } from "../../api/errors";
 import { queryAvailability } from "../../api/public";
 import { FilterPanel } from "../../components/FilterPanel";
+import { ResultList } from "../../components/ResultList";
 import { useApi } from "../../hooks/useApi";
 import { useMeta } from "../../hooks/useMeta";
 import { useQueryFilters } from "../../hooks/useQueryFilters";
 import { defaultNodeRange, type NodeRange } from "../../lib/nodes";
+
+/**
+ * 单页容量：接口 `limit` 为 1..200，取 20 让手机上一页不过长。
+ * `page` 与 `limit`/`offset` 的换算只在这里发生（`offset = (page - 1) * 20`）。
+ */
+export const RESULT_PAGE_SIZE = 20;
 
 export interface QueryPageProps {
   /**
@@ -65,7 +72,8 @@ export function QueryPage({ now }: QueryPageProps) {
     }
   }, [metaReady, meta, buildingAllowed, isCanonical, replaceFilters, filters]);
 
-  // 查询参数只来自 URL 解析出的 filters；page 的 limit/offset 换算留给结果区（第 4 项）。
+  // 查询参数只来自 URL 解析出的 filters；分页由 page 换算成接口的 limit/offset。
+  // 改楼/关键词/日期时 useQueryFilters 已把 page 重置为 1，所以换筛选自然回到第一页。
   const loadAvailability = useCallback(
     (signal: AbortSignal) =>
       queryAvailability(
@@ -75,6 +83,8 @@ export function QueryPage({ now }: QueryPageProps) {
           start_node: filters.start_node,
           end_node: filters.end_node,
           keyword: filters.keyword || undefined,
+          limit: RESULT_PAGE_SIZE,
+          offset: (filters.page - 1) * RESULT_PAGE_SIZE,
         },
         signal,
       ),
@@ -86,6 +96,22 @@ export function QueryPage({ now }: QueryPageProps) {
     loadAvailability,
     metaReady && isCanonical && buildingAllowed,
   );
+
+  // 数据到达后按 total 把页码钳进有效范围：URL 上可能带着 page=999（手改、旧分享链接），
+  // 结果集也可能在两次请求之间缩小（后台发布了新版本），两种情况下当前页都会是空的。
+  // 钳制结果用 replace 写回 URL：这是改正一个已失效的地址，不该新增历史记录，
+  // 否则后退会退回那个空页。
+  const lastPage =
+    query.data === null
+      ? 1
+      : Math.max(1, Math.ceil(query.data.total / RESULT_PAGE_SIZE));
+
+  useEffect(() => {
+    if (query.data === null || filters.page <= lastPage) {
+      return;
+    }
+    replaceFilters({ ...filters, page: lastPage });
+  }, [query.data, filters, lastPage, replaceFilters]);
 
   // 回车与点击查询按钮的同一个出口：筛选没变就重发同一次请求，变了就写 URL 触发请求。
   const handleSearch = (keyword: string) => {
@@ -146,9 +172,25 @@ export function QueryPage({ now }: QueryPageProps) {
       ) : null}
 
       <Card style={{ marginTop: 16 }} title="查询结果">
-        <Typography.Text type="secondary">
-          结果列表与分页在第 4 项实现；本项已按当前筛选发出查询请求。
-        </Typography.Text>
+        {query.data !== null ? (
+          <>
+            <ResultList
+              items={query.data.items}
+              dateOffset={filters.date_offset}
+              building={filters.building}
+            />
+            <Pagination
+              style={{ marginTop: 16, textAlign: "center" }}
+              // 越界页在 URL 被纠正前先按最后一页显示，避免分页控件出现一个不存在的当前页。
+              current={Math.min(filters.page, lastPage)}
+              pageSize={RESULT_PAGE_SIZE}
+              total={query.data.total}
+              showSizeChanger={false}
+              showTotal={(total) => `共 ${total} 间空教室`}
+              onChange={(page) => setFilters({ page })}
+            />
+          </>
+        ) : null}
       </Card>
     </main>
   );
