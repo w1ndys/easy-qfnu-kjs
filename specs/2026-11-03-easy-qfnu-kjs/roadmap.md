@@ -11,8 +11,8 @@
 - [x] admin-settings-sync — 设置、手动同步与运行状态：2.3 + 10.3 + 10.4 + 14.4 + 14.5 — `specs/2026-11-08-admin-settings-sync/`
 - [x] collect-runner — 采集执行器：window / Plan / Run / publish 接线与未决项收口 — `specs/2026-11-09-collect-runner/`
 - [x] admin-release — 版本对比/回退与异常数据视图：10.5 + 10.6 + 14.6 + 14.7 — `specs/2026-11-14-admin-release/`
+- [x] public-web — 公开查询页与数据大屏：12 + 13 — `specs/2026-11-15-public-web/`
 
 ## 待做（按交付顺序）
 
-- [ ] public-web — 公开查询页与数据大屏：12 + 13 — depends: public-api（已完成）
 - [ ] deploy-ops — 容器编排、备份、清理调度、全量门禁：1.2 + 15 + 16 — depends: 全部
