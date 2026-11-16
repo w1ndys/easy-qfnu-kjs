@@ -57,6 +57,8 @@ describe("有观测的小节", () => {
     expect(cell.querySelector("svg")).not.toBeNull();
     expect(cell).toHaveAttribute("data-status", "available");
     expect(cell).not.toHaveAttribute("aria-disabled");
+    // 状态格有可读名称：读屏一次听到「第几节 · 状态名 · 可用性」（Requirement 8.5）。
+    expect(cell).toHaveAccessibleName("第 01 节：空闲（可用）");
   });
 
   it("有数据但不可用时用与「无数据」不同的档位", () => {
@@ -106,6 +108,8 @@ describe("无观测的小节", () => {
     expect(within(cell).queryByText("可用")).toBeNull();
     expect(cell).toHaveAttribute("data-status", "no-data");
     expect(cell).toHaveAttribute("aria-disabled", "true");
+    // 可读名称也要说明「不可用」，不依赖颜色或透明度。
+    expect(cell).toHaveAccessibleName("第 03 节：无数据（不可用）");
   });
 
   it("响应里缺这一节时同样按无数据处理", () => {

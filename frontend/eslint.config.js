@@ -21,6 +21,9 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
+      // 验收口径「产物无 console.log」（tasklist 第 10 项）：调试输出进不了构建产物。
+      // warn/error 仍允许——错误边界与运行时诊断需要它们。
+      "no-console": ["error", { allow: ["warn", "error"] }],
       // App.tsx 同时导出 App 组件与路由表工厂，后者供测试注入一条故意抛错的
       // 路由来验证根错误边界；明确列名字比整条规则关掉更收敛。
       "react-refresh/only-export-components": [

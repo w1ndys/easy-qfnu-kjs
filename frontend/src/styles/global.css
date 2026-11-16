@@ -1,0 +1,45 @@
+/*
+ * 公开页全局收口（tasklist 第 10 项；Requirement 8.4 与「prefers-reduced-motion 关闭过渡」）。
+ *
+ * 这里只放组件内联样式表达不了的全局规则：
+ * 1. 减少动态效果：媒体查询兜底，任何 transition / animation / 平滑滚动都收敛到瞬时；
+ * 2. 触控目标：antd 的日期项与分页项默认高度 32px，抬到 44×44（其余控件由
+ *    theme 的 controlHeight=44 统一抬高，见 src/theme/index.ts）。
+ */
+
+/* 系统开启「减少动态效果」时关闭过渡与动画（antd 的 motion token 亦会关闭）。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* 日期项：11 个横向可滑的按钮，每个至少 44×44，单手可点。 */
+.public-filter .ant-radio-button-wrapper {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+}
+
+/* 分页项：页码、上一页、下一页同属可点击控件，同样抬到 44×44。 */
+.public-results .ant-pagination-item,
+.public-results .ant-pagination-prev,
+.public-results .ant-pagination-next {
+  min-width: 44px;
+  min-height: 44px;
+  line-height: 42px;
+}
+
+/* 公开页的触控目标统一不收缩：窄屏横向挤压时也不把可点区域压到 44 以下。 */
+.public-filter button,
+.public-results button {
+  flex-shrink: 0;
+}

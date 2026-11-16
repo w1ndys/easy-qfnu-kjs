@@ -15,6 +15,11 @@ export interface ResultListProps {
   dateOffset: number;
   /** 当前教学楼；空串表示「全部」，跳转时不写这个参数。 */
   building: string;
+  /**
+   * 结果行的列数：宽屏（≥1024px）排两列，其余单列（Requirement 8.2 的三列里，
+   * 筛选占 1 列、结果占 2 列，结果区内部再横向排两间）。
+   */
+  columns?: 1 | 2;
 }
 
 /**
@@ -34,7 +39,12 @@ function dayStatusHref(
   return `/day/${encodeURIComponent(roomId)}?${search.toString()}`;
 }
 
-export function ResultList({ items, dateOffset, building }: ResultListProps) {
+export function ResultList({
+  items,
+  dateOffset,
+  building,
+  columns = 1,
+}: ResultListProps) {
   const { token } = theme.useToken();
   // 展示名按整页结果算一次：同名判定需要看到整页，而不是逐行猜。
   const labels = useMemo(() => buildRoomLabels(items), [items]);
@@ -42,7 +52,16 @@ export function ResultList({ items, dateOffset, building }: ResultListProps) {
   return (
     <ul
       aria-label="空教室结果"
-      style={{ listStyle: "none", margin: 0, padding: 0 }}
+      data-columns={columns}
+      style={{
+        listStyle: "none",
+        margin: 0,
+        padding: 0,
+        display: "grid",
+        // 宽屏两列、其余单列；顺序仍按数组顺序从左到右填格，不重排。
+        gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+        columnGap: 16,
+      }}
     >
       {labels.map(({ room, label }) => (
         <li

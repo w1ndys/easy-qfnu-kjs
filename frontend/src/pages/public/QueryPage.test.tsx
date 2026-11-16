@@ -29,6 +29,7 @@ import {
   weekNoScheduleAvailabilityFixture,
   weekNoScheduleEmptyAvailabilityFixture,
 } from "../../test/fixtures/publicApi";
+import { FIXED_QUERY_BAR_RESERVED_PX } from "../../lib/layout";
 import { QueryPage, RESULT_PAGE_SIZE } from "./QueryPage";
 
 /** 上午档（12:00 前）与下午档（12:00–18:00）两个打开时刻。 */
@@ -177,9 +178,31 @@ function clickPage(page: number) {
   fireEvent.click(within(item).getByText(String(page)));
 }
 
+/**
+ * jsdom 的 innerWidth 可写，三档布局按它计算：渲染前改宽度就能落到目标档位。
+ * （不在断言里读 window.innerWidth 本身，避免测成「赋了什么就是什么」。）
+ */
+function setViewportWidth(width: number) {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: width,
+  });
+}
+
+/** 模拟用户拖动窗口/旋转屏幕：改宽度并派发 resize，让 useViewportTier 重算。 */
+function resizeViewportTo(width: number) {
+  setViewportWidth(width);
+  act(() => {
+    window.dispatchEvent(new Event("resize"));
+  });
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  // 回到 jsdom 默认宽度（1024 = wide），窄屏用例不会污染后续用例。
+  setViewportWidth(1024);
 });
 
 describe("页面加载", () => {
@@ -761,6 +784,8 @@ describe("加载、空、过期与错误四态（tasklist 第 6 项）", () => {
     await waitForQuerySettled(stub, 1);
 
     const live = () => screen.getByRole("status", { name: "查询结果播报" });
+    // 原子播报：一次读完整句，而不是把「查询结果：共 N 间空教室」拆成几段。
+    expect(live()).toHaveAttribute("aria-atomic", "true");
     expect(live()).toHaveTextContent("查询结果：共 1 间空教室");
 
     // 换日期触发第二次查询：命中数变化 → 播报文本跟着变。
@@ -790,5 +815,238 @@ describe("加载、空、过期与错误四态（tasklist 第 6 项）", () => {
     // jsdom 的 role 查询分辨不出来，所以这里额外钉住位置。
     expect(footer.closest("main")).toBeNull();
     expect(screen.getByRole("main")).not.toContainElement(footer);
+  });
+});
+
+describe("响应式三档布局（tasklist 第 10 项；Requirement 8.1–8.3）", () => {
+  it("<600px 单列，并把查询按钮固定在视口底部单手可达区", async () => {
+    setViewportWidth(375);
+    const stub = stubPublicApi();
+
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    const page = screen.getByTestId("public-page");
+    expect(page).toHaveAttribute("data-layout", "compact");
+    expect(page).toHaveAttribute("data-columns", "1");
+    expect(page.style.gridTemplateColumns).toMatch(
+      /^repeat\(1, minmax\(0(px)?, 1fr\)\)$/,
+    );
+    expect(screen.getByTestId("public-filter-area")).toHaveAttribute(
+      "data-span",
+      "1",
+    );
+    expect(screen.getByTestId("public-results-area")).toHaveAttribute(
+      "data-span",
+      "1",
+    );
+
+    // 底部固定操作区：贴住视口底边，按钮 48px 高（≥44×44）。
+    const bar = screen.getByTestId("public-query-bar");
+    expect(bar).toHaveStyle({ position: "fixed", bottom: "0px" });
+    const bottomButton = within(bar).getByRole("button", { name: /查询/ });
+    expect(bottomButton).toHaveStyle({ minHeight: "48px" });
+
+    // 固定区高度只在页脚容器预留一次：<main> 仍是普通 padding（16px），
+    // 不再额外让出一段，否则 compact 档底部会多出一截空白。
+    expect(page.style.paddingBottom).toBe("16px");
+    const footerWrapper = screen.getByRole("contentinfo").parentElement;
+    expect(footerWrapper?.style.paddingBottom).toBe(
+      `${FIXED_QUERY_BAR_RESERVED_PX}px`,
+    );
+
+    // 表单内不再渲染第二个「查询」：同一表单只有一个提交入口。
+    expect(screen.getAllByRole("button", { name: /查询/ })).toHaveLength(1);
+    expect(screen.getByRole("list", { name: "空教室结果" })).toHaveAttribute(
+      "data-columns",
+      "1",
+    );
+  });
+
+  it("600–1024px 双列：筛选左、结果右，按钮回到筛选区内", async () => {
+    setViewportWidth(800);
+    const stub = stubPublicApi();
+
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    const page = screen.getByTestId("public-page");
+    expect(page).toHaveAttribute("data-layout", "medium");
+    expect(page).toHaveAttribute("data-columns", "2");
+    expect(page.style.gridTemplateColumns).toMatch(
+      /^repeat\(2, minmax\(0(px)?, 1fr\)\)$/,
+    );
+    expect(screen.getByTestId("public-filter-area")).toHaveAttribute(
+      "data-span",
+      "1",
+    );
+    expect(screen.getByTestId("public-results-area")).toHaveAttribute(
+      "data-span",
+      "1",
+    );
+
+    // 双列下按钮回到筛选卡里，底部固定区不渲染。
+    expect(screen.queryByTestId("public-query-bar")).not.toBeInTheDocument();
+    const form = screen.getByRole("form", { name: "空教室筛选条件" });
+    expect(
+      within(form).getByRole("button", { name: /查询/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "空教室结果" })).toHaveAttribute(
+      "data-columns",
+      "1",
+    );
+  });
+
+  it("≥1024px 三列：筛选 1 列 + 结果 2 列，两者同屏且结果区内再排两列", async () => {
+    setViewportWidth(1440);
+    const stub = stubPublicApi();
+
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    const page = screen.getByTestId("public-page");
+    expect(page).toHaveAttribute("data-layout", "wide");
+    expect(page).toHaveAttribute("data-columns", "3");
+    expect(page.style.gridTemplateColumns).toMatch(
+      /^repeat\(3, minmax\(0(px)?, 1fr\)\)$/,
+    );
+
+    const filterArea = screen.getByTestId("public-filter-area");
+    const resultsArea = screen.getByTestId("public-results-area");
+    expect(filterArea).toHaveAttribute("data-span", "1");
+    expect(resultsArea).toHaveAttribute("data-span", "2");
+
+    // 同屏：两块都在同一个页面栅格里，而不是上下两个视图或换页。
+    expect(page).toContainElement(filterArea);
+    expect(page).toContainElement(resultsArea);
+    expect(screen.getByRole("list", { name: "空教室结果" })).toHaveAttribute(
+      "data-columns",
+      "2",
+    );
+    expect(screen.queryByTestId("public-query-bar")).not.toBeInTheDocument();
+
+    // 没有固定操作区就不留底部余量：<main> 与页脚都只用普通 24px 内边距。
+    expect(page.style.paddingBottom).toBe("24px");
+    expect(
+      screen.getByRole("contentinfo").parentElement?.style.paddingBottom,
+    ).toBe("24px");
+  });
+
+  it("窗口从宽屏缩到窄屏时切到单列并出现底部查询按钮", async () => {
+    setViewportWidth(1440);
+    const stub = stubPublicApi();
+
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+    expect(screen.getByTestId("public-page")).toHaveAttribute(
+      "data-layout",
+      "wide",
+    );
+    expect(screen.queryByTestId("public-query-bar")).not.toBeInTheDocument();
+
+    resizeViewportTo(375);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("public-page")).toHaveAttribute(
+        "data-layout",
+        "compact",
+      ),
+    );
+    expect(screen.getByTestId("public-query-bar")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /查询/ })).toHaveLength(1);
+  });
+});
+
+describe("触控目标 ≥44×44 的渲染断言（Requirement 8.4）", () => {
+  it("日期项、分页项与查询按钮都落在全局 CSS 覆盖的 antd 元素上", async () => {
+    // 用宽屏档：此时表单内的查询按钮在（compact 下会移到固定操作区）。
+    setViewportWidth(1024);
+    const stub = stubPublicApi({
+      availability: () => pagedAvailabilityFixture,
+    });
+    const { container } = renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    // 日期项：11 个 Radio.Button，且都在 global.css 的 .public-filter 作用域内
+    // （jsdom 不加载外部 CSS，只能断言选择器实际命中的 DOM 长得对）。
+    const dateGroup = screen.getByRole("group", { name: "日期" });
+    expect(
+      dateGroup.querySelectorAll(".ant-radio-button-wrapper"),
+    ).toHaveLength(11);
+    expect(dateGroup.closest(".public-filter")).not.toBeNull();
+
+    // 分页项：45 间 / 每页 20 → 3 个页码，全部落在 .public-results 内。
+    expect(
+      container.querySelectorAll(".public-results .ant-pagination-item"),
+    ).toHaveLength(3);
+
+    // 查询按钮：antd 的 .ant-btn 由 controlHeight=44 抬高，页内再钉一次 44 的下限。
+    const button = screen.getByRole("button", { name: /查询/ });
+    expect(button).toHaveClass("ant-btn");
+    expect(button).toHaveStyle({ minHeight: "44px" });
+  });
+});
+
+describe("可访问性收口（Requirement 8.6）", () => {
+  it("点击查询后焦点仍留在查询按钮上，不被结果区抢走", async () => {
+    const stub = stubPublicApi();
+
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    const button = screen.getByRole("button", { name: /查询/ });
+    button.focus();
+    expect(button).toHaveFocus();
+
+    fireEvent.click(button);
+    await waitForQuerySettled(stub, 2);
+
+    expect(button).toHaveFocus();
+    expect(document.activeElement).toBe(button);
+  });
+
+  it("回车查询后焦点留在关键词输入框", async () => {
+    const stub = stubPublicApi();
+
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    const input = screen.getByRole("textbox", { name: "关键词" });
+    input.focus();
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitForQuerySettled(stub, 2);
+
+    expect(input).toHaveFocus();
+  });
+
+  it("窄屏点底部固定按钮查询后焦点不跳到结果区", async () => {
+    setViewportWidth(375);
+    const stub = stubPublicApi();
+
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    const button = within(screen.getByTestId("public-query-bar")).getByRole(
+      "button",
+      { name: /查询/ },
+    );
+    button.focus();
+    fireEvent.click(button);
+    await waitForQuerySettled(stub, 2);
+
+    expect(button).toHaveFocus();
+  });
+});
+
+describe("MSW 默认 handler 端到端", () => {
+  it("不换 fetch 也走真实请求链拿到夹具，并播报命中数量", async () => {
+    // 本用例不调用 stubPublicApi：请求由 setup.ts 里 listen 的 MSW server 承接，
+    // 走的是 api/public → api/client → fetch 的完整链路。
+    renderQueryPage("/", OPEN_AT_1159);
+
+    expect(await screen.findByText("综合楼101")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "查询结果播报" }),
+    ).toHaveTextContent("查询结果：共 1 间空教室");
   });
 });

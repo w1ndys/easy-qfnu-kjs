@@ -5,13 +5,13 @@
 // 判定只用响应字段：过期看响应 week 是否命中 meta.weeks 且 stale（design「四态」），
 // 提示档位看 hint.code，前端不按时间或文案猜状态。
 
-import { Card, Pagination, Typography } from "antd";
+import { Button, Card, Pagination, theme, Typography } from "antd";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useState } from "react";
 import { ApiError } from "../../api/client";
 import { RATE_LIMIT_CODE, getErrorTitle } from "../../api/errors";
 import { queryAvailability } from "../../api/public";
-import { FilterPanel } from "../../components/FilterPanel";
+import { FilterPanel, FILTER_FORM_ID } from "../../components/FilterPanel";
 import { PageFooter } from "../../components/PageFooter";
 import { ResultList } from "../../components/ResultList";
 import {
@@ -25,8 +25,10 @@ import { useApi } from "../../hooks/useApi";
 import { useMeta } from "../../hooks/useMeta";
 import { useQueryFilters } from "../../hooks/useQueryFilters";
 import { useRateLimitCooldown } from "../../hooks/useRateLimitCooldown";
+import { useViewportTier } from "../../hooks/useViewportTier";
 import { VISUALLY_HIDDEN } from "../../lib/a11y";
 import { getEmptyCopy, HINT_WEEK_NO_SCHEDULE } from "../../lib/hintCopy";
+import { FIXED_QUERY_BAR_RESERVED_PX, publicLayout } from "../../lib/layout";
 import { defaultNodeRange, type NodeRange } from "../../lib/nodes";
 
 /**
@@ -63,6 +65,11 @@ export function QueryPage({ now }: QueryPageProps) {
   // 42901 后查询按钮冷却 3 秒（design「Error Handling」）。状态只有布尔，
   // 渲染期不读时钟（eslint react-hooks/purity）。
   const { coolingDown, start: startCooldown } = useRateLimitCooldown();
+
+  // 三档响应式（第 10 项；Requirement 8.1–8.4）：断点与派生布局只在 lib/layout.ts
+  // 里定义，页面按档位铺栅格、决定查询按钮是否固定在底部。
+  const layout = publicLayout(useViewportTier());
+  const { token } = theme.useToken();
 
   const metaReady =
     !metaLoading && metaError === null && context !== null && meta !== null;
@@ -161,6 +168,7 @@ export function QueryPage({ now }: QueryPageProps) {
           items={query.data.items}
           dateOffset={filters.date_offset}
           building={filters.building}
+          columns={layout.resultColumns}
         />
         <Pagination
           style={{ marginTop: 16, textAlign: "center" }}
@@ -259,46 +267,135 @@ export function QueryPage({ now }: QueryPageProps) {
     return `查询结果：共 ${total} 间空教室`;
   })();
 
+  // 元数据就绪才谈布局：筛选区没出现时结果区占满整行，不留一块空白列。
+  const showFilter = metaReady && context !== null && meta !== null;
+  const resultSpan = showFilter ? layout.resultSpan : layout.columns;
+
   return (
     <>
-      <main style={{ padding: 24, maxWidth: 960, margin: "0 auto" }}>
-        <Typography.Title level={2}>空教室查询</Typography.Title>
+      <main
+        data-testid="public-page"
+        data-layout={layout.tier}
+        data-columns={layout.columns}
+        style={{
+          display: "grid",
+          // 单列 / 双列 / 三列：筛选取 1 列，宽屏时结果再占 2 列（Requirement 8.2）。
+          gridTemplateColumns: `repeat(${layout.columns}, minmax(0, 1fr))`,
+          gap: 16,
+          alignItems: "start",
+          // <main> 只保留普通内边距；底部固定操作区的位置由页脚容器统一预留一次。
+          padding: layout.padding,
+          width: "100%",
+          maxWidth: layout.maxWidth,
+          margin: "0 auto",
+          boxSizing: "border-box",
+        }}
+      >
+        <Typography.Title
+          level={layout.tier === "compact" ? 3 : 2}
+          style={{ gridColumn: "1 / -1", margin: 0 }}
+        >
+          空教室查询
+        </Typography.Title>
 
-        {metaReady && context !== null && meta !== null ? (
-          <FilterPanel
-            context={context}
-            meta={meta}
-            filters={filters}
-            loading={query.loading}
-            disabled={coolingDown}
-            onFiltersChange={setFilters}
-            onSearch={handleSearch}
-          />
+        {showFilter && context !== null && meta !== null ? (
+          <div
+            data-testid="public-filter-area"
+            data-span={layout.filterSpan}
+            style={{ gridColumn: `span ${layout.filterSpan}`, minWidth: 0 }}
+          >
+            <FilterPanel
+              context={context}
+              meta={meta}
+              filters={filters}
+              loading={query.loading}
+              disabled={coolingDown}
+              // 窄屏时按钮移到页面底部的固定操作区，表单内不再重复渲染。
+              showSubmit={!layout.fixedQueryBar}
+              onFiltersChange={setFilters}
+              onSearch={handleSearch}
+            />
+          </div>
         ) : null}
 
-        <Card style={{ marginTop: 16 }} title="查询结果">
-          <div
-            role="status"
-            aria-live="polite"
-            aria-label="查询结果播报"
-            style={VISUALLY_HIDDEN}
-          >
-            {announcement}
-          </div>
-          <StaleBanner
-            week={query.data?.week}
-            weeks={meta?.weeks}
-            inCalendar={context?.in_calendar}
-          />
-          {resultBody}
-        </Card>
+        <div
+          data-testid="public-results-area"
+          data-span={resultSpan}
+          style={{ gridColumn: `span ${resultSpan}`, minWidth: 0 }}
+        >
+          <Card className="public-results" title="查询结果">
+            <div
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              aria-label="查询结果播报"
+              style={VISUALLY_HIDDEN}
+            >
+              {announcement}
+            </div>
+            <StaleBanner
+              week={query.data?.week}
+              weeks={meta?.weeks}
+              inCalendar={context?.in_calendar}
+            />
+            {resultBody}
+          </Card>
+        </div>
       </main>
+
+      {/*
+        <600px 的固定查询按钮（Requirement 8.1）：放在 <main> 之外，position: fixed
+        贴住视口底部并避开安全区；用 form 属性关联筛选表单，回车与点击仍走同一个
+        onSubmit 与限流冷却守卫。宽度 ≥600 时这一块不渲染，按钮回到筛选卡内。
+      */}
+      {layout.fixedQueryBar && showFilter ? (
+        <div
+          data-testid="public-query-bar"
+          role="region"
+          aria-label="查询操作"
+          style={{
+            position: "fixed",
+            insetInline: 0,
+            bottom: 0,
+            zIndex: 20,
+            padding: "12px 16px",
+            paddingBottom: "calc(12px + env(safe-area-inset-bottom, 0px))",
+            background: token.colorBgContainer,
+            borderTop: `1px solid ${token.colorSplit}`,
+            boxShadow: "0 -2px 8px rgba(0, 0, 0, 0.06)",
+          }}
+        >
+          <Button
+            type="primary"
+            htmlType="submit"
+            form={FILTER_FORM_ID}
+            loading={query.loading}
+            disabled={coolingDown}
+            block
+            autoInsertSpace={false}
+            style={{ minHeight: 48 }}
+          >
+            查询
+          </Button>
+        </div>
+      ) : null}
 
       {/*
         页脚必须在 <main> 之外：<footer> 只有不嵌在 main/section 等分区里才映射成
         contentinfo，放在 main 里对真实读屏只是普通元素（jsdom 的 role 查询看不出来）。
       */}
-      <div style={{ maxWidth: 960, margin: "0 auto", padding: "0 24px 24px" }}>
+      <div
+        style={{
+          maxWidth: layout.maxWidth,
+          width: "100%",
+          margin: "0 auto",
+          // 窄屏底部有固定操作区：只在页脚让出一次高度，滚到底时不会被盖住。
+          padding: `0 ${layout.padding}px ${
+            layout.fixedQueryBar ? FIXED_QUERY_BAR_RESERVED_PX : layout.padding
+          }px`,
+          boxSizing: "border-box",
+        }}
+      >
         <PageFooter />
       </div>
     </>

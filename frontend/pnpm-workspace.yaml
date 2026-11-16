@@ -1,0 +1,10 @@
+# pnpm 12 的安装策略。第 10 项引入 msw 时由 pnpm 生成，保留在仓库里以保证
+# `task frontend:install` 可复现：
+# - msw 的 postinstall 只用来往项目里拷浏览器端 Service Worker 脚本，Node 环境
+#   的 MSW 单测不需要（测试用 msw/node 的 setupServer），所以显式不执行；
+# - eslint-plugin-react-refresh@0.5.8 的发布时间落在 pnpm 默认的
+#   minimumReleaseAge 窗口内，而本仓库已锁定该版本，故把它排除在窗口校验外。
+allowBuilds:
+  msw: false
+minimumReleaseAgeExclude:
+  - eslint-plugin-react-refresh@0.5.8

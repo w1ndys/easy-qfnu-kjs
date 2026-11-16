@@ -26,6 +26,7 @@ import {
 import { useApi } from "../../hooks/useApi";
 import { useMeta } from "../../hooks/useMeta";
 import { MAX_DATE_OFFSET } from "../../hooks/useQueryFilters";
+import { useViewportTier } from "../../hooks/useViewportTier";
 import { VISUALLY_HIDDEN } from "../../lib/a11y";
 import { getEmptyCopy, HINT_WEEK_NO_SCHEDULE } from "../../lib/hintCopy";
 
@@ -97,6 +98,8 @@ function RoomHeader({ data }: { data: DayResult }) {
 export function DayPage() {
   const { roomId } = useParams<{ roomId: string }>();
   const [searchParams] = useSearchParams();
+  // 与查询页共用三档断点：窄屏收窄内边距，把横向空间让给 12 格状态。
+  const padding = useViewportTier() === "compact" ? 16 : 24;
 
   // 只输入空格的房号等价于没填（后端 parseDayParams 也 trim 后判空），这里先归一。
   const room = (roomId ?? "").trim();
@@ -206,7 +209,15 @@ export function DayPage() {
 
   return (
     <>
-      <main style={{ padding: 24, maxWidth: 960, margin: "0 auto" }}>
+      <main
+        style={{
+          padding,
+          paddingBottom: padding,
+          maxWidth: 960,
+          margin: "0 auto",
+          boxSizing: "border-box",
+        }}
+      >
         <Typography.Title level={2}>全天状态</Typography.Title>
         <div
           role="status"
@@ -228,7 +239,14 @@ export function DayPage() {
         页脚必须在 <main> 之外：<footer> 只有不嵌在 main/section 等分区里才映射成
         contentinfo，放在 main 里对真实读屏只是普通元素（jsdom 的 role 查询看不出来）。
       */}
-      <div style={{ maxWidth: 960, margin: "0 auto", padding: "0 24px 24px" }}>
+      <div
+        style={{
+          maxWidth: 960,
+          margin: "0 auto",
+          padding: `0 ${padding}px ${padding}px`,
+          boxSizing: "border-box",
+        }}
+      >
         <PageFooter />
       </div>
     </>

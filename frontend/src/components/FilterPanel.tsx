@@ -25,11 +25,23 @@ export interface FilterPanelProps {
    * 筛选控件仍可编辑——冷却只拦「再发一次」，不冻结输入。
    */
   disabled?: boolean;
+  /**
+   * 是否在筛选区内渲染查询按钮。窄屏（<600px）时按钮由页面固定在视口底部，
+   * 这里就不再重复渲染——否则同一表单会出现两个同名「查询」按钮，
+   * 读屏与测试都会看到两份（Requirement 8.1）。
+   */
+  showSubmit?: boolean;
   /** 改日期/楼/节次：直接把新值写进 URL。 */
   onFiltersChange: (patch: Partial<QueryFilters>) => void;
   /** 回车与点击查询按钮走同一个出口；参数是去掉首尾空白后的关键词。 */
   onSearch: (keyword: string) => void;
 }
+
+/**
+ * 筛选表单的 id：窄屏的固定查询按钮在表单外，用 `form={FILTER_FORM_ID}`
+ * 关联回同一个表单，提交仍走 form 的 onSubmit 与冷却守卫，不另开一条路径。
+ */
+export const FILTER_FORM_ID = "public-filter-form";
 
 export function FilterPanel({
   context,
@@ -37,6 +49,7 @@ export function FilterPanel({
   filters,
   loading = false,
   disabled = false,
+  showSubmit = true,
   onFiltersChange,
   onSearch,
 }: FilterPanelProps) {
@@ -106,8 +119,12 @@ export function FilterPanel({
   };
 
   return (
-    <Card title="筛选条件">
-      <form aria-label="空教室筛选条件" onSubmit={handleSubmit}>
+    <Card title="筛选条件" className="public-filter">
+      <form
+        id={FILTER_FORM_ID}
+        aria-label="空教室筛选条件"
+        onSubmit={handleSubmit}
+      >
         <div style={{ display: "grid", gap: 16 }}>
           <div>
             <Typography.Text type="secondary">日期</Typography.Text>
@@ -193,16 +210,18 @@ export function FilterPanel({
             />
           </div>
 
-          <Button
-            type="primary"
-            htmlType="submit"
-            loading={loading}
-            disabled={disabled}
-            autoInsertSpace={false}
-            style={{ minHeight: 44 }}
-          >
-            查询
-          </Button>
+          {showSubmit ? (
+            <Button
+              type="primary"
+              htmlType="submit"
+              loading={loading}
+              disabled={disabled}
+              autoInsertSpace={false}
+              style={{ minHeight: 44 }}
+            >
+              查询
+            </Button>
+          ) : null}
         </div>
       </form>
     </Card>

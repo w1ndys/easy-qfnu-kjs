@@ -1,17 +1,21 @@
 import { render, screen } from "@testing-library/react";
+import { theme } from "antd";
 import {
   createMemoryRouter,
   RouterProvider,
   type RouteObject,
 } from "react-router";
 import { describe, expect, it, vi } from "vitest";
-import { createAppRoutes } from "./App";
+import { AppThemeProvider, createAppRoutes } from "./App";
+import { REDUCED_MOTION_QUERY } from "./hooks/useReducedMotion";
+import { QueryPage } from "./pages/public/QueryPage";
 import {
   contextFixture,
   dayFixture,
   metaFixture,
   screenFixture,
 } from "./test/fixtures/publicApi";
+import { setMediaQueryMatches } from "./test/matchMedia";
 
 function jsonResponse(data: unknown): Response {
   return new Response(
@@ -30,7 +34,19 @@ function renderAt(path: string, extraChildren: RouteObject[] = []) {
     initialEntries: [path],
   });
 
-  return render(<RouterProvider router={router} />);
+  // 与 App 共用同一个主题壳：路由用例（含查询页）都跑在真实的 ConfigProvider 下。
+  return render(
+    <AppThemeProvider>
+      <RouterProvider router={router} />
+    </AppThemeProvider>,
+  );
+}
+
+/** 把 ConfigProvider 合并后的 token 落到 DOM 上，供主题接线断言。 */
+function MotionProbe() {
+  const { token } = theme.useToken();
+
+  return <span data-testid="motion-probe" data-motion={String(token.motion)} />;
 }
 
 /**
@@ -166,5 +182,48 @@ describe("App 路由表", () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+});
+
+describe("prefers-reduced-motion 接线（tasklist 第 10 项）", () => {
+  it("系统开启减少动态效果时，查询页跑在 motion token 关闭的 App 主题壳里", async () => {
+    setMediaQueryMatches(REDUCED_MOTION_QUERY, true);
+
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/",
+          element: <QueryPage now={new Date(2026, 10, 15, 11, 59)} />,
+        },
+      ],
+      { initialEntries: ["/"] },
+    );
+
+    render(
+      <AppThemeProvider>
+        <RouterProvider router={router} />
+        <MotionProbe />
+      </AppThemeProvider>,
+    );
+
+    // 先等真实查询页渲染出筛选区：断言的才是「这个页面上的主题接线」，而不是空壳。
+    expect(
+      await screen.findByRole("group", { name: "日期" }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("motion-probe")).toHaveAttribute(
+      "data-motion",
+      "false",
+    );
+  });
+
+  it("系统未要求减少动态效果时保持 antd 默认动效", () => {
+    renderAt("/motion-probe", [
+      { path: "motion-probe", element: <MotionProbe /> },
+    ]);
+
+    expect(screen.getByTestId("motion-probe")).toHaveAttribute(
+      "data-motion",
+      "true",
+    );
   });
 });
