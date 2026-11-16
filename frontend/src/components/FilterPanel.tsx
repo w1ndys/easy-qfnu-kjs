@@ -20,6 +20,11 @@ export interface FilterPanelProps {
   filters: QueryFilters;
   /** 查询在途：只让按钮 loading，筛选控件保持可编辑（Requirement 5.1）。 */
   loading?: boolean;
+  /**
+   * 限流冷却中（42901 后 3 秒）：禁用查询按钮，并让回车与表单提交走同一个守卫。
+   * 筛选控件仍可编辑——冷却只拦「再发一次」，不冻结输入。
+   */
+  disabled?: boolean;
   /** 改日期/楼/节次：直接把新值写进 URL。 */
   onFiltersChange: (patch: Partial<QueryFilters>) => void;
   /** 回车与点击查询按钮走同一个出口；参数是去掉首尾空白后的关键词。 */
@@ -31,6 +36,7 @@ export function FilterPanel({
   meta,
   filters,
   loading = false,
+  disabled = false,
   onFiltersChange,
   onSearch,
 }: FilterPanelProps) {
@@ -85,6 +91,10 @@ export function FilterPanel({
   const nodeOptions = useMemo(() => buildNodeOptions(meta.axis), [meta.axis]);
 
   const submit = () => {
+    // 冷却期内的回车与点击都从这里被挡下：只禁用按钮拦不住回车。
+    if (disabled) {
+      return;
+    }
     onSearch(keyword.trim());
     // 提交后回到「无未提交编辑」状态，输入框以 URL 的已提交值为准。
     setDraftKeyword(null);
@@ -187,6 +197,7 @@ export function FilterPanel({
             type="primary"
             htmlType="submit"
             loading={loading}
+            disabled={disabled}
             autoInsertSpace={false}
             style={{ minHeight: 44 }}
           >

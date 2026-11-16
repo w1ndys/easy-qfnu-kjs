@@ -1,23 +1,33 @@
-// 全天状态视图（tasklist 第 5 项；Requirement 4.1–4.4）：
-// 房间头 + 12 小节网格。房间标识从路由参数取，日期偏移与教学楼从查询串取，
+// 全天状态视图（tasklist 第 5–6 项；Requirement 4.1–4.5、5）：
+// 房间头 + 12 小节网格 + 四态。房间标识从路由参数取，日期偏移与教学楼从查询串取，
 // 请求固定 view=day；状态名与节次名只来自 /api/meta 的字典与轴（design D11），
 // 周次与星期只取响应里的 week/weekday，前端不推算（design D3）。
 //
-// 加载/空/过期/错误四态与 hint.day_no_data 的页顶提示属于第 6 项的 StateViews；
-// 这里只保留与 QueryPage 同款的最小内联加载/失败卡片，避免请求失败时整页空白。
+// 四态与空教室页共用 StateViews：加载 Skeleton、错误 Result、过期/非教学周 warning。
+// 提示标记一律在页顶用 Alert 说明原因（Requirement 4.5 的「页顶提示」口径），
+// 房间头始终保留；week_no_schedule 只提示、网格照常，其余标记说明结果为空的原因，
+// 不再画一份全是「无数据」的网格。
 
-import { Alert, Button, Card, Result, Skeleton, Space, Typography } from "antd";
+import { Card, Result, Space, Typography } from "antd";
 import type { ReactNode } from "react";
 import { useCallback } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
-import type { ApiError } from "../../api/client";
 import { getErrorTitle } from "../../api/errors";
 import { queryDay } from "../../api/public";
 import type { DayResult } from "../../api/types";
 import { NodeGrid } from "../../components/NodeGrid";
+import { PageFooter } from "../../components/PageFooter";
+import {
+  ErrorView,
+  HintAlert,
+  LoadingView,
+  StaleBanner,
+} from "../../components/StateViews";
 import { useApi } from "../../hooks/useApi";
 import { useMeta } from "../../hooks/useMeta";
 import { MAX_DATE_OFFSET } from "../../hooks/useQueryFilters";
+import { VISUALLY_HIDDEN } from "../../lib/a11y";
+import { getEmptyCopy, HINT_WEEK_NO_SCHEDULE } from "../../lib/hintCopy";
 
 /** 星期展示名：下标即接口的 weekday（1=周一 … 7=周日）；0 表示不在教学周。 */
 const WEEKDAY_LABELS: Readonly<Record<number, string>> = {
@@ -84,47 +94,6 @@ function RoomHeader({ data }: { data: DayResult }) {
   );
 }
 
-/** 最小加载卡片；第 6 项会换成 StateViews 的 LoadingView。 */
-function LoadingCard({ text }: { text: string }) {
-  return (
-    <Card>
-      <Skeleton active paragraph={{ rows: 3 }} />
-      <Typography.Text type="secondary">{text}</Typography.Text>
-    </Card>
-  );
-}
-
-/** 最小失败卡片：分类文案 + 重试 + request_id（Requirement 1.6）；第 6 项会换成 ErrorView。 */
-function ErrorCard({
-  error,
-  onRetry,
-}: {
-  error: ApiError;
-  onRetry: () => void;
-}) {
-  return (
-    <Card>
-      <Alert
-        type="error"
-        showIcon
-        title={getErrorTitle(error.code)}
-        description={error.message || "请求失败，请稍后重试。"}
-        action={
-          <Button size="small" onClick={onRetry}>
-            重试
-          </Button>
-        }
-      />
-      <Typography.Text
-        type="secondary"
-        style={{ display: "block", marginTop: 8 }}
-      >
-        request_id：{error.requestId}
-      </Typography.Text>
-    </Card>
-  );
-}
-
 export function DayPage() {
   const { roomId } = useParams<{ roomId: string }>();
   const [searchParams] = useSearchParams();
@@ -135,6 +104,7 @@ export function DayPage() {
   const building = searchParams.get("building")?.trim() ?? "";
 
   const {
+    context,
     meta,
     loading: metaLoading,
     error: metaError,
@@ -170,28 +140,97 @@ export function DayPage() {
       />
     );
   } else if (metaLoading) {
-    body = <LoadingCard text="正在加载页面上下文与数据版本…" />;
+    body = <LoadingView label="正在加载页面上下文与数据版本…" />;
   } else if (metaError !== null) {
-    body = <ErrorCard error={metaError} onRetry={reloadMeta} />;
+    body = <ErrorView error={metaError} onRetry={reloadMeta} />;
   } else if (day.data !== null && meta !== null) {
+    const hint = day.data.hint;
+    // 只有 week_no_schedule 与「无提示」保留网格；其余标记说明结果为空的原因，
+    // 画 12 个「无数据」格只会重复同一个信息。
+    const keepsGrid = hint === undefined || hint.code === HINT_WEEK_NO_SCHEDULE;
+
     body = (
       <>
+        {/* 提示标记放页顶：Requirement 4.5 要求「在页顶显示提示并保留房间信息」。 */}
+        {hint !== undefined ? <HintAlert hint={hint} /> : null}
         <RoomHeader data={day.data} />
-        <Card style={{ marginTop: 16 }} title="逐节状态">
-          <NodeGrid axis={meta.axis} dict={meta.dict} nodes={day.data.nodes} />
-        </Card>
+        {keepsGrid ? (
+          <Card style={{ marginTop: 16 }} title="逐节状态">
+            <NodeGrid
+              axis={meta.axis}
+              dict={meta.dict}
+              nodes={day.data.nodes}
+            />
+          </Card>
+        ) : null}
       </>
     );
   } else if (day.error !== null) {
-    body = <ErrorCard error={day.error} onRetry={day.reload} />;
+    body = <ErrorView error={day.error} onRetry={day.reload} />;
   } else {
-    body = <LoadingCard text="正在加载该教室的全天状态…" />;
+    body = <LoadingView label="正在加载该教室的全天状态…" />;
   }
 
+  // 读屏播报：加载 / 结果 / 空态 / 错误四态都从这里出（Requirement 8.6 与查询页同一口径）。
+  // 空态标题读 hintCopy 的同一张表，界面与播报不各说一套。
+  const announcement = (() => {
+    if (room === "") {
+      return "缺少房间标识，请回到空教室查询重新选择";
+    }
+    if (metaLoading) {
+      return "正在加载页面上下文与数据版本";
+    }
+    if (metaError !== null) {
+      return `页面加载失败：${getErrorTitle(metaError.code)}`;
+    }
+    if (day.loading) {
+      return "正在加载该教室的全天状态";
+    }
+    if (day.error !== null) {
+      return `全天状态加载失败：${getErrorTitle(day.error.code)}`;
+    }
+    if (day.data === null) {
+      return "";
+    }
+    const { hint, week, weekday, nodes } = day.data;
+    const availableCount = nodes.filter((node) => node.available).length;
+    if (hint !== undefined) {
+      const title = getEmptyCopy(hint).title;
+      // day_no_data 时网格不再画，播报只说原因；week_no_schedule 仍展示网格，补上可用节数。
+      return hint.code === HINT_WEEK_NO_SCHEDULE
+        ? `${title}；共 ${availableCount} 节可用`
+        : `查询结果：${title}`;
+    }
+    return `查询结果：${weekLabel(week, weekday)}，共 ${availableCount} 节可用`;
+  })();
+
   return (
-    <main style={{ padding: 24, maxWidth: 960, margin: "0 auto" }}>
-      <Typography.Title level={2}>全天状态</Typography.Title>
-      {body}
-    </main>
+    <>
+      <main style={{ padding: 24, maxWidth: 960, margin: "0 auto" }}>
+        <Typography.Title level={2}>全天状态</Typography.Title>
+        <div
+          role="status"
+          aria-live="polite"
+          aria-label="全天状态播报"
+          style={VISUALLY_HIDDEN}
+        >
+          {announcement}
+        </div>
+        <StaleBanner
+          week={day.data?.week}
+          weeks={meta?.weeks}
+          inCalendar={context?.in_calendar}
+        />
+        {body}
+      </main>
+
+      {/*
+        页脚必须在 <main> 之外：<footer> 只有不嵌在 main/section 等分区里才映射成
+        contentinfo，放在 main 里对真实读屏只是普通元素（jsdom 的 role 查询看不出来）。
+      */}
+      <div style={{ maxWidth: 960, margin: "0 auto", padding: "0 24px 24px" }}>
+        <PageFooter />
+      </div>
+    </>
   );
 }

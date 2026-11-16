@@ -35,7 +35,7 @@
   - 房间头显示房名/房号/楼名/日期（周次与星期取自响应 `week`/`weekday`；缺 `roomId` 时显示空态并给回查询页入口）
   - 验收：夹具中 3 个缺失节点渲染为「无数据」且断言无「空闲」文本；缺 `roomId` 路由显示空态；状态名来自字典而非硬编码
 
-- [ ] 6. 加载、空、过期与错误四态
+- [x] 6. 加载、空、过期与错误四态
   - `StateViews.tsx`：`LoadingView`（Skeleton，不遮筛选）、`EmptyView`（按 `hint.code` 四档文案 + 一条可操作建议）、`StaleBanner`（`stale` 或 `in_calendar=false`）、`ErrorView`（分类文案 + 重试 + `request_id`）
   - 过期判定：查询响应的 `week` 命中 `meta.weeks[].week` 且 `stale=true`；`week_no_schedule` 用置顶提示且结果照常展示
   - `PageFooter` 展示数据来源、更新频率与仅供参考说明；`42901` 时按钮禁用 3 秒

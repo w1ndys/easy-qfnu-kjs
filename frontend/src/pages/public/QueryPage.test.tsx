@@ -8,15 +8,26 @@ import {
 } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AvailabilityResult } from "../../api/types";
+import type {
+  AvailabilityResult,
+  ContextInfo,
+  MetaResult,
+} from "../../api/types";
 import {
   availabilityFixture,
   contextFixture,
   duplicateNameAvailabilityFixture,
+  emptyMetaFixture,
   metaFixture,
+  noDataAvailabilityFixture,
+  noMatchAvailabilityFixture,
+  outOfCalendarContextFixture,
   pagedAvailabilityFixture,
   pagedAvailabilityLastPageFixture,
   pagedAvailabilitySecondPageFixture,
+  staleMetaFixture,
+  weekNoScheduleAvailabilityFixture,
+  weekNoScheduleEmptyAvailabilityFixture,
 } from "../../test/fixtures/publicApi";
 import { QueryPage, RESULT_PAGE_SIZE } from "./QueryPage";
 
@@ -37,28 +48,50 @@ function envelope(data: unknown, requestId: string): Response {
 }
 
 interface StubOptions {
-  /** true 时所有请求挂起，直到调用 release()：用来观察加载态。 */
+  /** true 时所有请求挂起，直到调用 release()：用来观察整页加载态。 */
   holdUntilRelease?: boolean;
+  /** 只挂起 /api/query（上下文与元数据立即返回）：观察「加载态不遮筛选」。 */
+  holdQueryUntilRelease?: boolean;
   /** 覆盖 /api/query 的响应；入参是本次请求的 offset（0 起）。 */
   availability?: (offset: number) => AvailabilityResult;
+  /** 让 /api/query 返回失败信封（业务码非 0），优先级高于 availability。 */
+  availabilityError?: { code: number; message: string; requestId: string };
+  /** 覆盖 /api/context 的响应（如 in_calendar=false）。 */
+  context?: ContextInfo;
+  /** 覆盖 /api/meta 的响应（如某周 stale=true）。 */
+  meta?: MetaResult;
 }
 
-function stubPublicApi(options: StubOptions = {}) {
+function stubPublicApi(overrides: StubOptions = {}) {
   const requests: URL[] = [];
+  // options 按引用返回给用例：同一个页面上可以切换「下一次响应的形状」，
+  // 用来验证「先成功后失败时旧列表不残留」这类跨请求行为。
+  const options: StubOptions = { ...overrides };
   let release = () => {};
 
-  if (options.holdUntilRelease) {
+  if (
+    overrides.holdUntilRelease === true ||
+    overrides.holdQueryUntilRelease === true
+  ) {
     let openGate = () => {};
     const gate = new Promise<void>((resolve) => {
       openGate = resolve;
     });
     release = () => openGate();
+
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         const url = new URL(String(input), "http://localhost");
         requests.push(url);
-        await gate;
+        // 两个挂起开关各管各的：整页挂起拦全部请求，查询挂起只拦 /api/query。
+        const held =
+          options.holdUntilRelease === true ||
+          (options.holdQueryUntilRelease === true &&
+            url.pathname === "/api/query");
+        if (held) {
+          await gate;
+        }
         return respond(url, options);
       }),
     );
@@ -76,6 +109,7 @@ function stubPublicApi(options: StubOptions = {}) {
   return {
     requests,
     release,
+    options,
     queryRequests: () =>
       requests.filter((url) => url.pathname === "/api/query"),
   };
@@ -83,12 +117,16 @@ function stubPublicApi(options: StubOptions = {}) {
 
 function respond(url: URL, options: StubOptions = {}): Response {
   if (url.pathname === "/api/context") {
-    return envelope(contextFixture, "req_context");
+    return envelope(options.context ?? contextFixture, "req_context");
   }
   if (url.pathname === "/api/meta") {
-    return envelope(metaFixture, "req_meta");
+    return envelope(options.meta ?? metaFixture, "req_meta");
   }
   if (url.pathname === "/api/query") {
+    if (options.availabilityError !== undefined) {
+      const { code, message, requestId } = options.availabilityError;
+      return errorEnvelope(code, message, requestId);
+    }
     const offset = Number(url.searchParams.get("offset") ?? "0");
     return envelope(
       options.availability?.(offset) ?? availabilityFixture,
@@ -96,6 +134,18 @@ function respond(url: URL, options: StubOptions = {}): Response {
     );
   }
   throw new Error(`测试未处理的请求：${url.pathname}`);
+}
+
+/** 失败信封：HTTP 200 + 非 0 业务码（成败只看信封 code，Requirement 1.4）。 */
+function errorEnvelope(
+  code: number,
+  message: string,
+  requestId: string,
+): Response {
+  return new Response(
+    JSON.stringify({ code, message, data: null, request_id: requestId }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
 }
 
 function renderQueryPage(initialEntry: string, now: Date) {
@@ -490,5 +540,255 @@ describe("结果列表与分页", () => {
     expect(
       screen.getByRole("link", { name: "看 理工楼302 的全天状态" }),
     ).toHaveAttribute("href", "/day/Q11-302?date_offset=2&building=Q10");
+  });
+});
+
+describe("加载、空、过期与错误四态（tasklist 第 6 项）", () => {
+  it("查询在途时结果区显示骨架，筛选控件仍可编辑（Requirement 5.1）", async () => {
+    const stub = stubPublicApi({ holdQueryUntilRelease: true });
+
+    const { container } = renderQueryPage("/", OPEN_AT_1159);
+    await screen.findByRole("group", { name: "日期" });
+
+    expect(await screen.findByText("正在查询空教室…")).toBeInTheDocument();
+    expect(container.querySelector(".ant-skeleton")).not.toBeNull();
+    // 骨架只占结果区：筛选控件没有被遮罩或禁用。
+    expect(screen.getByRole("radio", { name: "11-17" })).toBeEnabled();
+    expect(screen.getByRole("combobox", { name: "教学楼" })).toBeEnabled();
+    expect(
+      screen.queryByRole("list", { name: "空教室结果" }),
+    ).not.toBeInTheDocument();
+
+    stub.release();
+
+    expect(await screen.findByText("综合楼101")).toBeInTheDocument();
+    expect(screen.queryByText("正在查询空教室…")).not.toBeInTheDocument();
+  });
+
+  it.each<[string, AvailabilityResult, string]>([
+    ["no_match", noMatchAvailabilityFixture, "没有符合条件的教室"],
+    ["no_data", noDataAvailabilityFixture, "该日期没有可查询的数据"],
+  ])(
+    "%s 显示对应空态文案，结果区不再渲染列表",
+    async (_code, fixture, title) => {
+      const stub = stubPublicApi({ availability: () => fixture });
+
+      renderQueryPage("/", OPEN_AT_1159);
+
+      expect(await screen.findByText(title)).toBeInTheDocument();
+      expect(
+        screen.queryByRole("list", { name: "空教室结果" }),
+      ).not.toBeInTheDocument();
+      expect(stub.queryRequests()).toHaveLength(1);
+    },
+  );
+
+  it("week_no_schedule 用置顶提示，命中结果照常展示", async () => {
+    stubPublicApi({ availability: () => weekNoScheduleAvailabilityFixture });
+
+    renderQueryPage("/", OPEN_AT_1159);
+
+    expect(await screen.findByText("该周疑似无排课")).toBeInTheDocument();
+    // 结果区没有被空态替换：命中项与分页总数都还在。
+    const list = screen.getByRole("list", { name: "空教室结果" });
+    expect(within(list).getByText("综合楼201")).toBeInTheDocument();
+    expect(screen.getByText("共 45 间空教室")).toBeInTheDocument();
+    // 提示在顶部（Alert），而不是被当成空态的 Empty。
+    expect(screen.getByRole("alert")).toHaveTextContent("该周疑似无排课");
+    expect(screen.queryByText("没有符合条件的教室")).not.toBeInTheDocument();
+  });
+
+  it("week_no_schedule 且 total=0 时只留置顶提示，不画空列表与分页（Requirement 5.2）", async () => {
+    stubPublicApi({
+      availability: () => weekNoScheduleEmptyAvailabilityFixture,
+    });
+
+    renderQueryPage("/", OPEN_AT_1159);
+
+    expect(await screen.findByText("该周疑似无排课")).toBeInTheDocument();
+    // 没有命中可展示：空列表与「共 0 间空教室」的分页都不该出现。
+    expect(
+      screen.queryByRole("list", { name: "空教室结果" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("共 0 间空教室")).not.toBeInTheDocument();
+    // 仍是置顶 Alert，而不是被当成空态把结果区换成 Empty。
+    expect(screen.getByRole("alert")).toHaveTextContent("该周疑似无排课");
+    expect(screen.queryByText("没有符合条件的教室")).not.toBeInTheDocument();
+  });
+
+  it("无当前数据版本（meta.empty）时显示「暂无数据版本」，优先于 hint=no_data", async () => {
+    const stub = stubPublicApi({
+      meta: emptyMetaFixture,
+      availability: () => noDataAvailabilityFixture,
+    });
+
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    // 后端 total=0 时总会给 hint，所以这一档只能靠 meta.empty 优先才可达。
+    expect(screen.getByText("暂无数据版本")).toBeInTheDocument();
+    expect(
+      screen.getByText("数据版本还没有发布，稍后再来"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("该日期没有可查询的数据"),
+    ).not.toBeInTheDocument();
+    // 读屏播报与界面同一档，不能界面说「暂无数据版本」而播报说 no_data。
+    expect(
+      screen.getByRole("status", { name: "查询结果播报" }),
+    ).toHaveTextContent("查询结果：暂无数据版本");
+  });
+
+  it("响应周次在元数据中被标记过期时提示，数据仍可见（Requirement 5.3）", async () => {
+    stubPublicApi({
+      meta: staleMetaFixture,
+      availability: () => pagedAvailabilityFixture,
+    });
+
+    renderQueryPage("/", OPEN_AT_1159);
+
+    expect(await screen.findByText("第 11 周数据已过期")).toBeInTheDocument();
+    // 最近成功时间按 Asia/Shanghai 展示：07:10Z → 15:10。
+    expect(
+      screen.getByText(/该周最近一次成功同步：2026-11-14 15:10/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("综合楼201")).toBeInTheDocument();
+  });
+
+  it("in_calendar=false 时提示当前不在教学周，已有数据照常展示（Requirement 5.4）", async () => {
+    stubPublicApi({ context: outOfCalendarContextFixture });
+
+    renderQueryPage("/", OPEN_AT_1159);
+
+    expect(await screen.findByText("当前不在教学周")).toBeInTheDocument();
+    expect(await screen.findByText("综合楼101")).toBeInTheDocument();
+  });
+
+  it("请求失败时用错误占位替换结果区，上一次列表不残留（Requirement 5.5）", async () => {
+    const stub = stubPublicApi({
+      availability: () => pagedAvailabilityFixture,
+    });
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+    expect(screen.getByText("综合楼201")).toBeInTheDocument();
+
+    // 同一个页面的下一次查询改成 50000：旧列表必须一起消失。
+    stub.options.availabilityError = {
+      code: 50000,
+      message: "",
+      requestId: "req_fail",
+    };
+    fireEvent.click(screen.getByRole("radio", { name: "11-17" }));
+
+    expect(await screen.findByText("服务异常")).toBeInTheDocument();
+    expect(screen.getByText("request_id：req_fail")).toBeInTheDocument();
+    expect(screen.queryByText("综合楼201")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("list", { name: "空教室结果" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeEnabled();
+  });
+
+  it("错误态点重试用同一个请求键重发一次请求", async () => {
+    const stub = stubPublicApi({
+      availabilityError: {
+        code: 50000,
+        message: "",
+        requestId: "req_fail",
+      },
+    });
+    renderQueryPage("/", OPEN_AT_1159);
+    expect(await screen.findByText("服务异常")).toBeInTheDocument();
+
+    // 让下一次成功：重试按钮应重发同一组参数而不是留在错误态。
+    stub.options.availabilityError = undefined;
+    stub.options.availability = () => availabilityFixture;
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+    expect(await screen.findByText("综合楼101")).toBeInTheDocument();
+    expect(stub.queryRequests()).toHaveLength(2);
+  });
+
+  it("42901 时显示限流文案，查询按钮禁用 3 秒后恢复（design「Error Handling」）", async () => {
+    vi.useFakeTimers();
+    try {
+      const stub = stubPublicApi({
+        availabilityError: {
+          code: 42901,
+          message: "",
+          requestId: "req_limited",
+        },
+      });
+
+      renderQueryPage("/", OPEN_AT_1159);
+
+      // 假计时器下 waitFor 无法轮询（它内部的 setTimeout 也被假化），
+      // 改用 act + advanceTimersByTimeAsync 冲刷微任务：fetch 桩、信封解析与
+      // React 状态更新都挂在微任务上，循环几轮直到错误文案出现，不依赖固定次数。
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        if (screen.queryByText("请求过于频繁，请稍后重试") !== null) {
+          break;
+        }
+      }
+
+      expect(screen.getByText("请求过于频繁，请稍后重试")).toBeInTheDocument();
+      expect(stub.queryRequests()).toHaveLength(1);
+      // 冷却中：查询与重试都不能再撞一次限流。
+      expect(screen.getByRole("button", { name: /查询/ })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "重试" })).toBeDisabled();
+
+      act(() => {
+        vi.advanceTimersByTime(2_999);
+      });
+      expect(screen.getByRole("button", { name: /查询/ })).toBeDisabled();
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(screen.getByRole("button", { name: /查询/ })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "重试" })).toBeEnabled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aria-live 区域随结果变化更新播报文本（Requirement 8.6）", async () => {
+    const stub = stubPublicApi();
+    renderQueryPage("/", OPEN_AT_1159);
+    await waitForQuerySettled(stub, 1);
+
+    const live = () => screen.getByRole("status", { name: "查询结果播报" });
+    expect(live()).toHaveTextContent("查询结果：共 1 间空教室");
+
+    // 换日期触发第二次查询：命中数变化 → 播报文本跟着变。
+    stub.options.availability = () => pagedAvailabilityFixture;
+    fireEvent.click(screen.getByRole("radio", { name: "11-17" }));
+    await waitFor(() =>
+      expect(live()).toHaveTextContent("查询结果：共 45 间空教室"),
+    );
+
+    // 进入空态也走同一个播报区，且用与界面相同的文案表。
+    stub.options.availability = () => noMatchAvailabilityFixture;
+    fireEvent.click(screen.getByRole("radio", { name: "11-18" }));
+    await waitFor(() =>
+      expect(live()).toHaveTextContent("查询结果：没有符合条件的教室"),
+    );
+  });
+
+  it("公开页页脚展示数据来源、更新频率与仅供参考（Requirement 5.6）", async () => {
+    stubPublicApi();
+    renderQueryPage("/", OPEN_AT_1159);
+
+    const footer = await screen.findByRole("contentinfo");
+    expect(footer).toHaveTextContent("数据来自学校教务系统");
+    expect(footer).toHaveTextContent("每周自动同步");
+    expect(footer).toHaveTextContent("仅供参考");
+    // 页脚必须在 <main> 之外：<footer> 嵌在 main 里对真实读屏只是普通元素，
+    // jsdom 的 role 查询分辨不出来，所以这里额外钉住位置。
+    expect(footer.closest("main")).toBeNull();
+    expect(screen.getByRole("main")).not.toContainElement(footer);
   });
 });

@@ -272,3 +272,108 @@ export const dayFixture = {
     dayNode(node, block, state),
   ),
 } satisfies DayResult;
+
+/**
+ * 第 6 项空态夹具：三档空教室提示标记（Requirement 5.2）。
+ * total=0 时后端才会给 hint（backend/internal/query/availability.go 的 availabilityHint），
+ * 所以前两档的 items 为空；week_no_schedule 另见下面的对抗性夹具。
+ */
+export const noMatchAvailabilityFixture = {
+  total: 0,
+  items: [],
+  date: "2026-11-17",
+  term: "2026-2027-1",
+  week: 11,
+  weekday: 2,
+  hint: { code: "no_match", message: "没有符合条件的教室" },
+} satisfies AvailabilityResult;
+
+/** 「该日期没有可查询的数据」：无当前版本、学期外或该日期不可查时的口径。 */
+export const noDataAvailabilityFixture = {
+  ...noMatchAvailabilityFixture,
+  hint: { code: "no_data", message: "没有已发布的数据" },
+} satisfies AvailabilityResult;
+
+/**
+ * 第 6 项对抗性夹具：week_no_schedule 与命中项同时存在。
+ * 真实后端只在 total=0 时给 hint，这里刻意让提示与结果并存，用来钉住
+ * 「week_no_schedule 用置顶提示、结果照常展示」——页面不能把它当空态替换结果区。
+ */
+export const weekNoScheduleAvailabilityFixture = {
+  ...pagedAvailabilityFixture,
+  hint: { code: "week_no_schedule", message: "该周疑似无排课" },
+} satisfies AvailabilityResult;
+
+/** 第 6 项过期夹具：第 11 周被后端标记 stale，页面应提示但照常展示数据。 */
+export const staleMetaFixture = {
+  ...metaFixture,
+  weeks: [
+    {
+      week: 11,
+      published: true,
+      last_success_at: "2026-11-14T07:10:12Z",
+      stale: true,
+    },
+  ],
+} satisfies MetaResult;
+
+/** 第 6 项非教学周夹具：/api/context 的 in_calendar=false（Requirement 5.4）。 */
+export const outOfCalendarContextFixture = {
+  ...contextFixture,
+  term: "",
+  week: 0,
+  weekday: 0,
+  in_calendar: false,
+} satisfies ContextInfo;
+
+/**
+ * 第 6 项无当前数据版本夹具：release/dict/axis 为 null、empty 为 true（MetaResult 契约）。
+ * 这一态下后端 total=0 仍会给 hint=no_data，页面必须让「暂无数据版本」压过 hint，
+ * 否则该档文案永远不可达（上一轮复审 minor 2）。
+ */
+export const emptyMetaFixture = {
+  release: null,
+  dict: null,
+  axis: null,
+  buildings: [],
+  weeks: [],
+  empty: true,
+} satisfies MetaResult;
+
+/**
+ * 第 6 项 week_no_schedule 无命中夹具：真实后端在该周无观测时给 total=0 + 该 hint。
+ * 页面只留置顶提示，不画空列表与「共 0 间空教室」分页（上一轮复审 minor 3）。
+ */
+export const weekNoScheduleEmptyAvailabilityFixture = {
+  total: 0,
+  items: [],
+  date: "2026-11-17",
+  term: "2026-2027-1",
+  week: 11,
+  weekday: 2,
+  hint: { code: "week_no_schedule", message: "该周疑似无排课" },
+} satisfies AvailabilityResult;
+
+/** 第 6 项全天状态空态：整日无观测（Requirement 4.5 的 day_no_data）。 */
+export const dayNoDataHintFixture = {
+  ...dayFixture,
+  // 整日无观测时后端把每一节都整形成 state_key=""、label="无数据"、has_data=false。
+  nodes: dayFixture.nodes.map((node) => ({
+    ...node,
+    state_key: "",
+    label: "无数据",
+    available: false,
+    has_data: false,
+  })),
+  hint: { code: "day_no_data", message: "该日无数据" },
+} satisfies DayResult;
+
+/**
+ * 第 6 项全天状态对抗性夹具：week_no_schedule 与逐节状态并存。
+ * 真实后端在该周无观测时不会返回逐节状态；这里刻意保留节点，
+ * 用来钉住「该周疑似无排课只置顶提示，网格照常展示」。
+ */
+export const dayWeekNoScheduleFixture = {
+  ...dayFixture,
+  hint: { code: "week_no_schedule", message: "该周疑似无排课" },
+} satisfies DayResult;

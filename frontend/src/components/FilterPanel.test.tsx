@@ -14,7 +14,10 @@ const baseFilters: QueryFilters = {
   page: 1,
 };
 
-function renderPanel(overrides: Partial<QueryFilters> = {}) {
+function renderPanel(
+  overrides: Partial<QueryFilters> = {},
+  options: { disabled?: boolean } = {},
+) {
   const onFiltersChange = vi.fn();
   const onSearch = vi.fn();
   const filters = { ...baseFilters, ...overrides };
@@ -27,6 +30,7 @@ function renderPanel(overrides: Partial<QueryFilters> = {}) {
         context={contextFixture}
         meta={metaFixture}
         filters={filters}
+        disabled={options.disabled}
         onFiltersChange={onFiltersChange}
         onSearch={onSearch}
       />
@@ -169,5 +173,20 @@ describe("关键词与查询按钮", () => {
 
     expect(onSearch).toHaveBeenCalledTimes(1);
     expect(onSearch).toHaveBeenCalledWith("综合");
+  });
+});
+
+describe("限流冷却", () => {
+  it("冷却中禁用查询按钮，回车也不发起查询（42901 的三秒冷却）", () => {
+    const { onSearch } = renderPanel({}, { disabled: true });
+
+    expect(screen.getByRole("button", { name: "查询" })).toBeDisabled();
+
+    // 只禁用按钮拦不住回车：输入框的回车必须走同一个守卫。
+    const input = screen.getByRole("textbox", { name: "关键词" });
+    fireEvent.change(input, { target: { value: "综合" } });
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+
+    expect(onSearch).not.toHaveBeenCalled();
   });
 });

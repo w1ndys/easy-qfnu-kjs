@@ -6,8 +6,11 @@ import type { ContextInfo, DayResult, MetaResult } from "../../api/types";
 import {
   contextFixture,
   dayFixture,
+  dayNoDataHintFixture,
+  dayWeekNoScheduleFixture,
   metaFixture,
   noAxisMetaFixture,
+  staleMetaFixture,
   unorderedAxisMetaFixture,
 } from "../../test/fixtures/publicApi";
 
@@ -29,6 +32,8 @@ interface StubOptions {
   /** 覆盖 /api/meta 的响应（用来模拟字典升级）。 */
   meta?: MetaResult;
   context?: ContextInfo;
+  /** 让 view=day 返回失败信封（业务码非 0），优先级高于 day。 */
+  dayError?: { code: number; message: string; requestId: string };
 }
 
 function stubPublicApi(options: StubOptions = {}) {
@@ -56,6 +61,13 @@ function respond(url: URL, options: StubOptions): Response {
     return envelope(options.meta ?? metaFixture, "req_meta");
   }
   if (url.pathname === "/api/query") {
+    if (options.dayError !== undefined) {
+      const { code, message, requestId } = options.dayError;
+      return new Response(
+        JSON.stringify({ code, message, data: null, request_id: requestId }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     return envelope(options.day ?? dayFixture, "req_day");
   }
   throw new Error(`测试未处理的请求：${url.pathname}`);
@@ -312,5 +324,136 @@ describe("缺少房间标识", () => {
 
     expect(await screen.findByText("缺少房间标识")).toBeInTheDocument();
     expect(stub.dayRequests()).toHaveLength(0);
+  });
+
+  it("缺房号时 aria-live 区域播报缺失原因，而不是空字符串", () => {
+    stubPublicApi();
+    renderDayPage("/day");
+
+    expect(
+      screen.getByRole("status", { name: "全天状态播报" }),
+    ).toHaveTextContent("缺少房间标识，请回到空教室查询重新选择");
+  });
+});
+
+describe("加载、空、过期与错误四态（tasklist 第 6 项）", () => {
+  it("day_no_data 在页顶提示「该日无数据」，房间信息保留、不再画网格（Requirement 4.5）", async () => {
+    stubPublicApi({ day: dayNoDataHintFixture });
+
+    renderDayPage("/day/Q10-101");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("该日无数据");
+    // 可操作建议跟着提示一起给。
+    expect(alert).toHaveTextContent("换一间教室，或看同教室的其他日期");
+
+    // 房间头不因空态消失（Requirement 4.5 的「保留房间信息」）。
+    expect(screen.getByText("综合楼101")).toBeInTheDocument();
+    expect(screen.getByText("房间标识：Q10-101")).toBeInTheDocument();
+
+    // 提示在房间头之前：这是「页顶」而不是结果区里的一行。
+    expect(
+      alert.compareDocumentPosition(screen.getByText("综合楼101")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // 不把「整日无观测」再画成 12 个格：原因已经在页顶说清楚了。
+    expect(
+      screen.queryByRole("list", { name: "全天状态小节" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("week_no_schedule 只置顶提示，12 小节网格照常展示", async () => {
+    stubPublicApi({ day: dayWeekNoScheduleFixture });
+
+    renderDayPage("/day/Q10-101");
+
+    const grid = await waitForGrid();
+    expect(within(grid).getAllByRole("listitem")).toHaveLength(12);
+    // 逐节状态没有被提示顶掉：5 个空闲格仍在。
+    expect(within(grid).getAllByText("空闲")).toHaveLength(5);
+    expect(screen.getByText("该周疑似无排课")).toBeInTheDocument();
+    expect(screen.queryByText("该日无数据")).not.toBeInTheDocument();
+  });
+
+  it("aria-live 区域先播报加载、再播报结果节数（Requirement 8.6）", async () => {
+    stubPublicApi();
+
+    renderDayPage("/day/Q10-101");
+
+    const live = () => screen.getByRole("status", { name: "全天状态播报" });
+    // 首帧上下文与元数据都还在途（useApi 的 loading 由「请求键是否已定格」派生）。
+    expect(live()).toHaveTextContent("正在加载页面上下文与数据版本");
+
+    await waitForGrid();
+    // 结果播报的节数取自响应的 available，而不是页面里另算一套。
+    expect(live()).toHaveTextContent("查询结果：第 11 周 · 周三，共 5 节可用");
+  });
+
+  it("aria-live 区域在空态播报与页顶提示同一句文案（Requirement 8.6）", async () => {
+    stubPublicApi({ day: dayNoDataHintFixture });
+
+    renderDayPage("/day/Q10-101");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("该日无数据");
+    expect(
+      screen.getByRole("status", { name: "全天状态播报" }),
+    ).toHaveTextContent("查询结果：该日无数据");
+  });
+
+  it("aria-live 区域在错误态播报分类文案（Requirement 5.5、8.6）", async () => {
+    stubPublicApi({
+      dayError: { code: 50000, message: "", requestId: "req_day_live" },
+    });
+
+    renderDayPage("/day/Q10-101");
+
+    expect(await screen.findByText("服务异常")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "全天状态播报" }),
+    ).toHaveTextContent("全天状态加载失败：服务异常");
+  });
+
+  it("该周在元数据里被标记过期时提示，逐节状态仍可见（Requirement 5.3）", async () => {
+    stubPublicApi({ meta: staleMetaFixture });
+
+    renderDayPage("/day/Q10-101");
+
+    expect(await screen.findByText("第 11 周数据已过期")).toBeInTheDocument();
+    expect(
+      screen.getByRole("list", { name: "全天状态小节" }),
+    ).toBeInTheDocument();
+  });
+
+  it("请求失败时显示分类文案、重试与 request_id，且不再渲染网格（Requirement 5.5）", async () => {
+    stubPublicApi({
+      dayError: { code: 50000, message: "", requestId: "req_day_fail" },
+    });
+
+    renderDayPage("/day/Q10-101");
+
+    expect(await screen.findByText("服务异常")).toBeInTheDocument();
+    expect(screen.getByText("request_id：req_day_fail")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("list", { name: "全天状态小节" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("页脚展示数据来源、更新频率与仅供参考（Requirement 5.6）", async () => {
+    stubPublicApi();
+
+    renderDayPage("/day/Q10-101");
+    await waitForGrid();
+
+    const footer = screen.getByRole("contentinfo");
+    expect(footer).toHaveTextContent("数据来自学校教务系统");
+    expect(footer).toHaveTextContent("每周自动同步");
+    expect(footer).toHaveTextContent("仅供参考");
+    // 页脚必须在 <main> 之外：<footer> 嵌在 main 里对真实读屏只是普通元素，
+    // jsdom 的 role 查询分辨不出来，所以这里额外钉住位置。
+    expect(footer.closest("main")).toBeNull();
+    expect(screen.getByRole("main")).not.toContainElement(footer);
   });
 });
