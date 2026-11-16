@@ -85,11 +85,11 @@ Updated: 2026-11-16
 
 依赖：7（命令名定稿后才能写文档）
 
-- [ ] `README.md` 新增「部署」段：前置条件、`deploy:env → deploy:check → up → deploy:health` 四步、首次初始化、业务回退、镜像回退、数据库恢复，末尾链接验收记录。
-- [ ] `docs/acceptance-2026-11-16-internal.md` 建好六节骨架（内网部署、首次初始化、业务版本回退、镜像回退、数据库恢复、并发演练），每节含可执行命令与期望结果。
-- [ ] 文档里出现的每个 `task` 名字都在 `task --list` 中存在；不出现 `task deploy:ps` 这类未定义 target。
-- [ ] 写明门禁口径：`task gate` 的 7 项不变、`task deploy:check` 独立且不并入 `gate`（已定）、改编排/镜像/nginx/脚本/配置时必须追加跑 `deploy:check`。
-- [ ] 写明拓扑口径：宿主端口只落在 `web`，`server` 只在内网 `18080`，`TRUST_PROXY_HEADERS` 因反代透传而为 `true`，`/api` 与探针都经 `web` 反代。
+- [x] `README.md` 新增「部署」段：前置条件、`deploy:env → deploy:check → up → deploy:health` 四步、首次初始化、业务回退、镜像回退、数据库恢复，末尾链接验收记录。
+- [x] `docs/acceptance-2026-11-16-internal.md` 建好六节骨架（内网部署、首次初始化、业务版本回退、镜像回退、数据库恢复、并发演练），每节含可执行命令与期望结果。
+- [x] 文档里出现的每个 `task` 名字都在 `task --list` 中存在；不出现 `task deploy:ps` 这类未定义 target。
+- [x] 写明门禁口径：`task gate` 的 7 项不变、`task deploy:check` 独立且不并入 `gate`（已定）、改编排/镜像/nginx/脚本/配置时必须追加跑 `deploy:check`。
+- [x] 写明拓扑口径：宿主端口只落在 `web`，`server` 只在内网 `18080`，`TRUST_PROXY_HEADERS` 因反代透传而为 `true`，`/api` 与探针都经 `web` 反代。
 
 ## 9. 验收演练与收尾
 

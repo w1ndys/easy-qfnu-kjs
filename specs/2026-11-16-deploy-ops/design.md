@@ -466,7 +466,7 @@ compose 的 `depends_on: postgres: service_healthy` 只保证「库能接受连�
 
 1. `curl -s http://127.0.0.1:8080/api/admin/state` → `initialized=false`（未初始化时不存在可登录账号）。
 2. 打开 `/admin` 设置管理员密码 → 成功后**立即导出加密密钥**：`task deploy:secret-backup`，把 `backup/secret/secret.key` 移到离线介质，不要和数据库备份放同一处。
-3. 登录 → 业务设置：教务账号与密码、OCR 地址与超时、教学楼白名单、同步 cron、展示名。
+3. 登录 → 业务设置：`jw_username`、`jw_password`、`ocr_base_url`、`feishu_webhook`、`feishu_sign_secret`、`cron_expr`、`building_whitelist`（每条 = 楼编号 + 展示名）；OCR 请求超时是 `.env` 的 `OCR_TIMEOUT`，不在业务设置里。
 4. 点「立即同步」→ 管理端看到轮次推进到发布成功 → 打开公开页能查到空教室。
 5. 把「密钥位置、备份位置、`.env` 关键取值（脱敏）」写进运维记录；`docs/acceptance-2026-11-16-internal.md` 开工。
 
