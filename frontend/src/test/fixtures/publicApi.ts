@@ -8,6 +8,7 @@ import type {
   DayNode,
   DayResult,
   MetaResult,
+  ScreenResult,
 } from "../../api/types";
 
 /** 与 backend/internal/query/query.go 的 ContextInfo 逐字段对齐。 */
@@ -377,3 +378,105 @@ export const dayWeekNoScheduleFixture = {
   ...dayFixture,
   hint: { code: "week_no_schedule", message: "该周疑似无排课" },
 } satisfies DayResult;
+
+/**
+ * 第 7 项大屏夹具：与 backend/internal/query/screen.go 的 ScreenResult 逐字段对齐。
+ * 前三周分别覆盖「已发布且新鲜」「未发布且从未成功」「已发布但过期」三种逐周状态，
+ * 让 WeekFreshnessTable 的每一列都有非占位值可断言。
+ */
+export const screenFixture = {
+  scale: {
+    rooms: 2481,
+    buildings: 26,
+    term: "2026-2027-1",
+    week: 5,
+    window: [5, 8],
+  },
+  release: {
+    release_id: "20261114T071012Z",
+    generated_at: "2026-11-14T07:10:12Z",
+  },
+  weeks: [
+    {
+      week: 5,
+      published: true,
+      last_success_at: "2026-11-14T07:10:12Z",
+      stale: false,
+    },
+    { week: 6, published: false, last_success_at: null, stale: false },
+    {
+      week: 7,
+      published: true,
+      last_success_at: "2026-11-07T07:10:12Z",
+      stale: true,
+    },
+  ],
+  last_run: {
+    status: "partial",
+    started_at: "2026-11-14T06:00:00Z",
+    // 1830000ms = 1830s = 30 分 30 秒：钉住耗时的分/秒拆分。
+    duration_ms: 1830000,
+    attr_conflict: true,
+  },
+  anomalies: { unknown_cells: 12, composite_cells: 51, attr_conflicts: 2 },
+  occupancy: {
+    by_building: [
+      {
+        building_id: "Q10",
+        name: "综合教学楼",
+        cells: 14700,
+        occupied: 3821,
+        rate: 0.26,
+      },
+    ],
+    by_weekday_block: [
+      [0.42, 0.38, 0.31, 0.22, 0.11],
+      [0.4, 0.36, 0.3, 0.2, 0.1],
+      [0.38, 0.34, 0.28, 0.18, 0.09],
+      [0.36, 0.32, 0.26, 0.16, 0.08],
+      [0.34, 0.3, 0.24, 0.14, 0.07],
+      [0.1, 0.08, 0.06, 0.04, 0.02],
+      [0.08, 0.06, 0.04, 0.02, 0.01],
+    ],
+  },
+  traffic: {
+    pv: { today: 12, d7: 120, d30: 360 },
+    uv: { today: 6, d7: 60, d30: 150 },
+  },
+  leaderboard: { buildings: [], rooms: [], keywords: [] },
+  peaks: {
+    heatmap: Array.from({ length: 7 }, () => Array<number>(24).fill(0)),
+    top: [],
+  },
+  trend: [],
+  node_distribution: [],
+  empty: false,
+} satisfies ScreenResult;
+
+/**
+ * 第 7 项空态夹具：无当前数据版本（release=null、empty=true），
+ * 其余块保持后端 emptyScreenResult 的空/零值形状，用来断言五个区块都保留标题。
+ */
+export const emptyScreenFixture = {
+  scale: { rooms: 0, buildings: 0, term: "", week: 0, window: [] },
+  release: null,
+  weeks: [],
+  last_run: null,
+  anomalies: { unknown_cells: 0, composite_cells: 0, attr_conflicts: 0 },
+  occupancy: {
+    by_building: [],
+    by_weekday_block: Array.from({ length: 7 }, () => Array<number>(5).fill(0)),
+  },
+  traffic: {
+    pv: { today: 0, d7: 0, d30: 0 },
+    uv: { today: 0, d7: 0, d30: 0 },
+  },
+  leaderboard: { buildings: [], rooms: [], keywords: [] },
+  peaks: {
+    heatmap: Array.from({ length: 7 }, () => Array<number>(24).fill(0)),
+    top: [],
+  },
+  trend: [],
+  node_distribution: [],
+  empty: true,
+} satisfies ScreenResult;

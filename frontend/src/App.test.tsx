@@ -10,6 +10,7 @@ import {
   contextFixture,
   dayFixture,
   metaFixture,
+  screenFixture,
 } from "./test/fixtures/publicApi";
 
 function jsonResponse(data: unknown): Response {
@@ -51,6 +52,9 @@ function stubPublicApi(): URL[] {
       }
       if (url.pathname === "/api/query") {
         return jsonResponse(dayFixture);
+      }
+      if (url.pathname === "/api/screen") {
+        return jsonResponse(screenFixture);
       }
       throw new Error(`测试未处理的请求：${url.pathname}`);
     }),
@@ -116,10 +120,23 @@ describe("App 路由表", () => {
     }
   });
 
-  it("数据大屏路由可访问", () => {
-    renderAt("/screen");
+  it("数据大屏路由在暗色缩放壳里渲染信息区块", async () => {
+    stubPublicApi();
 
-    expect(screen.getByText("数据大屏")).toBeInTheDocument();
+    try {
+      renderAt("/screen");
+
+      expect(screen.getByText("数据大屏")).toBeInTheDocument();
+      expect(screen.getByTestId("screen-canvas")).toBeInTheDocument();
+      expect(
+        await screen.findByRole("region", { name: "站点规模" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("region", { name: "占用分布" }),
+      ).toBeInTheDocument();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("未匹配的路径落到 404 页", () => {

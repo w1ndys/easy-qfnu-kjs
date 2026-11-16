@@ -41,7 +41,7 @@
   - `PageFooter` 展示数据来源、更新频率与仅供参考说明；`42901` 时按钮禁用 3 秒
   - 验收：四档 hint 各一条用例；过期时数据仍可见；错误态不残留上一次列表；`aria-live` 区域在结果变化时文本更新
 
-- [ ] 7. 数据大屏布局与信息区块
+- [x] 7. 数据大屏布局与信息区块
   - `ScreenLayout`：暗色（`darkAlgorithm`）、无导航、1920×1080 设计稿 + `lib/scale.ts` 计算 `scale(min(vw/1920, vh/1080))`，`transform-origin: top left` 居中留边
   - `ScaleBlock`（房间数/教学楼数/学期/当前周/采集窗口）、`ReleaseBlock`（版本标识 + 生成时间，`Asia/Shanghai`）、`WeekFreshnessTable`（逐周发布/最近成功/过期）、`RunBlock`（最近一轮状态/开始时间/耗时）、`AnomalyBlock`（未知/复合/归属冲突）
   - `empty=true` 时各区块保留标题并显示「暂无数据」；页面不渲染任何业务码、`message` 或错误原文
