@@ -119,12 +119,16 @@ services:
     logging: *logging
 
   backup:
+    # 备份 sidecar：直接用 postgres 镜像（自带 pg_dump 17.11 与 busybox crond），不另建镜像。
+    # entrypoint 装 crontab 后前台跑 crond；不覆盖 command（entrypoint 自己 exec crond）。
+    # 与 server、web 无启动依赖：业务进程崩了，每日备份照跑。
     image: postgres:17-alpine
     container_name: easy-qfnu-kjs-backup
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+    # 只注入连接与保留参数，不注入任何应用段变量（备份进程不读应用配置）。
     environment:
       PGHOST: postgres
       PGUSER: ${POSTGRES_USER:-kjs}
@@ -132,12 +136,13 @@ services:
       PGDATABASE: ${POSTGRES_DB:-easy_qfnu_kjs}
       BACKUP_RETAIN_DAYS: ${BACKUP_RETAIN_DAYS:-7}
       TZ: Asia/Shanghai
-    # ---- 占位（tasklist 第 5 项替换为真实的 crond sidecar）----
-    # 第 5 项会把下面换成 `entrypoint: /scripts/entrypoint.sh`（装 crontab 后 exec crond），
-    # 并补两个挂载：`../backup:/backup`（仓库根的 backup/，注意是 `..` 不是 `.`）与
-    # `./backup:/scripts:ro`（deploy/backup/）。占位阶段只跑一个不做事也不退出的进程：
-    # task ps 能看到它是 running，且不占宿主端口、不写宿主文件。
-    command: ["sleep", "infinity"]
+    entrypoint: /scripts/entrypoint.sh
+    volumes:
+      # 相对路径以本文件所在目录（deploy/）解析：`..` 是仓库根，即宿主 ./backup。
+      # 备份产物落宿主目录（bind mount，不是命名卷），运维可直接拷走做异地副本。
+      - ../backup:/backup
+      # 仓库的 deploy/backup/ 只读挂进容器；crontab 由 entrypoint 以 600 装到 /etc/crontabs。
+      - ./backup:/scripts:ro
     logging: *logging
 
 volumes:

@@ -16,7 +16,9 @@ frontend/.vite/
 *.local
 
 # --- runtime artifacts ---
-backup/
+# 只忽略仓库根下的运行期产物目录：deploy/backup/ 是备份脚本（deploy/backup/*.sh），
+# 按目录名忽略会把它们一并吞掉，所以这里用前导斜杠锚定到仓库根。
+/backup/
 logs/
 *.log
 

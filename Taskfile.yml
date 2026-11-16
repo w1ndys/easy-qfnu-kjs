@@ -70,6 +70,17 @@ tasks:
     cmds:
       - '{{.COMPOSE}} build'
 
+  # ---------- 部署 ----------
+  deploy:backup:
+    desc: 手动执行一次备份（与每日 03:15 定时任务同一份脚本）
+    # 与 up/ps/down/logs 同一口径：.env 缺失时直接拒绝，而不是让 compose 用空口令跑。
+    # 必须覆盖 entrypoint：否则会用默认入口再起一个 crond，而不是执行一次备份。
+    preconditions:
+      - sh: test -f .env
+        msg: 缺少 .env：先 `task deploy:env`（或 `cp .env.example .env`）并填 POSTGRES_PASSWORD
+    cmds:
+      - '{{.COMPOSE}} run --rm --entrypoint /scripts/backup.sh backup'
+
   # ---------- 数据库 ----------
   db:up:
     desc: 只启动数据库

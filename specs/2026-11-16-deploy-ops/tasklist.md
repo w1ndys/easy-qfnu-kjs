@@ -57,10 +57,10 @@ Updated: 2026-11-16
 
 依赖：3（编排存在，备份服务才能接线）
 
-- [ ] `deploy/backup/{crontab,entrypoint.sh,backup.sh}` 落地，`sh -n` 全部通过；`docker compose up -d backup` 后 `docker compose logs backup` 出现 `backup schedule loaded`。
-- [ ] `task deploy:backup` 在 `backup/` 产出 `kjs-<UTC>.dump`，文件非空，`.last_success` 单行内容与该文件名一致。
-- [ ] 人为让 `pg_dump` 失败（临时改错库名）时：退出码非零、`.last_success` 不变、既有备份一份不少。
-- [ ] 在 `backup/` 造 8 个跨 8 天的旧文件后跑一次成功备份，结果恰为 7 份且包含刚生成的那份（保留策略不会清空目录）。
+- [x] `deploy/backup/{crontab,entrypoint.sh,backup.sh}` 落地，`sh -n` 全部通过；`docker compose up -d backup` 后 `docker compose logs backup` 出现 `backup schedule loaded`。
+- [x] `task deploy:backup` 在 `backup/` 产出 `kjs-<UTC>.dump`，文件非空，`.last_success` 单行内容与该文件名一致。
+- [x] 人为让 `pg_dump` 失败（临时改错库名）时：退出码非零、`.last_success` 不变、既有备份一份不少。
+- [x] 在 `backup/` 造 8 个跨 8 天的旧文件后跑一次成功备份，结果恰为 7 份且包含刚生成的那份（保留策略不会清空目录）。
 
 ## 6. 恢复与密钥备份
 
