@@ -23,6 +23,9 @@ export const contextFixture = {
 /**
  * 与 backend/internal/query/meta.go 的 MetaResult 对齐：3 栋白名单教学楼，
  * 12 个小节分属 5 个大节（轴顺序故意与数组顺序无关，逼实现按 ordinal 排序）。
+ * `axis.blocks` / `block` 用 backend/migrations/0001_baseline.sql 的真实编码：
+ * 0102 / 030405 / 0607 / 0809 / 101112——最后一个大节含 3 个小节，
+ * 列头必须能写成「第 10–12 节」，不能按「每个大节固定 2 节」硬推。
  */
 export const metaFixture = {
   release: {
@@ -38,20 +41,20 @@ export const metaFixture = {
   },
   axis: {
     version: 1,
-    blocks: ["0102", "030405", "060708", "0910", "1112"],
+    blocks: ["0102", "030405", "0607", "0809", "101112"],
     nodes: [
       { node: "01", ordinal: 1, block: "0102", block_ordinal: 1 },
       { node: "02", ordinal: 2, block: "0102", block_ordinal: 1 },
       { node: "03", ordinal: 3, block: "030405", block_ordinal: 2 },
       { node: "04", ordinal: 4, block: "030405", block_ordinal: 2 },
       { node: "05", ordinal: 5, block: "030405", block_ordinal: 2 },
-      { node: "06", ordinal: 6, block: "060708", block_ordinal: 3 },
-      { node: "07", ordinal: 7, block: "060708", block_ordinal: 3 },
-      { node: "08", ordinal: 8, block: "060708", block_ordinal: 3 },
-      { node: "09", ordinal: 9, block: "0910", block_ordinal: 4 },
-      { node: "10", ordinal: 10, block: "0910", block_ordinal: 4 },
-      { node: "11", ordinal: 11, block: "1112", block_ordinal: 5 },
-      { node: "12", ordinal: 12, block: "1112", block_ordinal: 5 },
+      { node: "06", ordinal: 6, block: "0607", block_ordinal: 3 },
+      { node: "07", ordinal: 7, block: "0607", block_ordinal: 3 },
+      { node: "08", ordinal: 8, block: "0809", block_ordinal: 4 },
+      { node: "09", ordinal: 9, block: "0809", block_ordinal: 4 },
+      { node: "10", ordinal: 10, block: "101112", block_ordinal: 5 },
+      { node: "11", ordinal: 11, block: "101112", block_ordinal: 5 },
+      { node: "12", ordinal: 12, block: "101112", block_ordinal: 5 },
     ],
   },
   buildings: [
@@ -215,18 +218,18 @@ export const pagedAvailabilityLastPageFixture = {
 const DAY_NODE_STATES: ReadonlyArray<
   readonly [node: string, block: string, state: "free" | "busy" | "no-data"]
 > = [
-  ["12", "1112", "no-data"],
+  ["12", "101112", "no-data"],
   ["01", "0102", "free"],
-  ["07", "060708", "no-data"],
+  ["07", "0607", "no-data"],
   ["03", "030405", "no-data"],
-  ["11", "1112", "free"],
+  ["11", "101112", "free"],
   ["02", "0102", "free"],
-  ["09", "0910", "free"],
+  ["09", "0809", "free"],
   ["04", "030405", "busy"],
-  ["06", "060708", "free"],
-  ["10", "0910", "busy"],
+  ["06", "0607", "free"],
+  ["10", "101112", "busy"],
   ["05", "030405", "busy"],
-  ["08", "060708", "busy"],
+  ["08", "0809", "busy"],
 ];
 
 /**

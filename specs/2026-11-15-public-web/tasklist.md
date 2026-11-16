@@ -47,7 +47,7 @@
   - `empty=true` 时各区块保留标题并显示「暂无数据」；页面不渲染任何业务码、`message` 或错误原文
   - 验收：窗口从 1920×1080 变 2560×1440 / 1280×1024 时区块顺序与相对位置不变（缩放系数单测 + 一条渲染用例）；断言敏感串（错误码、`error_code`）不出现
 
-- [ ] 8. 占用热力图组件
+- [x] 8. 占用热力图组件
   - `OccupancyHeatmap`：自绘 SVG，7 行（周一…周日）× 5 列（大节，列头由 `meta.axis` 派生为「第 01–02 节」），入场 `occupancy.by_weekday_block`，`rate` 为 0 用中性底色
   - 图例 5 档（0/25/50/75/100%）+ 说明「未知与复合占用计入已占用」；`role="img"` + `aria-label` 概述，每格 `<title>` 可读文本，悬停 `Tooltip`
   - `BuildingOccupancyList` 用 `by_building` 显示楼名、占用率与已占/总格数

@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
+import type { MetaAxis } from "../api/types";
 import { metaFixture } from "../test/fixtures/publicApi";
-import { NODE_IDS, buildNodeOptions, defaultNodeRange } from "./nodes";
+import {
+  BLOCK_COUNT,
+  NODE_IDS,
+  buildBlockLabels,
+  buildNodeOptions,
+  defaultNodeRange,
+} from "./nodes";
 
 /** 构造本地时间；只关心小时与分钟，日期取夹具同一天。 */
 function localTime(hour: number, minute: number): Date {
@@ -83,5 +90,90 @@ describe("buildNodeOptions 从轴派生节次选项", () => {
 
     expect(options).toHaveLength(12);
     expect(options[0]).toEqual({ value: "01", label: "第 01 节" });
+  });
+});
+
+describe("buildBlockLabels 从轴派生大节列头", () => {
+  it("按 axis.blocks 顺序把每个大节的首尾小节写成区间（末节含三小节）", () => {
+    // 真实轴编码（backend/migrations/0001_baseline.sql）：第 06–09 节不是两节一个大节，
+    // 最后一个大节是 101112，列头必须写成「第 10–12 节」而不是两节一段。
+    expect(buildBlockLabels(metaFixture.axis)).toEqual([
+      "第 01–02 节",
+      "第 03–05 节",
+      "第 06–07 节",
+      "第 08–09 节",
+      "第 10–12 节",
+    ]);
+  });
+
+  it("axis.nodes 的数组顺序不影响列头，首尾取 ordinal 最小/最大", () => {
+    // 反序只改数组顺序，ordinal 不变：01 仍是 0102 大节的第一节。
+    const reversed: MetaAxis = {
+      ...metaFixture.axis,
+      nodes: [...metaFixture.axis.nodes].reverse(),
+    };
+
+    expect(buildBlockLabels(reversed)).toEqual([
+      "第 01–02 节",
+      "第 03–05 节",
+      "第 06–07 节",
+      "第 08–09 节",
+      "第 10–12 节",
+    ]);
+  });
+
+  it("无 meta（轴为 null）时回退「大节 1..5」而不抛错", () => {
+    expect(buildBlockLabels(null)).toEqual([
+      "大节 1",
+      "大节 2",
+      "大节 3",
+      "大节 4",
+      "大节 5",
+    ]);
+  });
+
+  it("轴为空数组时同样回退，且恒为 5 列", () => {
+    const emptyAxis: MetaAxis = { version: 1, blocks: [], nodes: [] };
+
+    expect(buildBlockLabels(emptyAxis)).toHaveLength(BLOCK_COUNT);
+    expect(buildBlockLabels(emptyAxis)).toEqual([
+      "大节 1",
+      "大节 2",
+      "大节 3",
+      "大节 4",
+      "大节 5",
+    ]);
+  });
+
+  it("轴只覆盖部分大节时逐列回退，前面的列仍然派生", () => {
+    const partialAxis: MetaAxis = {
+      version: 1,
+      blocks: ["0102"],
+      nodes: metaFixture.axis.nodes.filter((node) => node.block === "0102"),
+    };
+
+    expect(buildBlockLabels(partialAxis)).toEqual([
+      "第 01–02 节",
+      "大节 2",
+      "大节 3",
+      "大节 4",
+      "大节 5",
+    ]);
+  });
+
+  it("blocks 缺失（只给 nodes）时按 block_ordinal 排大节顺序", () => {
+    const nodesOnlyAxis: MetaAxis = {
+      version: 1,
+      blocks: [],
+      nodes: [...metaFixture.axis.nodes].reverse(),
+    };
+
+    expect(buildBlockLabels(nodesOnlyAxis)).toEqual([
+      "第 01–02 节",
+      "第 03–05 节",
+      "第 06–07 节",
+      "第 08–09 节",
+      "第 10–12 节",
+    ]);
   });
 });

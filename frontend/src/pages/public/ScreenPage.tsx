@@ -1,19 +1,21 @@
-// 数据大屏（tasklist 第 7 项；Requirement 6.1–6.4、6.6、PRD 6.4）：
+// 数据大屏（tasklist 第 7–8 项；Requirement 6.1–6.6、PRD 6.4）：
 // 在 1920×1080 设计稿上按 12 列 × 8 行分区，顺序固定、窗口变化只等比缩放。
 //
-// 本项只负责「布局 + 五个信息区块」：
-// - 数据只请求一次（useApi）；30 秒轮询、离线徽标与最后刷新时间留给第 9 项；
-// - 占用热力图与按楼占用率属于第 8 项，这里只留一块同样大小的占位区；
+// 数据来源：
+// - `/api/screen` 提供五个信息区块与占用分布；30 秒轮询、离线徽标与最后刷新时间
+//   留给第 9 项（本项仍是一次加载）；
+// - `/api/meta` 只取 `axis` 给热力图列头用（design D12）：首屏与 screen 并行请求一次，
+//   之后不随轮询刷新；meta 失败不影响大屏，列头回退「大节 1..5」；
 // - 大屏不渲染业务码、message 或错误原文（Requirement 7.6），失败时只有中性占位与重试。
 
 import { Button, theme } from "antd";
-import type { CSSProperties, ReactNode } from "react";
+import { useCallback, type CSSProperties, type ReactNode } from "react";
 import type { ApiResult } from "../../api/client";
-import { getScreen } from "../../api/public";
-import type { ScreenResult } from "../../api/types";
+import { getMeta, getScreen } from "../../api/public";
+import type { MetaAxis, MetaResult, ScreenResult } from "../../api/types";
+import { OccupancyBlock } from "../../components/OccupancyHeatmap";
 import {
   AnomalyBlock,
-  NO_DATA_TEXT,
   ReleaseBlock,
   RunBlock,
   ScaleBlock,
@@ -40,7 +42,7 @@ const AREAS = {
   eastTop: "2 / 6 / 5 / 13",
   /** 左下：最近一轮 + 异常计数（4 行）。 */
   westBottom: "5 / 1 / 9 / 6",
-  /** 右下：占用热力图与按楼占用率（4 行，第 8 项实现）。 */
+  /** 右下：占用热力图与按楼占用率（4 行）。 */
   eastBottom: "5 / 6 / 9 / 13",
   /** 加载与失败占位：盖上整个内容区，不画半截数据。 */
   content: "2 / 1 / 9 / 13",
@@ -69,6 +71,11 @@ const STACKED_AREA: CSSProperties = {
 /** 请求函数放在模块级，引用稳定，useApi 不会因页面重渲染重发请求。 */
 function loadScreen(signal: AbortSignal): Promise<ApiResult<ScreenResult>> {
   return getScreen(signal);
+}
+
+/** 只为热力图列头取一次轴定义（design D12）；失败时由 OccupancyBlock 回退列头。 */
+function loadMeta(signal: AbortSignal): Promise<ApiResult<MetaResult>> {
+  return getMeta(signal);
 }
 
 function ScreenHeader() {
@@ -153,51 +160,14 @@ function ScreenErrorView({ onRetry }: { onRetry: () => void }) {
   );
 }
 
-/**
- * 第 8 项的实现位：占位区与热力图区域同尺寸，接管时不需要改栅格。
- *
- * `empty=true`（没有当前数据版本）时与其他五个区块同口径：保留标题、正文换成
- * 「暂无数据」，不显示「尚待接入」——否则整页只有这一块还在说功能没做完。
- */
-function OccupancyPlaceholder({ empty }: { empty: boolean }) {
-  const { token } = theme.useToken();
-
-  return (
-    <section
-      aria-label="占用分布"
-      data-testid="screen-block-occupancy"
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        flex: "1 1 0",
-        minWidth: 0,
-        minHeight: 0,
-        padding: 16,
-        borderRadius: 12,
-        background: token.colorBgContainer,
-        border: `1px solid ${token.colorBorderSecondary}`,
-      }}
-    >
-      <h2
-        style={{ margin: 0, fontSize: 22, fontWeight: 600, lineHeight: "30px" }}
-      >
-        占用分布
-      </h2>
-      <p
-        style={{
-          margin: "12px 0 0",
-          fontSize: 18,
-          color: token.colorTextSecondary,
-        }}
-      >
-        {empty ? NO_DATA_TEXT : "占用热力图与按楼占用率尚待接入。"}
-      </p>
-    </section>
-  );
-}
-
 /** 有数据时的五个区块；顺序与 AREAS 一致，DOM 顺序即阅读顺序。 */
-function ScreenContent({ data }: { data: ScreenResult }) {
+function ScreenContent({
+  data,
+  axis,
+}: {
+  data: ScreenResult;
+  axis: MetaAxis | null;
+}) {
   return (
     <>
       <div
@@ -231,7 +201,11 @@ function ScreenContent({ data }: { data: ScreenResult }) {
         data-grid-area={AREAS.eastBottom}
         style={{ ...STACKED_AREA, gridArea: AREAS.eastBottom }}
       >
-        <OccupancyPlaceholder empty={data.empty} />
+        <OccupancyBlock
+          occupancy={data.occupancy}
+          axis={axis}
+          empty={data.empty}
+        />
       </div>
     </>
   );
@@ -239,14 +213,19 @@ function ScreenContent({ data }: { data: ScreenResult }) {
 
 function ScreenBody({
   screen,
+  axis,
+  onRetry,
 }: {
   screen: ApiRequestState<ScreenResult>;
+  axis: MetaAxis | null;
+  /** 错误页的重试：同时重发主数据与轴定义（见 ScreenPage 里的说明）。 */
+  onRetry: () => void;
 }): ReactNode {
   if (screen.data !== null) {
-    return <ScreenContent data={screen.data} />;
+    return <ScreenContent data={screen.data} axis={axis} />;
   }
   if (screen.error !== null) {
-    return <ScreenErrorView onRetry={screen.reload} />;
+    return <ScreenErrorView onRetry={onRetry} />;
   }
   return <ScreenLoading />;
 }
@@ -258,11 +237,27 @@ function ScreenBody({
 export function ScreenPage() {
   // 第 7 项只做一次加载；第 9 项把这一层换成 useScreenPolling，区块组件保持不变。
   const screen = useApi("screen", loadScreen);
+  // 轴只取一次，不参与轮询：轮询只打 /api/screen（design D12）。
+  const meta = useApi("screen-meta", loadMeta);
+
+  // 错误页的重试要顺带重发 meta：首屏两个请求可能同时失败，只重发 screen 的话
+  // 主数据恢复后列头仍永久停在「大节 1..5」的回退文案，而 meta 单独失败不弹错误页。
+  // 因此把 meta.reload 挂到同一个重试入口上；meta 单独失败仍按 design D12 静默回退。
+  const { reload: reloadScreen } = screen;
+  const { reload: reloadMeta } = meta;
+  const retry = useCallback(() => {
+    reloadScreen();
+    reloadMeta();
+  }, [reloadScreen, reloadMeta]);
 
   return (
     <main aria-label="数据大屏" style={GRID_STYLE}>
       <ScreenHeader />
-      <ScreenBody screen={screen} />
+      <ScreenBody
+        screen={screen}
+        axis={meta.data?.axis ?? null}
+        onRetry={retry}
+      />
     </main>
   );
 }

@@ -68,7 +68,7 @@ interface ScreenBlockProps {
 }
 
 /** 区块外壳：标题 + 深色卡片；空态与有数据态共用同一个标题结构。 */
-function ScreenBlock({
+export function ScreenBlock({
   title,
   testId,
   children,
@@ -109,7 +109,7 @@ function ScreenBlock({
 }
 
 /** 空态正文：只替换区块内容，标题由 ScreenBlock 保留。 */
-function NoData() {
+export function NoData() {
   const { token } = theme.useToken();
   return (
     <p

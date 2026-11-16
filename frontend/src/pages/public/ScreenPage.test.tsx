@@ -1,16 +1,26 @@
-import { act, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ScreenLayout } from "../../layouts/ScreenLayout";
 import {
+  emptyMetaFixture,
   emptyScreenFixture,
+  metaFixture,
   screenFixture,
 } from "../../test/fixtures/publicApi";
 import { ScreenPage } from "./ScreenPage";
 
-// 大屏布局与信息区块（tasklist 第 7 项）。
-// 两条验收点在这里落地：
-// 1) 五个业务区块 + 占用占位区渲染，以及 empty=true 的「保留标题 + 暂无数据」；
+// 大屏布局与信息区块（tasklist 第 7–8 项）。
+// 验收点在这里落地：
+// 1) 五个业务区块 + 占用分布区块渲染，以及 empty=true 的「保留标题 + 暂无数据」；
 // 2) 窗口 1920×1080 → 2560×1440 → 1280×1024 只改缩放系数，区块顺序与相对位置不变；
+// 3) 热力图列头来自 /api/meta 的轴定义，meta 失败时回退「大节 1..5」；
 // 另加一条「失败时页面不出现业务码、message 与错误原文」。
 
 const INITIAL_WIDTH = window.innerWidth;
@@ -41,14 +51,24 @@ function errorEnvelope(
   );
 }
 
-function stubScreen(response: () => Response): URL[] {
+/**
+ * 大屏两个接口各按路径返回：`/api/screen` 是主数据，`/api/meta` 只为热力图列头取轴
+ * （design D12）。默认 meta 成功；用例可单独让 meta 失败。
+ */
+function stubScreenApi(options: {
+  screen: () => Response;
+  meta?: () => Response;
+}): URL[] {
   const requests: URL[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input), "http://localhost");
       requests.push(url);
-      return response();
+      if (url.pathname === "/api/meta") {
+        return (options.meta ?? (() => envelope(metaFixture)))();
+      }
+      return options.screen();
     }),
   );
   return requests;
@@ -113,14 +133,20 @@ afterEach(() => {
 });
 
 describe("信息区块", () => {
-  it("渲染站点规模、数据版本、逐周新鲜度、最近一轮与异常计数五块", async () => {
-    const requests = stubScreen(() => envelope(screenFixture));
+  it("渲染站点规模、数据版本、逐周新鲜度、最近一轮、异常计数与占用分布六块", async () => {
+    const requests = stubScreenApi({
+      screen: () => envelope(screenFixture),
+    });
 
     renderScreenPage();
 
     const scaleBlock = await screen.findByRole("region", { name: "站点规模" });
-    expect(requests).toHaveLength(1);
-    expect(requests[0].pathname).toBe("/api/screen");
+    // 首屏只发两个请求：主数据与列头用的轴定义，且都是各一次。
+    await waitFor(() => expect(requests).toHaveLength(2));
+    expect(requests.map((url) => url.pathname).sort()).toEqual([
+      "/api/meta",
+      "/api/screen",
+    ]);
     // 千分位、单位与采集窗口都来自响应字段，不写死。
     expect(within(scaleBlock).getByText("2,481")).toBeInTheDocument();
     expect(within(scaleBlock).getByText("26")).toBeInTheDocument();
@@ -167,14 +193,26 @@ describe("信息区块", () => {
     expect(within(anomalyBlock).getByText("51")).toBeInTheDocument();
     expect(within(anomalyBlock).getByText("2")).toBeInTheDocument();
 
-    // 有数据时占用占位区仍是第 8 项的「尚待接入」，不因空态分支改成「暂无数据」。
+    // 占用分布（第 8 项）：热力图 35 格、列头取自 meta 轴、按楼列表来自 screen。
     const occupancyBlock = screen.getByRole("region", { name: "占用分布" });
     expect(
-      within(occupancyBlock).getByText("占用热力图与按楼占用率尚待接入。"),
+      within(occupancyBlock).getByRole("img", {
+        name: "占用热力图：7 天 5 大节，最高 42%",
+      }),
+    ).toBeInTheDocument();
+    expect(within(occupancyBlock).getAllByTestId("heatmap-cell")).toHaveLength(
+      35,
+    );
+    expect(within(occupancyBlock).getByText("第 03–05 节")).toBeInTheDocument();
+    expect(within(occupancyBlock).getByText("综合教学楼")).toBeInTheDocument();
+    expect(
+      within(occupancyBlock).getByText("3,821 / 14,700"),
     ).toBeInTheDocument();
     expect(
       within(occupancyBlock).queryByText("暂无数据"),
     ).not.toBeInTheDocument();
+    // 第 7 项的占位文案不应再出现在页面上。
+    expect(screen.queryByText(/尚待接入/)).not.toBeInTheDocument();
 
     // 信封里的 message 不是可展示内容，页面上也不出现业务码或错误字段名。
     expect(screen.queryByText("success")).not.toBeInTheDocument();
@@ -183,15 +221,17 @@ describe("信息区块", () => {
     }
   });
 
-  it("empty=true 时五个业务区块与占用占位区都保留标题并显示「暂无数据」", async () => {
-    stubScreen(() => envelope(emptyScreenFixture));
+  it("empty=true 时六个区块都保留标题并显示「暂无数据」", async () => {
+    stubScreenApi({
+      screen: () => envelope(emptyScreenFixture),
+      meta: () => envelope(emptyMetaFixture),
+    });
 
     renderScreenPage();
 
     await screen.findByRole("region", { name: "站点规模" });
 
-    // 「占用分布」是第 8 项的实现位，这里同样跟随空态：保留标题，正文换成
-    // 「暂无数据」，不再显示「尚待接入」——整页空态只有一种文案。
+    // 「占用分布」此时没有热力图，与其它区块同口径：保留标题，正文换成「暂无数据」。
     for (const title of [
       "站点规模",
       "数据版本",
@@ -213,13 +253,15 @@ describe("信息区块", () => {
   });
 
   it("失败时只显示中性占位，不出现业务码、message 或错误原文", async () => {
-    stubScreen(() =>
-      errorEnvelope(
-        50001,
-        "error_code=UPSTREAM_401 upstream token expired",
-        "req_screen_secret",
-      ),
-    );
+    stubScreenApi({
+      screen: () =>
+        errorEnvelope(
+          50001,
+          "error_code=UPSTREAM_401 upstream token expired",
+          "req_screen_secret",
+        ),
+      meta: () => errorEnvelope(50001, "meta failed", "req_meta_secret"),
+    });
 
     renderScreenPage();
 
@@ -237,16 +279,80 @@ describe("信息区块", () => {
       expect(screen.queryByText(new RegExp(secret))).not.toBeInTheDocument();
     }
 
-    // 失败时不画半截数据：五个数据区块一个都没有。
+    // 失败时不画半截数据：数据区块一个都没有。
     expect(
       screen.queryByRole("region", { name: "站点规模" }),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("region", { name: "占用分布" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("meta 请求失败不拖垮大屏，热力图列头回退「大节 1..5」", async () => {
+    stubScreenApi({
+      screen: () => envelope(screenFixture),
+      meta: () => errorEnvelope(50000, "meta boom", "req_meta_secret"),
+    });
+
+    renderScreenPage();
+
+    const occupancyBlock = await screen.findByRole("region", {
+      name: "占用分布",
+    });
+    for (const label of ["大节 1", "大节 2", "大节 3", "大节 4", "大节 5"]) {
+      expect(within(occupancyBlock).getByText(label)).toBeInTheDocument();
+    }
+    expect(within(occupancyBlock).getAllByTestId("heatmap-cell")).toHaveLength(
+      35,
+    );
+    // 主数据正常时页面不进错误态，也不显示 meta 的错误信息。
+    expect(screen.queryByText("数据暂时不可用")).not.toBeInTheDocument();
+    expect(screen.queryByText(/meta boom/)).not.toBeInTheDocument();
+  });
+
+  it("失败页重试会一并重发 meta，恢复后列头改由轴派生", async () => {
+    let screenCalls = 0;
+    let metaCalls = 0;
+    const requests = stubScreenApi({
+      screen: () => {
+        screenCalls += 1;
+        return screenCalls === 1
+          ? errorEnvelope(50000, "screen boom", "req_screen_secret")
+          : envelope(screenFixture);
+      },
+      meta: () => {
+        metaCalls += 1;
+        return metaCalls === 1
+          ? errorEnvelope(50000, "meta boom", "req_meta_secret")
+          : envelope(metaFixture);
+      },
+    });
+
+    renderScreenPage();
+
+    expect(await screen.findByText("数据暂时不可用")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+    const occupancyBlock = await screen.findByRole("region", {
+      name: "占用分布",
+    });
+    // 列头从「大节 1..5」换成轴派生的「第 10–12 节」：证明 meta 也真的重发了，
+    // 而不是只重发 screen、列头永久停在回退文案。
+    expect(
+      await within(occupancyBlock).findByText("第 10–12 节"),
+    ).toBeInTheDocument();
+    expect(
+      requests.filter((url) => url.pathname === "/api/screen"),
+    ).toHaveLength(2);
+    expect(requests.filter((url) => url.pathname === "/api/meta")).toHaveLength(
+      2,
+    );
   });
 });
 
 describe("等比缩放与布局稳定性", () => {
   it("窗口从 1920×1080 变 2560×1440 / 1280×1024 时只改缩放系数，区块顺序与相对位置不变", async () => {
-    stubScreen(() => envelope(screenFixture));
+    stubScreenApi({ screen: () => envelope(screenFixture) });
 
     setViewport(1920, 1080);
     renderScreenPage();

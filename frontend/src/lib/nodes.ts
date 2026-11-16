@@ -3,7 +3,7 @@
 // 12:00–18:00 → 06–09，≥18:00 → 10–12。它是纯交互默认值，不改服务端对区间的判定；
 // 选非当天日期时不重算区间（沿用当前时段）。
 
-import type { MetaAxis } from "../api/types";
+import type { MetaAxis, MetaAxisNode } from "../api/types";
 
 /** 请求与 URL 里的节次区间，值即接口契约的小节编号 "01".."12"。 */
 export interface NodeRange {
@@ -70,4 +70,92 @@ export function buildNodeOptions(axis: MetaAxis | null): NodeOption[] {
   return [...nodes]
     .sort((left, right) => left.ordinal - right.ordinal)
     .map((node) => ({ value: node.node, label: `第 ${node.node} 节` }));
+}
+
+/**
+ * 大节列数：占用热力图固定 7 天 × 5 大节
+ * （backend/internal/query/screen.go 的 by_weekday_block 契约）。
+ */
+export const BLOCK_COUNT = 5;
+
+/** 没有轴可用时的大节列头：按 1..5 的序号回退，不编造小节区间。 */
+function fallbackBlockLabel(index: number): string {
+  return `大节 ${index + 1}`;
+}
+
+/**
+ * 一组小节编号（已按 ordinal 从小到大）→ 大节区间文案。
+ * 两个及以上小节写成「第 01–02 节」，单节点大节退回「第 01 节」；
+ * 空组返回 null，由调用方按列号回退。
+ */
+function blockLabel(nodeIds: readonly string[]): string | null {
+  if (nodeIds.length === 0) {
+    return null;
+  }
+  const first = nodeIds[0];
+  const last = nodeIds[nodeIds.length - 1];
+  return first === last ? `第 ${first} 节` : `第 ${first}–${last} 节`;
+}
+
+/**
+ * 由元数据轴派生大节列头，如「第 01–02 节」。
+ *
+ * 大节顺序优先取 `axis.blocks`（轴自己声明的大节顺序）；`blocks` 为空时按
+ * 每个大节内节点的 `block_ordinal` 排序。每个大节的首尾小节取该大节内
+ * ordinal 最小/最大的节点，所以 `axis.nodes` 的数组顺序不影响列头。
+ *
+ * 返回值恒为 `BLOCK_COUNT` 项：无当前版本（`/api/meta` 失败或 `axis` 为 null）、
+ * 轴只覆盖部分大节、或某个大节没有节点时，逐列回退「大节 1」..「大节 5」，
+ * 热力图始终是 7×5，少一列就与矩阵对不上（Requirement 6.5）。
+ */
+export function buildBlockLabels(axis: MetaAxis | null): string[] {
+  const derived = deriveBlockLabels(axis);
+  return Array.from(
+    { length: BLOCK_COUNT },
+    (_, index) => derived[index] ?? fallbackBlockLabel(index),
+  );
+}
+
+/** 派生列头；返回数组长度可能与 BLOCK_COUNT 不一致，缺失位交给 buildBlockLabels 回退。 */
+function deriveBlockLabels(axis: MetaAxis | null): Array<string | null> {
+  const blocks = axis?.blocks ?? [];
+  const nodes = axis?.nodes ?? [];
+  if (blocks.length === 0 && nodes.length === 0) {
+    return [];
+  }
+
+  const groups = new Map<string, MetaAxisNode[]>();
+  for (const node of nodes) {
+    const group = groups.get(node.block);
+    if (group === undefined) {
+      groups.set(node.block, [node]);
+    } else {
+      group.push(node);
+    }
+  }
+
+  const blockCodes =
+    blocks.length > 0
+      ? blocks
+      : [...groups.entries()]
+          .sort(
+            ([, left], [, right]) => blockOrdinal(left) - blockOrdinal(right),
+          )
+          .map(([code]) => code);
+
+  return blockCodes.map((code) => {
+    const group = groups.get(code) ?? [];
+    const ordered = [...group]
+      .sort((left, right) => left.ordinal - right.ordinal)
+      .map((node) => node.node);
+    return blockLabel(ordered);
+  });
+}
+
+/** 一组节点里最靠前的大节序号；只在 blocks 缺失、需要按 nodes 排序时使用。 */
+function blockOrdinal(nodes: readonly MetaAxisNode[]): number {
+  return nodes.reduce(
+    (min, node) => Math.min(min, node.block_ordinal),
+    Number.POSITIVE_INFINITY,
+  );
 }
