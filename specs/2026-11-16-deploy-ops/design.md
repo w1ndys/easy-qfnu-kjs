@@ -262,15 +262,19 @@ networks:
 静态文件与反代整段由 `deploy/nginx/default.conf.template` 承担，后端**零改动**（`api.Handler()` 仍只注册 `/healthz`、`/readyz`、`/api/*`，[api.go](../../backend/internal/api/api.go)）。原「静态托管路由表」已随 D1 拍板删除（已定）。
 
 1. **模板渲染**：文件落 `/etc/nginx/templates/default.conf.template`，官方镜像 entrypoint 调 `envsubst` 输出到 `/etc/nginx/conf.d/default.conf`，只替换环境里存在的变量名（`${BACKEND_UPSTREAM}`），nginx 自身的 `$uri`、`$host`、`$remote_addr` 不会被误替换。`BACKEND_UPSTREAM` 为空时渲染出空上游，`nginx -t` 直接失败，容器停在可见的 `Exited`。
-2. **静态与 SPA 兜底**：`root /usr/share/nginx/html`；`location / { try_files $uri $uri/ /index.html; }`——`/admin`、`/screen` 这类前端路由由 nginx 兜 `index.html`，不再需要后端兜底。`/assets/` 用 `^~` 前缀单独一段 `try_files $uri =404`：缺失的哈希资源要返回 404 而不是被兜成 `index.html`（否则浏览器会把 HTML 当 JS 解析）。`/api`、`/healthz`、`/readyz` 也用 `^~` 前缀，保证带点的路径（如 `/api/export.json`）不会被兜底规则截走（CP8）。
+2. **静态与 SPA 兜底**：`root /usr/share/nginx/html`；`location / { try_files $uri $uri/ /index.html; }`——`/admin`、`/screen` 这类前端路由由 nginx 兜 `index.html`，不再需要后端兜底。`/assets/` 用 `^~` 前缀单独一段 `try_files $uri =404`：缺失的哈希资源要返回 404 而不是被兜成 `index.html`（否则浏览器会把 HTML 当 JS 解析）。`/api/` 用 `^~` 前缀，保证带点的路径（如 `/api/export.json`）不会被兜底规则截走（CP8）。探针用 `=` 精确匹配（`/healthz`、`/readyz`），并给带尾斜杠的 `/healthz/`、`/readyz/` 各配一条显式 `return 404`：这两条路径不匹配精确段，否则会被 SPA 兜底成 200 HTML，监控把路径拼错也会「看起来通了」。精确匹配与 `^~` 前缀的分工固定为：探针、`/index.html` 与 `/50x.html` 用 `=`，`/api/`、`/assets/`、`/admin` 用 `^~`。基础镜像自带的 `/50x.html` 已从镜像删掉（`Dockerfile.web` 的 runtime 阶段），并配 `location = /50x.html { return 404; }`，否则它会被 SPA 兜底成 200 的 `index.html`。
 3. **反代路径**：`location ^~ /api/`、`location = /healthz`、`location = /readyz` 三条反代到 `http://$backend`（`$backend` 由 `BACKEND_UPSTREAM` 渲染），其余路径一律静态。`/readyz` 也走反代（已定）：`task deploy:health` 要从宿主侧复验就绪探针，缺这条它只能进容器里查。
 4. **动态解析（关键）**：`resolver 127.0.0.11 valid=10s ipv6=off;` + 变量形式的 `proxy_pass http://$backend;`。若把上游写成字面量在启动时解析一次，`task deploy:rollback` 重建 `server` 换 IP 后 `web` 会一直回 502 直到被手工重启；用 Docker 内嵌 DNS 按请求解析可以避开这个坑。
 5. **透传头**：`proxy_set_header Host $host;`、`X-Real-IP $remote_addr;`、`X-Forwarded-For $proxy_add_x_forwarded_for;`、`X-Forwarded-Proto $scheme;`。后端的取源逻辑读 `X-Forwarded-For` 的**最右一跳**（紧邻反代追加，客户端伪造无效，[ratelimit.go](../../backend/internal/api/ratelimit.go)），`$proxy_add_x_forwarded_for` 正好把真实客户端地址追加在最后，与 `TRUST_PROXY_HEADERS=true` 配对成立。
 6. **缓存头**：`/assets/`（文件名含内容哈希）`Cache-Control: public, max-age=31536000, immutable`；`index.html` 与 SPA 兜底响应 `Cache-Control: no-cache`；`/admin` 前缀额外 `no-store`（管理端 HTML 不能被缓存）。后端的 `withAdminNoStore` 仍兜 API 响应，两层口径一致。
 7. **安全头**：`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、HTML 额外 `X-Frame-Options: SAMEORIGIN`（用 `add_header ... always` 挂到静态与兜底响应上）。CSP 不在本 spec：antd 的内联样式与 `CSP style-src` 的兼容要先单独核，硬加会把页面样式打断。
-8. **压缩**：开 `gzip on` + `gzip_types`（`text/css`、`application/javascript`、`application/json`、`image/svg+xml`）。纯加法、不影响正确性，静态产物体积明显下降。
+8. **压缩**：开 `gzip on` + `gzip_types`（`text/css`、`application/javascript`、`application/json`、`image/svg+xml`）+ `gzip_vary on`。纯加法、不影响正确性，静态产物体积明显下降；`gzip_vary` 补上 `Vary: Accept-Encoding`，避免中间缓存把 gzip 版本发给不支持的客户端。
 9. **日志**：`access_log` / `error_log` 保持官方镜像的默认（软链到 `/dev/stdout`、`/dev/stderr`），由 compose 的 `json-file` 驱动轮转，不写容器内文件。
 10. **本体健康**：容器健康检查探 `GET /`，只看 nginx 能否吐出静态产物，不使用 `/healthz`——否则 `server` 一抖动就把 `web` 判成不健康，`restart: on-failure:5` 会把一个没问题的反代反复重启。
+11. **相对重定向（关键）**：`absolute_redirect off;`。nginx 的自动 301（目录补尾斜杠、裸 `/api` → `/api/`）默认写**绝对** URL，端口取容器内 `listen 8080`；宿主侧端口由 compose 的 `SERVER_PORT` 决定（默认 8080，smoke 用 18081），绝对 Location 会把浏览器导到只存在于容器里的端口。关掉后 nginx 只写相对 Location（如 `/api/`），由浏览器按当前地址补全主机与端口，端口天然正确。
+12. **代理超时**：`proxy_connect_timeout 2s;`、`proxy_read_timeout 30s;`。上游容器刚停或刚重建的 10 秒内，`resolver` 缓存里还是旧 IP，首个请求会去连一个已消失的地址并重试到默认 60s connect 超时，用户侧看到的是首个请求卡三四十秒才等到 502；连接超时压到 2s 让它快速失败。读超时显式写 30s（默认也是 60s），把慢接口的等待上限收敛在这一条指令上，不依赖 nginx 版本的默认值。
+13. **裸 `/api` 的 301 保留现状**：`GET /api`（不带尾斜杠）由 nginx 自动 301 到 `/api/`——这是 `location ^~ /api/` 配无 URI 的 `proxy_pass` 时的补斜杠行为，配合 `absolute_redirect off` 写的是相对 Location。前端只请求 `/api/...`，不为裸 `/api` 单独配反代段。
+14. **`/admin` 无服务端路由**：`/admin`、`/admin/`、`/admin/xxx` 都没有对应文件或目录，由 `location ^~ /admin` 的 `try_files` 兜 `index.html`（带 `no-store`），交给管理端前端路由接管；后端不注册 `/admin` 路由，所以这些路径永远是 SPA 的 200，不存在服务端 404。这是现状，本 spec 不改。
 
 ### 环境变量表
 

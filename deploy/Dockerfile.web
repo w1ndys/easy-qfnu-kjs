@@ -26,6 +26,12 @@ RUN pnpm build
 # ---- runtime：nginx 提供静态产物，反代由模板渲染 ----
 FROM nginx:1.29-alpine AS runtime
 
+# 基础镜像的 html 目录自带 index.html 与 50x.html，都不属于本站：index.html 会被下一步
+# 的 dist 覆盖（先删只是为了不依赖覆盖语义），50x.html 是 nginx 品牌错误页、模板里
+# 不引用，留着会让 /50x.html 命中一个与本站无关的 200 页面。
+# 必须删在 COPY dist 之前，否则会把 dist 里的 index.html 一起删掉。
+RUN rm -f /usr/share/nginx/html/index.html /usr/share/nginx/html/50x.html
+
 COPY --from=web-build /app/frontend/dist /usr/share/nginx/html
 
 # 官方镜像 entrypoint 里的 20-envsubst-on-templates.sh 会把 /etc/nginx/templates/*.template
