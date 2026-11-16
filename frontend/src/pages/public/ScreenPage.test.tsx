@@ -13,14 +13,17 @@ import {
   emptyScreenFixture,
   metaFixture,
   screenFixture,
+  updatedScreenFixture,
 } from "../../test/fixtures/publicApi";
 import { ScreenPage } from "./ScreenPage";
 
-// 大屏布局与信息区块（tasklist 第 7–8 项）。
+// 大屏布局与信息区块（tasklist 第 7–8 项）与轮询降级（第 9 项）。
 // 验收点在这里落地：
 // 1) 五个业务区块 + 占用分布区块渲染，以及 empty=true 的「保留标题 + 暂无数据」；
 // 2) 窗口 1920×1080 → 2560×1440 → 1280×1024 只改缩放系数，区块顺序与相对位置不变；
 // 3) 热力图列头来自 /api/meta 的轴定义，meta 失败时回退「大节 1..5」；
+// 4) 30 秒轮询失败后旧数据仍在、顶栏出现离线徽标与最后刷新时间，下次成功清除并用新响应更新；
+// 5) 首屏失败显示错误占位 + 重试，且与 empty 的「暂无数据」空态区分。
 // 另加一条「失败时页面不出现业务码、message 与错误原文」。
 
 const INITIAL_WIDTH = window.innerWidth;
@@ -103,6 +106,37 @@ function renderScreenPage() {
   );
 }
 
+/**
+ * fake timer 下让「fetch → response.text() → 信封解析 → setState → 重渲染」走完。
+ * 不用 waitFor：它会自己推进时钟，打乱 30 秒节拍的断言。
+ */
+async function flushAsync() {
+  await act(async () => {
+    for (let index = 0; index < 8; index += 1) {
+      await Promise.resolve();
+    }
+  });
+}
+
+/** 推进 fake 时钟并让该拍请求落地。 */
+async function advance(ms: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+  await flushAsync();
+}
+
+/** jsdom 的 visibilityState 是只读 getter：测试里替换成可切换的实现。 */
+function setVisibility(state: "visible" | "hidden") {
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    get: () => state,
+  });
+  act(() => {
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+}
+
 /** 从 `transform: scale(1.3333)` 里取数值；取不到直接失败，避免断言悄悄空转。 */
 function scaleOf(element: HTMLElement): number {
   const match = /scale\(([\d.eE+-]+)\)/.exec(element.style.transform);
@@ -126,8 +160,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  // 还原可见性，避免轮询用例的 hidden 状态漏给其它用例。
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    get: () => "visible",
+  });
   // 还原视口，避免用例之间的窗口尺寸互相污染。
   setViewport(INITIAL_WIDTH, INITIAL_HEIGHT);
 });
@@ -267,6 +307,11 @@ describe("信息区块", () => {
 
     expect(await screen.findByText("数据暂时不可用")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试" })).toBeEnabled();
+    // 首屏失败是错误占位，不是 empty 的「暂无数据」空态；顶栏也还没成功刷新过。
+    expect(screen.queryByText("暂无数据")).not.toBeInTheDocument();
+    expect(screen.getByTestId("screen-last-refresh")).toHaveTextContent(
+      "尚未成功刷新",
+    );
 
     for (const secret of [
       "50001",
@@ -390,5 +435,97 @@ describe("等比缩放与布局稳定性", () => {
     expect(Math.abs(Number.parseFloat(canvas.style.left))).toBeLessThan(1);
     expect(Number.parseFloat(canvas.style.top)).toBeCloseTo(152, 6);
     expect(blockLayout()).toEqual(before);
+  });
+});
+
+describe("轮询与降级", () => {
+  it("每 30 秒请求一次 /api/screen，失败一轮保留旧数据并在顶栏挂离线徽标，下次成功清除并用新响应更新", async () => {
+    // 固定时钟：02:30Z → 顶栏应显示 10:30（Asia/Shanghai）。
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-16T02:30:00Z"));
+
+    let screenCalls = 0;
+    const requests = stubScreenApi({
+      screen: () => {
+        screenCalls += 1;
+        // 首屏成功、第二拍失败、第三拍恢复且房间数已变（2481 → 2482）。
+        if (screenCalls === 2) {
+          return errorEnvelope(50000, "poll boom", "req_poll_secret");
+        }
+        return envelope(
+          screenCalls >= 3 ? updatedScreenFixture : screenFixture,
+        );
+      },
+    });
+
+    renderScreenPage();
+    await flushAsync();
+
+    // 首屏成功：数据区块在，顶栏有最后刷新时间、没有离线徽标。
+    expect(
+      screen.getByRole("region", { name: "站点规模" }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("screen-last-refresh")).toHaveTextContent(
+      "最后刷新 2026-11-16 10:30（Asia/Shanghai）",
+    );
+    expect(screen.queryByTestId("offline-badge")).not.toBeInTheDocument();
+    expect(
+      requests.filter((url) => url.pathname === "/api/screen"),
+    ).toHaveLength(1);
+
+    // 推进 30 秒：第二拍失败，但旧数据仍在、页面不进错误态与空态。
+    await advance(30_000);
+    expect(
+      requests.filter((url) => url.pathname === "/api/screen"),
+    ).toHaveLength(2);
+    expect(
+      screen.getByRole("region", { name: "站点规模" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("2,481")).toBeInTheDocument();
+    expect(screen.getByTestId("offline-badge")).toHaveTextContent("离线");
+    // 失败不推进最后刷新时间。
+    expect(screen.getByTestId("screen-last-refresh")).toHaveTextContent(
+      "2026-11-16 10:30",
+    );
+    expect(screen.queryByText("数据暂时不可用")).not.toBeInTheDocument();
+    expect(screen.queryByText("暂无数据")).not.toBeInTheDocument();
+
+    // 再下一拍成功：徽标清除，最后刷新时间前进到 10:31，数据换成这次响应的内容。
+    await advance(30_000);
+    expect(screen.queryByTestId("offline-badge")).not.toBeInTheDocument();
+    expect(screen.getByTestId("screen-last-refresh")).toHaveTextContent(
+      "最后刷新 2026-11-16 10:31（Asia/Shanghai）",
+    );
+    expect(screen.getByText("2,482")).toBeInTheDocument();
+    // 旧的房间数必须被替换掉，而不是与新区块并存。
+    expect(screen.queryByText("2,481")).not.toBeInTheDocument();
+  });
+
+  it("隐藏页面后推进 60 秒不发新请求，重新可见立即补一次", async () => {
+    vi.useFakeTimers();
+    const requests = stubScreenApi({ screen: () => envelope(screenFixture) });
+
+    renderScreenPage();
+    await flushAsync();
+    expect(
+      screen.getByRole("region", { name: "站点规模" }),
+    ).toBeInTheDocument();
+    expect(
+      requests.filter((url) => url.pathname === "/api/screen"),
+    ).toHaveLength(1);
+
+    setVisibility("hidden");
+    await advance(60_000);
+    expect(
+      requests.filter((url) => url.pathname === "/api/screen"),
+    ).toHaveLength(1);
+    // 隐藏期间数据保持不动。
+    expect(screen.getByText("2,481")).toBeInTheDocument();
+
+    setVisibility("visible");
+    await flushAsync();
+    expect(
+      requests.filter((url) => url.pathname === "/api/screen"),
+    ).toHaveLength(2);
   });
 });

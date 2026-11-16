@@ -7,6 +7,7 @@ import {
   ErrorView,
   HintAlert,
   LoadingView,
+  OfflineBadge,
   StaleBanner,
 } from "./StateViews";
 
@@ -230,5 +231,31 @@ describe("ErrorView", () => {
     );
 
     expect(screen.getByRole("button", { name: "重试" })).toBeDisabled();
+  });
+});
+
+describe("OfflineBadge", () => {
+  it("以 warning 标签、可读文本与 status 角色提示离线", () => {
+    render(<OfflineBadge />);
+
+    const badge = screen.getByTestId("offline-badge");
+    // 文字承载语义，颜色只作辅助（Requirement 8.5 的口径）。
+    expect(badge).toHaveTextContent("离线");
+    expect(badge).toHaveAttribute("role", "status");
+    expect(badge).toHaveClass("ant-tag-warning");
+  });
+
+  it("图标与文字同时表达离线，且图标对读屏是装饰", () => {
+    render(<OfflineBadge />);
+
+    const badge = screen.getByTestId("offline-badge");
+    const icon = badge.querySelector("svg");
+    // Requirement 8.5：状态不能只靠文字 + 颜色，还要有图标。
+    expect(icon).not.toBeNull();
+    // 图标是装饰：不参与可读名称，也不带 title 之类的文字兜底。
+    expect(icon).toHaveAttribute("aria-hidden", "true");
+    expect(icon?.querySelector("title")).toBeNull();
+    // 可读语义仍只由「离线」二字承担，图标不引入任何额外文本。
+    expect(badge.textContent?.trim()).toBe("离线");
   });
 });

@@ -16,6 +16,7 @@ import {
   Result,
   Skeleton,
   Space,
+  Tag,
   Typography,
 } from "antd";
 import type { ApiError } from "../api/client";
@@ -168,6 +169,69 @@ export function StaleBanner({ week, weeks, inCalendar }: StaleBannerProps) {
 
   return (
     <div style={{ display: "grid", gap: 12, marginBottom: 16 }}>{alerts}</div>
+  );
+}
+
+/**
+ * 离线图标：自绘 SVG，不新增图标依赖（与 StatusCell 同一取舍）。
+ * 图标是装饰（aria-hidden）：可读语义由徽标里的「离线」二字承担，
+ * 图标既不进可读名称，也不带 `title` 之类的文字兜底。
+ */
+function OfflineIcon() {
+  return (
+    <svg
+      width={16}
+      height={16}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      focusable="false"
+      style={{ verticalAlign: "-0.125em", marginInlineEnd: 6 }}
+    >
+      {/* 断开的信号弧 + 斜杠：与文字互为补充，颜色只作辅助。 */}
+      <path
+        d="M1.5 5.5Q8 -0.5 14.5 5.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.6}
+        strokeLinecap="round"
+      />
+      <path
+        d="M4.2 8.6Q8 4.8 11.8 8.6"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.6}
+        strokeLinecap="round"
+      />
+      <circle cx={8} cy={12.4} r={1.1} fill="currentColor" />
+      <path
+        d="m2.2 2.2 11.6 11.6"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.8}
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+/**
+ * 大屏离线徽标（tasklist 第 9 项；Requirement 7.3、8.5、design「大屏另有两态」）。
+ *
+ * 只表达「最近一次轮询失败」：数据仍按上一次成功的结果展示，顶栏同时给出最后刷新时间。
+ * 下一次轮询成功时由页面把它撤掉，徽标自己不持有任何轮询状态。
+ * 表达上文字与图标并用，颜色只作辅助（Requirement 8.5）。
+ */
+export function OfflineBadge() {
+  return (
+    <Tag
+      color="warning"
+      role="status"
+      data-testid="offline-badge"
+      style={{ marginInlineEnd: 0, fontSize: 16, lineHeight: "24px" }}
+    >
+      <OfflineIcon />
+      离线
+    </Tag>
   );
 }
 

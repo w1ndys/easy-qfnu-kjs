@@ -1,9 +1,9 @@
-// 数据大屏（tasklist 第 7–8 项；Requirement 6.1–6.6、PRD 6.4）：
+// 数据大屏（tasklist 第 7–9 项；Requirement 6.1–6.6、7.1–7.6、PRD 6.4）：
 // 在 1920×1080 设计稿上按 12 列 × 8 行分区，顺序固定、窗口变化只等比缩放。
 //
 // 数据来源：
-// - `/api/screen` 提供五个信息区块与占用分布；30 秒轮询、离线徽标与最后刷新时间
-//   留给第 9 项（本项仍是一次加载）；
+// - `/api/screen` 由 `useScreenPolling` 在可见时每 30 秒请求一次（第 9 项）：
+//   在途与失败都保留上一次成功的数据，失败只在顶栏挂离线徽标，成功自动清除；
 // - `/api/meta` 只取 `axis` 给热力图列头用（design D12）：首屏与 screen 并行请求一次，
 //   之后不随轮询刷新；meta 失败不影响大屏，列头回退「大节 1..5」；
 // - 大屏不渲染业务码、message 或错误原文（Requirement 7.6），失败时只有中性占位与重试。
@@ -11,7 +11,7 @@
 import { Button, theme } from "antd";
 import { useCallback, type CSSProperties, type ReactNode } from "react";
 import type { ApiResult } from "../../api/client";
-import { getMeta, getScreen } from "../../api/public";
+import { getMeta } from "../../api/public";
 import type { MetaAxis, MetaResult, ScreenResult } from "../../api/types";
 import { OccupancyBlock } from "../../components/OccupancyHeatmap";
 import {
@@ -21,8 +21,13 @@ import {
   ScaleBlock,
   WeekFreshnessTable,
 } from "../../components/ScreenBlocks";
-import { LoadingView } from "../../components/StateViews";
-import { useApi, type ApiRequestState } from "../../hooks/useApi";
+import { LoadingView, OfflineBadge } from "../../components/StateViews";
+import { useApi } from "../../hooks/useApi";
+import {
+  useScreenPolling,
+  type ScreenPollingState,
+} from "../../hooks/useScreenPolling";
+import { formatShanghaiDateTime } from "../../lib/datetime";
 
 /** 1920×1080 设计稿的栅格参数：12 列 × 8 行、间距 24px、外边距 40px（design「大屏布局」）。 */
 const GRID_GAP = 24;
@@ -34,7 +39,7 @@ const CANVAS_PADDING = 40;
  * 因此区块的相对位置与顺序只由这张表决定（正确性属性 8）。
  */
 const AREAS = {
-  /** 页头：1 行通栏（第 9 项在这里补最后刷新时间与离线徽标）。 */
+  /** 页头：1 行通栏（标题 · 最后刷新时间 · 离线徽标）。 */
   header: "1 / 1 / 2 / 13",
   /** 左上：站点规模（3 行）。 */
   westTop: "2 / 1 / 5 / 6",
@@ -68,18 +73,27 @@ const STACKED_AREA: CSSProperties = {
   minHeight: 0,
 };
 
-/** 请求函数放在模块级，引用稳定，useApi 不会因页面重渲染重发请求。 */
-function loadScreen(signal: AbortSignal): Promise<ApiResult<ScreenResult>> {
-  return getScreen(signal);
-}
-
 /** 只为热力图列头取一次轴定义（design D12）；失败时由 OccupancyBlock 回退列头。 */
 function loadMeta(signal: AbortSignal): Promise<ApiResult<MetaResult>> {
   return getMeta(signal);
 }
 
-function ScreenHeader() {
+/**
+ * 页头：标题 + 最后刷新时间 + 离线徽标（design「大屏布局」）。
+ *
+ * 最后刷新时间取轮询成功时的客户端接收时刻，按 `Asia/Shanghai` 展示（Requirement 7.3、
+ * 正确性属性 7：时间只走 lib/datetime.ts）。还没有成功过时显示「尚未成功刷新」，
+ * 此时若首屏失败，徽标与内容区的错误占位会同时出现，屏幕上不会伪装成空数据。
+ */
+function ScreenHeader({
+  lastSuccessAt,
+  offline,
+}: {
+  lastSuccessAt: string | null;
+  offline: boolean;
+}) {
   const { token } = theme.useToken();
+  const lastRefresh = formatShanghaiDateTime(lastSuccessAt);
 
   return (
     <header
@@ -95,9 +109,24 @@ function ScreenHeader() {
       }}
     >
       <h1 style={{ margin: 0, fontSize: 40, fontWeight: 700 }}>数据大屏</h1>
-      <p style={{ margin: 0, fontSize: 18, color: token.colorTextSecondary }}>
-        站点规模 · 数据新鲜度 · 同步健康 · 占用分布
-      </p>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 16,
+          minWidth: 0,
+        }}
+      >
+        <p
+          data-testid="screen-last-refresh"
+          style={{ margin: 0, fontSize: 18, color: token.colorTextSecondary }}
+        >
+          {lastRefresh === null
+            ? "尚未成功刷新"
+            : `最后刷新 ${lastRefresh}（Asia/Shanghai）`}
+        </p>
+        {offline && <OfflineBadge />}
+      </div>
     </header>
   );
 }
@@ -216,7 +245,7 @@ function ScreenBody({
   axis,
   onRetry,
 }: {
-  screen: ApiRequestState<ScreenResult>;
+  screen: ScreenPollingState;
   axis: MetaAxis | null;
   /** 错误页的重试：同时重发主数据与轴定义（见 ScreenPage 里的说明）。 */
   onRetry: () => void;
@@ -235,24 +264,27 @@ function ScreenBody({
  * 暗色主题与等比缩放由 ScreenLayout 提供（路由里包裹本页），本页只管内容分区。
  */
 export function ScreenPage() {
-  // 第 7 项只做一次加载；第 9 项把这一层换成 useScreenPolling，区块组件保持不变。
-  const screen = useApi("screen", loadScreen);
+  // 可见时 30 秒轮询一次；隐藏暂停、重新可见立即补一次，失败保留旧数据（第 9 项）。
+  const screen = useScreenPolling();
   // 轴只取一次，不参与轮询：轮询只打 /api/screen（design D12）。
   const meta = useApi("screen-meta", loadMeta);
 
   // 错误页的重试要顺带重发 meta：首屏两个请求可能同时失败，只重发 screen 的话
   // 主数据恢复后列头仍永久停在「大节 1..5」的回退文案，而 meta 单独失败不弹错误页。
   // 因此把 meta.reload 挂到同一个重试入口上；meta 单独失败仍按 design D12 静默回退。
-  const { reload: reloadScreen } = screen;
+  const { retry: retryScreen } = screen;
   const { reload: reloadMeta } = meta;
   const retry = useCallback(() => {
-    reloadScreen();
+    retryScreen();
     reloadMeta();
-  }, [reloadScreen, reloadMeta]);
+  }, [retryScreen, reloadMeta]);
 
   return (
     <main aria-label="数据大屏" style={GRID_STYLE}>
-      <ScreenHeader />
+      <ScreenHeader
+        lastSuccessAt={screen.lastSuccessAt}
+        offline={screen.offline}
+      />
       <ScreenBody
         screen={screen}
         axis={meta.data?.axis ?? null}

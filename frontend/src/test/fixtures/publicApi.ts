@@ -457,6 +457,15 @@ export const screenFixture = {
 } satisfies ScreenResult;
 
 /**
+ * 第 9 项轮询夹具：与 `screenFixture` 只差「房间数」一个字段。
+ * 用来证明后续成功的那一拍会用**本次响应**整体替换界面，而不是一直显示首屏数据。
+ */
+export const updatedScreenFixture = {
+  ...screenFixture,
+  scale: { ...screenFixture.scale, rooms: 2482 },
+} satisfies ScreenResult;
+
+/**
  * 第 7 项空态夹具：无当前数据版本（release=null、empty=true），
  * 其余块保持后端 emptyScreenResult 的空/零值形状，用来断言五个区块都保留标题。
  */

@@ -1,6 +1,7 @@
 import {
   NETWORK_ERROR_CODE,
   UNKNOWN_REQUEST_ID,
+  getErrorTitle,
   isRetriableCode,
 } from "./errors";
 import type { Envelope } from "./types";
@@ -46,6 +47,34 @@ export class ApiError extends Error {
 
 /** 信封解析失败的业务码：与 50000 同路径（design「Error Handling」）。 */
 const PARSE_ERROR_CODE = 50000;
+
+/**
+ * fetch 被取消时抛的是 AbortError；它只表示「这次结果不要了」，不该进错误态。
+ * 放在这里与 ApiError 同源，供 useApi 与大屏轮询共用同一套判定。
+ */
+export function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    (error as { name?: unknown }).name === "AbortError"
+  );
+}
+
+/**
+ * 不该出现的非 ApiError（编程错误等）也收敛成一层兜底，页面永远只处理 ApiError。
+ * 业务码用 -1（前端自有的「没拿到信封」），文案与网络失败一致。
+ */
+export function toApiError(error: unknown): ApiError {
+  if (error instanceof ApiError) {
+    return error;
+  }
+  return new ApiError(
+    NETWORK_ERROR_CODE,
+    UNKNOWN_REQUEST_ID,
+    getErrorTitle(NETWORK_ERROR_CODE),
+  );
+}
 
 /**
  * 拼接查询串。空串按「未传」处理（后端口径里 building/keyword 为空即不限），

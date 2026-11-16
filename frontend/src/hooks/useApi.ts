@@ -3,12 +3,12 @@
 // 不引 react-query：两个页面、无写操作，请求状态跟随组件生命周期即可（design D2）。
 
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, type ApiResult } from "../api/client";
 import {
-  NETWORK_ERROR_CODE,
-  UNKNOWN_REQUEST_ID,
-  getErrorTitle,
-} from "../api/errors";
+  ApiError,
+  isAbortError,
+  toApiError,
+  type ApiResult,
+} from "../api/client";
 
 /** 已完成（成功或失败）的那次请求在页面上的定格结果。 */
 interface SettledState<T> {
@@ -28,28 +28,6 @@ export interface ApiRequestState<T> {
   loading: boolean;
   /** 用同一个请求键再发一次（查询按钮/回车在筛选未变时靠它触发）。 */
   reload: () => void;
-}
-
-/** fetch 被取消时抛的是 AbortError；它只表示「这次结果不要了」，不该进错误态。 */
-function isAbortError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "name" in error &&
-    (error as { name?: unknown }).name === "AbortError"
-  );
-}
-
-/** 不该出现的非 ApiError（编程错误等）也收敛成一层兜底，页面永远只处理 ApiError。 */
-function toApiError(error: unknown): ApiError {
-  if (error instanceof ApiError) {
-    return error;
-  }
-  return new ApiError(
-    NETWORK_ERROR_CODE,
-    UNKNOWN_REQUEST_ID,
-    getErrorTitle(NETWORK_ERROR_CODE),
-  );
 }
 
 /**
