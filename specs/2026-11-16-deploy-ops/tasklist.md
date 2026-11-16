@@ -66,10 +66,10 @@ Updated: 2026-11-16
 
 依赖：5
 
-- [ ] `deploy/backup/restore.sh` 在缺 `TARGET_DB` 或 `CONFIRM≠yes` 时拒绝执行并以非零退出码结束。
-- [ ] 先建临时库再 `task deploy:restore file=<dump> target=easy_qfnu_kjs_restore CONFIRM=yes`，备份恢复到临时库成功；临时库上跑一次空教室查询返回成功信封（空结果也算通过）。
-- [ ] `task deploy:secret-backup` 产出 `backup/secret/secret.key` 且权限为 `600`；命令输出不含文件内容。
-- [ ] `Taskfile.yml` 的 `db:dump` / `db:restore` 已改为转调同一份脚本，仓库里不存在第二套 `pg_dump` 实现。
+- [x] `deploy/backup/restore.sh` 在缺 `TARGET_DB` 或 `CONFIRM≠yes` 时拒绝执行并以非零退出码结束。
+- [x] 先建临时库再 `task deploy:restore file=<dump> target=easy_qfnu_kjs_restore CONFIRM=yes`，备份恢复到临时库成功；临时库上跑一次空教室查询返回成功信封（空结果也算通过）。
+- [x] `task deploy:secret-backup` 产出 `backup/secret/secret.key` 且权限为 `600`；命令输出不含文件内容。
+- [x] `Taskfile.yml` 的 `db:dump` / `db:restore` 已改为转调同一份脚本，仓库里不存在第二套 `pg_dump` 实现。
 
 ## 7. 门禁与运维 target
 

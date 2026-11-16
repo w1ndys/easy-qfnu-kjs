@@ -81,6 +81,33 @@ tasks:
     cmds:
       - '{{.COMPOSE}} run --rm --entrypoint /scripts/backup.sh backup'
 
+  deploy:restore:
+    desc: 恢复备份到显式目标库（演练一律用临时库；需 file=backup/xxx.dump 与 target=库名，CONFIRM=yes 才执行）
+    # 目标库必须由运维显式给出：绝不默认恢复进 POSTGRES_DB，避免一次手滑覆盖生产库。
+    # CONFIRM 不硬编码：它由用户显式传，空值时交给 restore.sh 的确认门拒绝（负向用例也据此验证）。
+    requires:
+      vars: [file, target]
+    preconditions:
+      - sh: test -f .env
+        msg: 缺少 .env：先 `task deploy:env`（或 `cp .env.example .env`）并填 POSTGRES_PASSWORD
+      - sh: test -f '{{.file}}'
+        msg: 备份文件不存在：{{.file}}（先 task deploy:backup，或确认路径相对仓库根）
+    cmds:
+      - |
+        {{.COMPOSE}} run --rm --entrypoint /scripts/restore.sh \
+          -e TARGET_DB={{.target}} \
+          -e BACKUP_FILE=/backup/$(basename "{{.file}}") \
+          -e CONFIRM={{.CONFIRM}} \
+          backup
+
+  deploy:secret-backup:
+    desc: 导出加密密钥到 ./backup/secret/secret.key（权限 600，内容不进 stdout/日志）
+    preconditions:
+      - sh: test -f .env
+        msg: 缺少 .env：先 `task deploy:env`（或 `cp .env.example .env`）并填 POSTGRES_PASSWORD
+    cmds:
+      - sh deploy/scripts/secret-backup.sh
+
   # ---------- 数据库 ----------
   db:up:
     desc: 只启动数据库
@@ -102,33 +129,24 @@ tasks:
       - '{{.COMPOSE}} up -d postgres'
 
   db:dump:
-    desc: 导出全量备份到 ./backup，文件名带 UTC 时间戳
-    # 用户与库名在容器内展开：这两个值由 compose 注入 postgres 容器，是权威来源。
-    # pipefail 与非空校验缺一不可：pg_dump 失败时 gzip 仍可能以 0 退出，不设 pipefail 就会
-    # 「命令成功但备份为空」；先写临时文件、非空才 mv，失败时 trap 清掉半截文件。
+    desc: 导出 -Fc 格式备份到 ./backup
+    # 与每日 03:15 定时任务同一份实现（deploy/backup/backup.sh）：备份只此一处，
+    # 不再维护第二套 gzip 管道。
     cmds:
-      - |
-        set -eu
-        set -o pipefail
-        mkdir -p '{{.BACKUP_DIR}}'
-        file="{{.BACKUP_DIR}}/easy_qfnu_kjs_$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
-        tmp="$(mktemp '{{.BACKUP_DIR}}/.easy_qfnu_kjs.XXXXXX')"
-        trap 'rm -f "$tmp"' EXIT
-        {{.COMPOSE}} exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' | gzip > "$tmp"
-        test -s "$tmp"
-        mv "$tmp" "$file"
-        trap - EXIT
-        echo "已写入 $file"
+      - task: deploy:backup
 
   db:restore:
-    desc: 从备份恢复，需 file=backup/xxx.sql.gz
+    desc: 从备份恢复到显式目标库（转调 restore.sh；需 file= 与 target=，CONFIRM=yes 才执行）
+    # 与 deploy:restore 同源：都走 deploy/backup/restore.sh 的同一道确认门与建库检查，
+    # 这里只做一次变量转发，不复制命令。
     requires:
-      vars: [file]
+      vars: [file, target]
     cmds:
-      - |
-        set -eu
-        set -o pipefail
-        gunzip -c '{{.file}}' | {{.COMPOSE}} exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+      - task: deploy:restore
+        vars:
+          file: '{{.file}}'
+          target: '{{.target}}'
+          CONFIRM: '{{.CONFIRM}}'
 
   # ---------- 后端 ----------
   backend:run:
