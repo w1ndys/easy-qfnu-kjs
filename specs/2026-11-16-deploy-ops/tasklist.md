@@ -48,10 +48,10 @@ Updated: 2026-11-16
 
 依赖：无（应用段键集合不变，8 项）
 
-- [ ] `.env.example` 应用段 8 项（不含 `STATIC_DIR`，已定），逐项注释默认值与适用场景；`ADMIN_COOKIE_SECURE` 写清 HTTP 与 TLS 两种取值，`TRUST_PROXY_HEADERS` 说明「经 `web` 反代时为 `true`，绕过反代直连排障时才 `false`」。
-- [ ] 分隔标题严格为 design 约定的两行注释，应用段在前、编排段在后；文件不含任何真实口令、密钥或内网地址。
-- [ ] `backend/internal/config` 新增对齐测试：`go/ast` 解析 `config.go` 的 `os.Getenv` 键集合，与 `.env.example` 应用段做双向差集，并断言键数等于 `config.Config` 字段数（当前 8）；`go test ./internal/config` 通过。
-- [ ] 除这条测试外，`backend/` 下没有其他改动（含注释）：旧「web 反代」注释保持原样即可，不再为静态托管改写（已定）。
+- [x] `.env.example` 应用段 8 项（不含 `STATIC_DIR`，已定），逐项注释默认值与适用场景；`ADMIN_COOKIE_SECURE` 写清 HTTP 与 TLS 两种取值，`TRUST_PROXY_HEADERS` 说明「经 `web` 反代时为 `true`，绕过反代直连排障时才 `false`」。
+- [x] 分隔标题严格为 design 约定的两行注释，应用段在前、编排段在后；文件不含任何真实口令、密钥或内网地址。
+- [x] `backend/internal/config` 新增对齐测试：`go/ast` 解析 `config.go` 的 `os.Getenv` 键集合，与 `.env.example` 应用段做双向差集，并断言键数等于 `config.Config` 字段数（当前 8）；`go test ./internal/config` 通过。
+- [x] 除这条测试外，`backend/` 下没有其他改动（含注释）：旧「web 反代」注释保持原样即可，不再为静态托管改写（已定）。
 
 ## 5. 备份：sidecar、脚本与保留策略
 
