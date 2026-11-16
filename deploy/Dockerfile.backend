@@ -1,0 +1,46 @@
+# server 镜像。构建上下文是仓库根，单独构建：
+#   docker build -f deploy/Dockerfile.backend --target runtime -t easy-qfnu-kjs-server:local .
+# go-build 阶段是唯一读 backend/ 的地方，runtime 阶段只有静态二进制、CA 证书与 tzdata。
+# 静态托管由独立的 web 镜像承担，本镜像不产出、也不挂载任何前端文件。
+
+# ---- go-build：编译期镜像，Go 版本与 backend/go.mod 的 go 1.26.10 对齐 ----
+FROM golang:1.26.10-alpine AS go-build
+
+WORKDIR /src/backend
+
+# 依赖清单先拷再下模块：只改 backend/ 源码时 go mod download 这层仍命中缓存。
+COPY backend/go.mod backend/go.sum ./
+RUN go mod download
+
+# 源码后拷。migrations/*.sql 已由 //go:embed 打进二进制，运行阶段不需要 migrations/ 目录。
+COPY backend/ ./
+
+# CGO_ENABLED=0 得到静态链接的二进制（运行阶段没有 glibc/musl 动态依赖）；
+# -trimpath 去掉构建机路径；-ldflags="-s -w" 去掉符号表与调试信息。
+ENV CGO_ENABLED=0
+RUN go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+
+# ---- runtime：运行镜像，不含 Go 工具链、也不含源码 ----
+FROM alpine:3.22 AS runtime
+
+# apk 只装两项：ca-certificates（采集走 https，必须有根证书）与 tzdata。
+# tzdata 是给 TZ=Asia/Shanghai 用的：alpine 基础镜像没有 zoneinfo，缺它时 TZ 是空操作、
+# 进程与日志（json-file 驱动按进程本地时间打戳）会退回 UTC，排障时与宿主机差 8 小时。
+# 注意分界：只有日志/展示层的时间才依赖 tzdata；业务时间（到期判定等）由固定 +08:00 偏移算出，
+# 不查本地时区库，所以换掉 tzdata 也不影响业务正确性。
+# 健康检查用基础镜像自带的 busybox wget，不另装 curl。
+# uid/gid 写成固定 10001：/var/lib/easy-qfnu-kjs 由命名卷挂载，首次初始化会继承这里的属主，
+# 运行用户必须能在这条路径下写 secret.key。
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app \
+    && mkdir -p /var/lib/easy-qfnu-kjs \
+    && chown app:app /var/lib/easy-qfnu-kjs
+
+COPY --from=go-build /out/server /app/server
+
+WORKDIR /app
+USER app
+
+EXPOSE 18080
+ENTRYPOINT ["/app/server"]

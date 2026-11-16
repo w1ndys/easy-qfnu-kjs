@@ -22,7 +22,7 @@ Updated: 2026-11-16
 |---|---|---|---|
 | D1 | **前端由独立 `web` 容器托管并反代（已定）**：`web`（nginx 或等价）托管 `frontend/dist` 的静态文件与 SPA 兜底，并把 `/api/*`、`/healthz`、`/readyz` 反代到 `server:18080`；`server` 只提供 JSON 与探针 | 已定 | 前端可单独发版、静态缓存头与安全头在 nginx 一处收敛；与 API 同源（同一个宿主端口），管理端 Cookie/CSRF 不受跨站影响。代价是多一个容器与一份反代配置，`TRUST_PROXY_HEADERS` 必须置 `true`（否则限流与统计看到的客户端 IP 全变成 `web` 容器地址） |
 | D2 | **编排文件放仓库根、名 `docker-compose.yml`**（`deploy/` 只放两份 Dockerfile、nginx 配置与脚本） | 待拍板 | 与根 `Taskfile.yml`、`.gitignore` 的 `backup/`、README 的入口一致，运维一条 `task up` 就够；偏离 ai-kit 惯例的 `deploy/compose.yaml`，且 README 里历史写的 `compose.yaml` / `Dockerfile.backend` / `Dockerfile.frontend` 要同步改成 `docker-compose.yml` / `deploy/Dockerfile.backend` / `deploy/Dockerfile.web` |
-| D3 | **两份 Dockerfile（已定）**：`deploy/Dockerfile.backend`（`golang:1.26.10-alpine` 构建 → `alpine:3.22` 运行，非 root 用户）与 `deploy/Dockerfile.web`（`node:24-alpine` + pnpm 构建 → `nginx:1.29-alpine` 运行），两者构建上下文都是仓库根，`.dockerignore` 只维护一份 | 已定 | 前端产物只进 web 镜像、后端镜像只装二进制与 CA 证书，改前端不必重建后端镜像；代价是两份文件与两条 `build:` 声明，`docker compose build` 变成两次构建 |
+| D3 | **两份 Dockerfile（已定）**：`deploy/Dockerfile.backend`（`golang:1.26.10-alpine` 构建 → `alpine:3.22` 运行，非 root 用户）与 `deploy/Dockerfile.web`（`node:24-alpine` + pnpm 构建 → `nginx:1.29-alpine` 运行），两者构建上下文都是仓库根，`.dockerignore` 只维护一份 | 已定 | 前端产物只进 web 镜像、后端镜像只装二进制、CA 证书与 tzdata，改前端不必重建后端镜像；代价是两份文件与两条 `build:` 声明，`docker compose build` 变成两次构建 |
 | D4 | **备份用 compose 的 sidecar 服务**（`postgres:17-alpine` 镜像 + 自带 busybox `crond`），每日 03:15 `Asia/Shanghai` | 已定 | 备份与业务进程生命周期解耦，`server` 崩了备份照样跑；镜像自带 `pg_dump` 17.11，与 `postgres:17` 同主版本，不用给运行镜像装客户端。代价是多一个常驻容器 |
 | D5 | **备份产物落宿主 `./backup`（bind mount）** | 待拍板 | 备份要能被运维直接拷走做异地副本，放命名卷反而要多一条 `docker run -v` 才能取出；`.gitignore` 已忽略 `backup/`。这是对「数据一律命名卷」的刻意例外，数据库数据卷与密钥卷仍用命名卷 |
 | D6 | `server` 与 `web` 的 `restart: on-failure:5`；`postgres`、`backup` 用 `restart: unless-stopped` | 已定 | 配置写错或迁移失败时容器停在 `Exited`，运维一眼看到，不会无限重启刷库；`web` 跟着 `server` 一起停在可见状态，不会留下一个只回 502 的空壳。代价是运行期偶发崩溃累计到第 5 次后也要人工 `task up` |
@@ -187,7 +187,7 @@ services:
       SECRET_KEY_PATH: /var/lib/easy-qfnu-kjs/secret.key
       ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-false}
       UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-}
-      TZ: Asia/Shanghai
+      TZ: Asia/Shanghai   # 依赖 runtime 阶段的 tzdata 才生效：日志时间与宿主机一致；业务时间仍用固定 +08:00，不依赖 tzdata
     volumes:
       - secret:/var/lib/easy-qfnu-kjs
     healthcheck:
@@ -246,7 +246,7 @@ networks:
 | 阶段 | 基础镜像 | 职责 | 关键点 |
 |---|---|---|---|
 | `go-build` | `golang:1.26.10-alpine` | 拷 `backend/go.mod`、`backend/go.sum` 先 `go mod download`，再拷 `backend/` 源码，`CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server` | 迁移脚本已由 `//go:embed *.sql` 打进二进制，运行阶段不需要 `migrations/` 目录 |
-| `runtime` | `alpine:3.22` | 只拷二进制 + CA 证书；预建 `/var/lib/easy-qfnu-kjs` 并 chown 给非 root 用户；`USER app` | `apk add --no-cache ca-certificates`（采集走 https、无 tzdata 需求——业务时区用固定 `+08:00`）；**不再**有 `/app/web` 与静态目录 |
+| `runtime` | `alpine:3.22` | 只拷二进制，装 CA 证书与 tzdata；预建 `/var/lib/easy-qfnu-kjs` 并 chown 给非 root 用户；`USER app` | `apk add --no-cache ca-certificates tzdata`。`ca-certificates`：采集走 https 需要根证书；`tzdata`：alpine 无 zoneinfo，缺它时 `TZ=Asia/Shanghai` 是空操作、日志时间戳停在 UTC，装上后 `TZ` 生效、日志时间与宿主机一致。业务时间（到期判定等）仍用固定 `+08:00` 计算，不依赖 tzdata。**不再**有 `/app/web` 与静态目录 |
 
 **`deploy/Dockerfile.web`**
 

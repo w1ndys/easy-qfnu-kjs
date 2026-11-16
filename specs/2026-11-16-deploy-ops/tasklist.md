@@ -17,11 +17,11 @@ Updated: 2026-11-16
 
 依赖：无
 
-- [ ] `docker build -f deploy/Dockerfile.backend --target runtime -t easy-qfnu-kjs-server:local .` 退出码 0；镜像内无 `/app/web`，`/var/lib/easy-qfnu-kjs` 已建且属主为运行用户。
-- [ ] `docker build -f deploy/Dockerfile.web --target runtime -t easy-qfnu-kjs-web:local .` 退出码 0；镜像内 `/usr/share/nginx/html/index.html` 与 `/etc/nginx/templates/default.conf.template` 存在。
-- [ ] `server` 运行阶段 `id -u` 非 0；二进制为静态链接（`CGO_ENABLED=0`），运行阶段无 Go、无 Node、无 `apk` 装的多余包。`web` 运行阶段无 Go、无 Node、无源码。
-- [ ] `.dockerignore` 覆盖 `.git`、`frontend/node_modules`、`frontend/dist`、`backend/bin`、`backup`、`specs`、`.env*`（保留 `.env.example`），改这些路径不触发重建。
-- [ ] 两个镜像里都搜不到 `secret.key`、`.env`、`node_modules` 与源码目录。
+- [x] `docker build -f deploy/Dockerfile.backend --target runtime -t easy-qfnu-kjs-server:local .` 退出码 0；镜像内无 `/app/web`，`/var/lib/easy-qfnu-kjs` 已建且属主为运行用户。
+- [x] `docker build -f deploy/Dockerfile.web --target runtime -t easy-qfnu-kjs-web:local .` 退出码 0；镜像内 `/usr/share/nginx/html/index.html` 与 `/etc/nginx/templates/default.conf.template` 存在。
+- [x] `server` 运行阶段 `id -u` 非 0；二进制为静态链接（`CGO_ENABLED=0`），运行阶段无 Go、无 Node、无 `apk` 装的多余包。`web` 运行阶段无 Go、无 Node、无源码。
+- [x] `.dockerignore` 覆盖 `.git`、`frontend/node_modules`、`frontend/dist`、`backend/bin`、`backup`、`specs`、`.env*`（保留 `.env.example`），改这些路径不触发重建。
+- [x] 两个镜像里都搜不到 `secret.key`、`.env`、`node_modules` 与源码目录。
 
 ## 2. web 容器与 nginx 反代：模板、静态产物与 `/api` 转发
 

@@ -1,0 +1,10 @@
+# 占位模板：由 tasklist 第 2 项替换为完整站点配置（静态 + SPA 兜底 + /api /healthz /readyz 反代）。
+# 本文件现在只保证 web 镜像可构建、渲染后 nginx 配置合法（不引用任何环境变量），
+# 监听端口与 8080 一致，方便在模板落地前先把镜像跑起来看一眼静态产物。
+# 不要按本文件的 location 列表推断第 2 项的最终口径。
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+}

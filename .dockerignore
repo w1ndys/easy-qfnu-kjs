@@ -1,0 +1,33 @@
+# 构建上下文是仓库根，deploy/Dockerfile.backend 与 deploy/Dockerfile.web 共用这一份排除表。
+# 下面列出的路径既不进构建上下文、也不会被任何 COPY 读到：改它们不会触发镜像重建，
+# 也不会把密钥、依赖目录、运行期产物或规格文档带进镜像。
+
+# --- 密钥与环境变量：.env 一律不进镜像，唯一例外是给出键名的 .env.example ---
+# 用 `**/` 前缀而不是裸 `.env`：Docker 的排除表按路径模式匹配，裸 `.env` 只命中上下文根，
+# frontend/.env、backend/.env.production 这类嵌套文件会漏进上下文（构建期用不到却能被打包）。
+**/.env
+**/.env.*
+!**/.env.example
+
+# --- 版本库与操作系统垃圾 ---
+.git
+.gitignore
+**/.DS_Store
+
+# --- Go 构建产物 ---
+backend/bin/
+backend/*.test
+coverage.out
+
+# --- 前端依赖与产物：由 web-build 阶段在自己容器里重新装、重新编 ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# --- 运行期产物：宿主机上的备份、日志，与镜像无关且体积大 ---
+backup/
+logs/
+*.log
+
+# --- 规格与设计文档：镜像不读 ---
+specs/

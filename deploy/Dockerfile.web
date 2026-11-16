@@ -1,0 +1,36 @@
+# web 镜像。构建上下文是仓库根，单独构建：
+#   docker build -f deploy/Dockerfile.web --target runtime -t easy-qfnu-kjs-web:local .
+# web-build 阶段是唯一读 frontend/ 的地方；runtime 阶段只有 nginx 与 frontend/dist 的产物，
+# 不含 Node、也不含前端源码。
+
+# ---- web-build：Node 24 + pnpm 产静态产物 ----
+FROM node:24-alpine AS web-build
+
+# pnpm 版本由 frontend/package.json 的 packageManager（pnpm@12.5.1）决定，交给 corepack 落地。
+# COREPACK_ENABLE_DOWNLOAD_PROMPT=0：非交互构建不能因为「是否下载 pnpm」的确认而卡住。
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable pnpm
+
+WORKDIR /app/frontend
+
+# 依赖清单与 pnpm 策略文件先拷：pnpm-workspace.yaml 里的 allowBuilds / minimumReleaseAgeExclude
+# 必须在 install 之前存在才生效，而只改源码时这一层仍然命中缓存。
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+
+# 源码后拷。node_modules 与 dist 被 .dockerignore 排除，不会覆盖上一步装好的依赖。
+# 产物落在 /app/frontend/dist（vite.config.ts 的 build.outDir）。
+COPY frontend/ ./
+RUN pnpm build
+
+# ---- runtime：nginx 提供静态产物，反代由模板渲染 ----
+FROM nginx:1.29-alpine AS runtime
+
+COPY --from=web-build /app/frontend/dist /usr/share/nginx/html
+
+# 官方镜像 entrypoint 里的 20-envsubst-on-templates.sh 会把 /etc/nginx/templates/*.template
+# 用环境变量渲染到 /etc/nginx/conf.d/，BACKEND_UPSTREAM 由此注入。
+COPY deploy/nginx/default.conf.template /etc/nginx/templates/default.conf.template
+
+# 与 compose 的端口映射（8080）一致；master 以 root 起（渲染模板、绑端口），worker 默认降为 nginx 用户。
+EXPOSE 8080
