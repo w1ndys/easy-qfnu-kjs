@@ -71,6 +71,20 @@ tasks:
       - '{{.COMPOSE}} build'
 
   # ---------- 部署 ----------
+  deploy:env:
+    desc: 首次部署生成 .env（已存在则只提示、不覆盖），随后填 POSTGRES_PASSWORD
+    # 只做复制，不替用户编口令：POSTGRES_PASSWORD 留空，由运维自己填。
+    # .env 已存在时保持原样并 exit 0：这个 target 会在部署流程里被重复调用，不能覆盖真实口令。
+    cmds:
+      - |
+        if [ -f .env ]; then
+          echo "deploy:env: .env 已存在，不覆盖（要重建先自行备份并删除 .env）"
+          exit 0
+        fi
+        cp .env.example .env
+        echo "deploy:env: 已从 .env.example 生成 .env"
+        echo "deploy:env: 请填写 POSTGRES_PASSWORD（按需再改 BIND_ADDR / SERVER_PORT / IMAGE_TAG）"
+
   deploy:backup:
     desc: 手动执行一次备份（与每日 03:15 定时任务同一份脚本）
     # 与 up/ps/down/logs 同一口径：.env 缺失时直接拒绝，而不是让 compose 用空口令跑。
@@ -107,6 +121,135 @@ tasks:
         msg: 缺少 .env：先 `task deploy:env`（或 `cp .env.example .env`）并填 POSTGRES_PASSWORD
     cmds:
       - sh deploy/scripts/secret-backup.sh
+
+  # ---------- 部署门禁与体检 ----------
+  # 与 `gate` 的分工（design D10，已定）：`gate` 的 7 项不依赖 Docker、CI 上也能跑；
+  # deploy:check 要构建两个镜像，是分钟级的，所以保持独立 target、不并入 gate。
+  # 改编排 / 镜像 / nginx / 脚本 / 配置时手动追加跑 deploy:check。
+  deploy:check-config:
+    desc: 快速校验（不构建镜像）：compose 配置合法 + .env.example 与 config 对齐
+    # 占位口令只作为 shell 环境变量注入。shell 环境优先于 --env-file，所以 .env.example
+    # 里的 POSTGRES_PASSWORD 保持空行，干净检出（没有 .env）也能过这一步。
+    cmds:
+      - 'POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ci-placeholder} docker compose -f deploy/compose.yaml --env-file .env.example config -q'
+      # 对齐测试就在后端测试包里（gate 的后端 test 同样会跑到），这里给一个只跑它的快速入口。
+      # -count=1 关掉结果缓存：测试读的是仓库根 .env.example（包外文件），go test 的缓存键
+      # 看不到它的变化，不加就可能拿上一次的 ok 冒充通过。
+      - 'cd backend && {{.GO}} test -count=1 ./internal/config -run TestEnvExample'
+
+  deploy:check:
+    desc: 部署门禁（独立于 task gate，改编排/镜像/nginx/脚本/配置时手动跑）：config → 配置对齐 → sh -n → 构建两镜像 → nginx -t
+    cmds:
+      - task: deploy:check-config
+      - |
+        set -eu
+        # deploy/ 下每个 shell 脚本都过一遍语法检查（含 backup/entrypoint.sh 与 scripts/smoke.sh）。
+        # 逐个文件调用：任一个语法错都以非零退出码结束，Task 会停在这一步、不进入构建。
+        for f in $(find deploy -type f -name '*.sh' | sort); do
+          echo "==> sh -n $f"
+          sh -n "$f"
+        done
+      # build 同样要解析整份编排，占位口令必须注入；退出码 0 且 web 与 server 两个镜像都
+      # 构建出来才算过。
+      - 'POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ci-placeholder} docker compose -f deploy/compose.yaml --env-file .env.example build'
+      # 容器的 entrypoint 会先用 BACKEND_UPSTREAM 渲染模板再校验语法，所以这一步验的是
+      # 「模板 + 上游变量 + 配置」三件套；显式给上游值——留空时 nginx -t 按 design 必然失败。
+      - 'docker run --rm -e BACKEND_UPSTREAM=server:18080 easy-qfnu-kjs-web:local nginx -t'
+
+  deploy:health:
+    desc: 体检：容器状态 + 经 web 宿主端口的 /healthz、/readyz + 最近备份时间（超 26 小时非零退出）
+    # 与 up/ps/down/logs 同一口径：缺 .env 直接拒绝，而不是让 compose 用空口令拼出错误提示。
+    preconditions:
+      - sh: test -f .env
+        msg: 缺少 .env：先 `task deploy:env`（或 `cp .env.example .env`）并填 POSTGRES_PASSWORD
+    cmds:
+      - |
+        set -eu
+
+        echo "== 容器状态（{{.COMPOSE}} ps --all）=="
+        {{.COMPOSE}} ps --all
+
+        echo
+        echo "== 探针（经 web 的宿主端口）=="
+        # 宿主端口只从 compose 的映射里取（BIND_ADDR:SERVER_PORT 可能不是默认值）。
+        if ! bind=$({{.COMPOSE}} port web 8080); then
+          echo "deploy:health: 失败：取不到 web 的宿主端口（web 未运行？先 task up）" >&2
+          exit 1
+        fi
+        # 输出形如 127.0.0.1:8080、0.0.0.0:8080 或 [::]:8080。宿主侧探测一律走回环：
+        # 绑定在 0.0.0.0 时从本机打 127.0.0.1 等价，还不依赖内网地址。
+        case "$bind" in
+          *:*) port="${bind##*:}" ;;
+          *) echo "deploy:health: 失败：无法解析 web 的端口映射输出：$bind" >&2; exit 1 ;;
+        esac
+        hostport="127.0.0.1:$port"
+        echo "web 宿主端口：$hostport（compose port 输出：$bind）"
+
+        for path in /healthz /readyz; do
+          url="http://$hostport$path"
+          if ! code=$(curl -fsS -m 5 -o /dev/null -w '%{http_code}' "$url"); then
+            echo "deploy:health: 失败：$url 不可达或状态码 >= 400（容器未起 / 反代 502 / 库未就绪）" >&2
+            exit 1
+          fi
+          case "$code" in
+            2??) echo "GET $path -> HTTP $code" ;;
+            *) echo "deploy:health: 失败：$url 返回 HTTP $code（要求 2xx）" >&2; exit 1 ;;
+          esac
+        done
+
+        echo
+        echo "== 最近备份时间 =="
+        marker=backup/.last_success
+        if [ ! -f "$marker" ]; then
+          echo "deploy:health: 失败：找不到 $marker，备份从未成功过（先 task deploy:backup）" >&2
+          exit 1
+        fi
+        ts=$(awk 'NR == 1 { print $1 }' "$marker")
+        if [ -z "$ts" ]; then
+          echo "deploy:health: 失败：$marker 第一行为空，读不到 UTC 时间戳" >&2
+          exit 1
+        fi
+        # 同一份脚本在 GNU date（Linux）与 BSD date（macOS）上都要能解析：先试 GNU 的
+        # `date -d`，失败再退 BSD 的 `date -j -f`；两套都按 UTC 解析（-u 与 +%s 配套）。
+        if epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
+          :
+        elif epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
+          :
+        else
+          echo "deploy:health: 失败：无法解析备份时间戳 \"$ts\"（期望形如 2026-11-16T08:22:55Z）" >&2
+          exit 1
+        fi
+        now=$(date -u +%s)
+        age=$((now - epoch))
+        echo "最近成功备份：$ts（文件：$(awk 'NR == 1 { print $2 }' "$marker")，距今 ${age} 秒）"
+        # 每日 03:15 一次备份，26 小时 = 93600 秒，留出约 2 小时余量（任务排队、dump 变慢）。
+        # 超过它说明最近两天都没备份成功，按失败处理。
+        if [ "$age" -gt 93600 ]; then
+          echo "deploy:health: 失败：最近一次成功备份距今 ${age} 秒，超过 26 小时（93600 秒）" >&2
+          exit 1
+        fi
+        echo "备份新鲜度：通过（阈值 93600 秒）"
+
+  deploy:smoke:
+    desc: 冒烟（opt-in）：临时 project kjs-smoke + 端口 18081 + 临时卷，验完自行 down -v 清理
+    # 所有编排细节（-p、override、down -v、断言）都在脚本里；这里只做入口。
+    cmds:
+      - sh deploy/scripts/smoke.sh
+
+  deploy:rollback:
+    desc: 镜像回退：web 与 server 一起换到 tag= 指定的镜像（不重建；.env 里的 IMAGE_TAG 不变）
+    # 前后端成对回退：新前端配旧后端最容易出兼容问题，所以两个服务一起换同一个 tag。
+    # --no-build 保证只换镜像、不顺手重建；IMAGE_TAG 由 shell 环境传入，优先于 --env-file .env。
+    requires:
+      vars: [tag]
+    preconditions:
+      - sh: test -f .env
+        msg: 缺少 .env：先 `task deploy:env`（或 `cp .env.example .env`）并填 POSTGRES_PASSWORD
+    cmds:
+      - 'IMAGE_TAG={{.tag}} {{.COMPOSE}} up -d --no-build web server'
+      - |
+        echo "deploy:rollback: 已把 web 与 server 切到 IMAGE_TAG={{.tag}}"
+        echo "deploy:rollback: 注意：.env 里的 IMAGE_TAG 没有改；后续 task up 要用同一个 tag 时请同步改 .env 的 IMAGE_TAG"
 
   # ---------- 数据库 ----------
   db:up:

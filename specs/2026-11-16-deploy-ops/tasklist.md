@@ -75,11 +75,11 @@ Updated: 2026-11-16
 
 依赖：2、3、4、5、6
 
-- [ ] `task deploy:check` 按顺序跑「`docker compose config -q` → 配置对齐测试 → 脚本 `sh -n` → `docker compose build`（`web` 与 `server` 两个镜像）→ `docker run --rm -e BACKEND_UPSTREAM=server:18080 easy-qfnu-kjs-web:local nginx -t`」，任一步失败整体非零退出（用故意写坏的 compose 与坏脚本各验一次）。
-- [ ] `task deploy:check-config` 在不构建镜像的前提下跑完前两步。
-- [ ] `task deploy:check` 保持独立 target，未出现在 `task gate` 的依赖里（已定）。
-- [ ] `task deploy:health` 输出「容器状态 + 经 `web` 宿主端口探测的 `/healthz`、`/readyz` + 最近备份时间」；备份超过 26 小时时非零退出。
-- [ ] `task deploy:env`、`deploy:smoke`、`deploy:rollback`（`web` 与 `server` 一起回填 tag）可用；`smoke.sh` 使用独立 project 名与端口 18081、临时卷，结束时自行 `down -v` 清理，并按 design C 段断言 SPA 兜底、`/api` 404 不兜底与缓存头。
+- [x] `task deploy:check` 按顺序跑「`docker compose config -q` → 配置对齐测试 → 脚本 `sh -n` → `docker compose build`（`web` 与 `server` 两个镜像）→ `docker run --rm -e BACKEND_UPSTREAM=server:18080 easy-qfnu-kjs-web:local nginx -t`」，任一步失败整体非零退出（用故意写坏的 compose 与坏脚本各验一次）。
+- [x] `task deploy:check-config` 在不构建镜像的前提下跑完前两步。
+- [x] `task deploy:check` 保持独立 target，未出现在 `task gate` 的依赖里（已定）。
+- [x] `task deploy:health` 输出「容器状态 + 经 `web` 宿主端口探测的 `/healthz`、`/readyz` + 最近备份时间」；备份超过 26 小时时非零退出。
+- [x] `task deploy:env`、`deploy:smoke`、`deploy:rollback`（`web` 与 `server` 一起回填 tag）可用；`smoke.sh` 使用独立 project 名与端口 18081、临时卷，结束时自行 `down -v` 清理，并按 design C 段断言 SPA 兜底、`/api` 404 不兜底与缓存头。
 
 ## 8. 运维文档与验收清单
 
