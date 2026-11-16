@@ -18,12 +18,12 @@ Updated: 2026-11-16
 
 | 术语 | 定义 |
 |---|---|
-| 部署单元 | 本 spec 交付的一整套部署能力：根 `docker-compose.yml`、`deploy/` 下的两份 Dockerfile（`Dockerfile.backend`、`Dockerfile.web`）与 nginx 配置、`deploy/` 下的脚本、根 `.env.example`、根 `Taskfile.yml` 里的 `deploy:*` target |
+| 部署单元 | 本 spec 交付的一整套部署能力：`deploy/compose.yaml`、`deploy/` 下的两份 Dockerfile（`Dockerfile.backend`、`Dockerfile.web`）与 nginx 配置、`deploy/` 下的脚本、根 `.env.example`、根 `Taskfile.yml` 里的 `deploy:*` target |
 | 编排器 | Docker Compose v2（`docker compose`），单机、单副本 |
 | `web` 服务 | 部署拓扑的边缘容器：nginx 托管前端构建产物、兜 SPA 路由，并把 `/api/*`、`/healthz`、`/readyz` 反代到 `server`（已定） |
 | 应用运行进程 | `server` 服务里的 `easy-qfnu-kjs` 二进制：公开 API、管理 API、进程内 cron、访问统计记账与清理都在这一个进程内；它不提供任何静态文件 |
 | 应用段变量 | `.env.example` 中被 `backend/internal/config` 读取的变量，与 `config.Config` 字段一一对应 |
-| 编排段变量 | `.env.example` 中只被 `docker-compose.yml` 或 nginx 模板使用、不进入应用进程的变量 |
+| 编排段变量 | `.env.example` 中只被 `deploy/compose.yaml` 或 nginx 模板使用、不进入应用进程的变量 |
 | 备份集 | 一次成功 `pg_dump` 产出的单个文件，文件名含 UTC 时间戳 |
 | 保留窗口 | 备份保留 7 天；访问统计保留 90 天 |
 | 验收环境 | 校内网单台主机上的单副本部署，尚不启用 HTTPS（内网验收阶段） |
@@ -37,8 +37,8 @@ Updated: 2026-11-16
 
 #### Acceptance Criteria
 
-1. WHEN 运维执行 `docker compose config`，编排器 SHALL 通过 `docker-compose.yml` 的语法与必填变量校验。
-2. IF `POSTGRES_PASSWORD` 未设置，编排器 SHALL 以非零退出码结束并在错误信息中指出该变量名。
+1. WHEN 运维执行 `POSTGRES_PASSWORD=ci-placeholder docker compose -f deploy/compose.yaml --env-file .env.example config -q`，编排器 SHALL 通过 `deploy/compose.yaml` 的语法与必填变量校验（占位口令由 shell 环境注入，不写进 `.env.example`）。
+2. IF `POSTGRES_PASSWORD` 未设置（含完全不传 `--env-file` 的情形），编排器 SHALL 以非零退出码结束并在错误信息中指出该变量名。
 3. `server` 服务 SHALL 只在 `postgres` 的健康检查通过之后启动；`web` 服务 SHALL 只在 `server` 的健康检查通过之后启动（已定）。
 4. `postgres` SHALL 只通过 compose 内部网络被 `server` 访问，宿主端口映射 SHALL 只存在于 `web` 服务（已定：`server` 不再映射宿主端口）。
 5. `postgres` 的数据目录与加密密钥目录 SHALL 分别落在两个命名卷上，编排文件 SHALL 为两个卷固定卷名。
@@ -67,7 +67,7 @@ Updated: 2026-11-16
 1. `.env.example` 的应用段键集合 SHALL 与 `config.Config` 的字段一一对应：每个字段恰有一个键，每个键恰对应一个字段。
 2. WHEN 某个应用段变量取值为空串，应用运行进程 SHALL 回落到 `config.Load` 定义的默认值（与未设置同义）。
 3. IF `.env.example` 的应用段出现 `config` 未读取的键、或缺少 `config` 读取的键，`task deploy:check` SHALL 以非零退出码结束并列出差异。
-4. 编排段变量 SHALL 只出现在 `docker-compose.yml` 的插值或 nginx 模板里；应用运行进程的环境 SHALL 只含应用段变量与编排层派生值（`DATABASE_URL`），SHALL 不含 `STATIC_DIR` 一类静态托管配置项（已定）。
+4. 编排段变量 SHALL 只出现在 `deploy/compose.yaml` 的插值或 nginx 模板里；应用运行进程的环境 SHALL 只含应用段变量与编排层派生值（`DATABASE_URL`），SHALL 不含 `STATIC_DIR` 一类静态托管配置项（已定）。
 5. `.env` SHALL 被版本控制忽略，`.env.example` SHALL 不含任何真实口令、密钥或内网地址。
 6. WHEN 运维执行 `task deploy:env`，任务 SHALL 在 `.env` 不存在时从 `.env.example` 复制一份，在 `.env` 已存在时保留原文件并提示未覆盖。
 

@@ -13,7 +13,7 @@ backend/     Go 1.26.10 服务：API、采集 pipeline、查询、存储
 frontend/    React 19 + antd 6：公开查询页（移动优先）与管理面板（桌面优先）
 docs/        产品基线与上游事实
 specs/       重写的需求、设计与任务拆解
-compose.yaml、Dockerfile.backend、Dockerfile.frontend、Taskfile.yml
+deploy/compose.yaml、deploy/Dockerfile.backend、deploy/Dockerfile.web、Taskfile.yml
 ```
 
 ## 文档
@@ -27,7 +27,8 @@ compose.yaml、Dockerfile.backend、Dockerfile.frontend、Taskfile.yml
 
 ```
 task            # 列出全部任务
-task up         # 起 web + server + postgres
+cp .env.example .env   # 首次：填 POSTGRES_PASSWORD；缺 .env 时 up/ps/down/logs 会拒绝执行
+task up         # 起 web + server + postgres (+ backup)
 task db:up      # 只起数据库
 task backend:run / task frontend:dev   # 本地开发
 task gate       # 提交前门禁：后端 test/race/vet/lint + 前端 test/lint/build

@@ -8,10 +8,10 @@ Updated: 2026-11-16
 
 **总则**
 
-- 不新增业务功能，也不改后端代码（已定）：`backend/` 下零改动，改动全在 `docker-compose.yml`、`deploy/`、`.env.example`、`Taskfile.yml`、`README.md` 与文档。
+- 不新增业务功能，也不改后端代码（已定）：`backend/` 下零改动，改动全在 `deploy/compose.yaml`、`deploy/`、`.env.example`、`Taskfile.yml`、`README.md` 与文档。
 - `task gate` 的 7 项覆盖不得减少；第 4 项的对齐测试必须落在后端 test 项里，随 `gate` 自动生效（这是本 spec 唯一的后端新增测试）。
 - 不 push、不 tag、不 force；commit 格式 `类型(内容): 中文描述`，不加 emoji。
-- design 里标「待拍板」的 D2/D5/D6/D8b/D11 与「公网 TLS 归属」未拍板前，对应实现停在最后一步（不合并）。D1（独立 `web` 容器 + 反代）与 D10（`deploy:check` 独立、不并入 `gate`）已定，按本表实现。
+- design 里标「待拍板」的 D5/D6/D8b/D11 与「公网 TLS 归属」未拍板前，对应实现停在最后一步（不合并）。D1（独立 `web` 容器 + 反代）、D2（编排文件放 `deploy/compose.yaml`）与 D10（`deploy:check` 独立、不并入 `gate`）已定，按本表实现。
 
 ## 1. 镜像：`deploy/Dockerfile.backend`、`deploy/Dockerfile.web` 与 `.dockerignore`
 
@@ -33,15 +33,16 @@ Updated: 2026-11-16
 - [ ] 容器内 `GET /` 返回 `index.html`、`/admin` 返回 `index.html`、`/assets/<hash>.js` 返回 200 且带 `immutable`；`server` 未起时 `/api/*` 返回 502（不伪装成 200 或 `index.html`）。
 - [ ] `git diff --stat -- backend/` 为空：本项不新增 `StaticDir`、不改 `api.Handler()`（已定）。
 
-## 3. 编排：根 `docker-compose.yml` 与编排段变量
+## 3. 编排：`deploy/compose.yaml` 与编排段变量
 
 依赖：1、2（两个镜像与 nginx 模板就位才能接线）
 
-- [ ] `docker compose --env-file .env.example config -q` 通过；缺 `POSTGRES_PASSWORD` 时非零退出且错误信息点到变量名。
+- [ ] `POSTGRES_PASSWORD=ci-placeholder docker compose -f deploy/compose.yaml --env-file .env.example config -q` 退出码 0；独立检查：完全不传 env file 且 shell 未导出该变量（`env -u POSTGRES_PASSWORD docker compose -f deploy/compose.yaml config -q`）时退出码非零且错误信息点到 `POSTGRES_PASSWORD`。
 - [ ] `task up` 后 `task ps` 显示 `web`/`server`/`postgres` 为 `healthy`、`backup` 为 `running`；`web` 依赖 `server` healthy 才启动；`server`、`postgres`、`backup` 均无宿主端口，`ports` 只在 `web`。
 - [ ] 四个服务都挂 `json-file` 10 MiB × 5；`web` 与 `server` 为 `restart: on-failure:5`，`server` 另有 `stop_grace_period: 20s`、健康检查 15s/3 次/`start_period: 60s`；`web` 健康检查探 `GET /`；两个命名卷写死卷名。
 - [ ] `server` 的 `environment` 里没有 `STATIC_DIR`、没有 `POSTGRES_*`，`TRUST_PROXY_HEADERS` 为 `${TRUST_PROXY_HEADERS:-true}`；`web` 的 `environment` 只有 `BACKEND_UPSTREAM` 与 `TZ`。
-- [ ] `.env.example` 编排段 8 项齐备（含 `BACKEND_UPSTREAM`）；`Taskfile.yml` 里 `up/down/ps/build` 的描述、`logs` 的 `service` 取值、`db:psql` 的用户与库名、`LOCAL_DSN` 注释同步到新口径。
+- [ ] `.env.example` 编排段 8 项齐备（含 `BACKEND_UPSTREAM`）；`Taskfile.yml` 里 `up/down/ps/build` 的描述、`logs` 的 `service` 取值、`ps` 的 `--all`（Exited 服务可见）、`db:psql` 与 `db:dump`/`db:restore` 的用户与库名、`db:dump` 的空备份防护、`LOCAL_DSN` 注释同步到新口径。
+- [ ] `task up/ps/down/logs` 在 `.env` 缺失时以非零退出码结束并提示先 `task deploy:env` 或 `cp .env.example .env` 并填 `POSTGRES_PASSWORD`；README 常用命令段有对应一行。
 
 ## 4. 配置样例：`.env.example` 应用段与对齐测试
 

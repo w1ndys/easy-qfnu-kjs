@@ -6,7 +6,7 @@ Updated: 2026-11-16
 
 ## Description
 
-把七份已完成的 spec 装进一套单机、单副本的容器部署：一个根 `docker-compose.yml`、`deploy/` 下的两份 Dockerfile（`Dockerfile.backend`、`Dockerfile.web`）与 nginx 配置、一份根 `.env.example`、`deploy/` 下的备份与恢复脚本，以及根 `Taskfile.yml` 里的 `deploy:*` 门禁与运维入口。
+把七份已完成的 spec 装进一套单机、单副本的容器部署：`deploy/compose.yaml` 编排、`deploy/` 下的两份 Dockerfile（`Dockerfile.backend`、`Dockerfile.web`）与 nginx 配置、一份根 `.env.example`、`deploy/` 下的备份与恢复脚本，以及根 `Taskfile.yml` 里的 `deploy:*` 门禁与运维入口。
 
 拓扑是四服务（已定）：`web`（nginx 托管前端产物，反代 `/api`、`/healthz`、`/readyz` 到 `server`）+ `server` + `postgres` + 备份 sidecar（`backup`）。
 
@@ -21,7 +21,7 @@ Updated: 2026-11-16
 | 编号 | 决策 | 状态 | 取舍 |
 |---|---|---|---|
 | D1 | **前端由独立 `web` 容器托管并反代（已定）**：`web`（nginx 或等价）托管 `frontend/dist` 的静态文件与 SPA 兜底，并把 `/api/*`、`/healthz`、`/readyz` 反代到 `server:18080`；`server` 只提供 JSON 与探针 | 已定 | 前端可单独发版、静态缓存头与安全头在 nginx 一处收敛；与 API 同源（同一个宿主端口），管理端 Cookie/CSRF 不受跨站影响。代价是多一个容器与一份反代配置，`TRUST_PROXY_HEADERS` 必须置 `true`（否则限流与统计看到的客户端 IP 全变成 `web` 容器地址） |
-| D2 | **编排文件放仓库根、名 `docker-compose.yml`**（`deploy/` 只放两份 Dockerfile、nginx 配置与脚本） | 待拍板 | 与根 `Taskfile.yml`、`.gitignore` 的 `backup/`、README 的入口一致，运维一条 `task up` 就够；偏离 ai-kit 惯例的 `deploy/compose.yaml`，且 README 里历史写的 `compose.yaml` / `Dockerfile.backend` / `Dockerfile.frontend` 要同步改成 `docker-compose.yml` / `deploy/Dockerfile.backend` / `deploy/Dockerfile.web` |
+| D2 | **编排文件放 `deploy/compose.yaml`（已定）**：`deploy/` 同时承载编排、两份 Dockerfile、nginx 配置与脚本 | 已定 | 按 ai-kit 惯例把编排与它管理的 Dockerfile / nginx / 脚本放在一处，`deploy/` 一个目录就是全部部署资产；代价是 compose 以本文件所在目录为项目目录（`build.context` 等相对路径要写 `..`、命令要带 `-f deploy/compose.yaml`），且 README 里历史写的 `compose.yaml` / `Dockerfile.backend` / `Dockerfile.frontend` 要同步改成 `deploy/compose.yaml` / `deploy/Dockerfile.backend` / `deploy/Dockerfile.web` |
 | D3 | **两份 Dockerfile（已定）**：`deploy/Dockerfile.backend`（`golang:1.26.10-alpine` 构建 → `alpine:3.22` 运行，非 root 用户）与 `deploy/Dockerfile.web`（`node:24-alpine` + pnpm 构建 → `nginx:1.29-alpine` 运行），两者构建上下文都是仓库根，`.dockerignore` 只维护一份 | 已定 | 前端产物只进 web 镜像、后端镜像只装二进制、CA 证书与 tzdata，改前端不必重建后端镜像；代价是两份文件与两条 `build:` 声明，`docker compose build` 变成两次构建 |
 | D4 | **备份用 compose 的 sidecar 服务**（`postgres:17-alpine` 镜像 + 自带 busybox `crond`），每日 03:15 `Asia/Shanghai` | 已定 | 备份与业务进程生命周期解耦，`server` 崩了备份照样跑；镜像自带 `pg_dump` 17.11，与 `postgres:17` 同主版本，不用给运行镜像装客户端。代价是多一个常驻容器 |
 | D5 | **备份产物落宿主 `./backup`（bind mount）** | 待拍板 | 备份要能被运维直接拷走做异地副本，放命名卷反而要多一条 `docker run -v` 才能取出；`.gitignore` 已忽略 `backup/`。这是对「数据一律命名卷」的刻意例外，数据库数据卷与密钥卷仍用命名卷 |
@@ -107,12 +107,12 @@ docker compose up -d
 ### 目录结构
 
 ```text
-docker-compose.yml              根编排：web / server / postgres / backup，命名卷、网络、健康检查、日志轮转
 .dockerignore                   唯一一份：排除 .git、node_modules、frontend/dist、backend/bin、backup、specs
 .env.example                    两段：应用段（≡ config.Config，8 项）+ 编排段（仅 compose 与 nginx 模板）
 Taskfile.yml                    新增 deploy:*，修正 up/down/logs/build 描述、db:dump/db:restore、LOCAL_DSN 注释
 README.md                       「部署」段：内网部署、首次初始化、回退与恢复，链接验收记录
 deploy/
+  compose.yaml                  编排：web / server / postgres / backup，命名卷、网络、健康检查、日志轮转
   Dockerfile.backend            server 镜像：go-build（golang:1.26.10-alpine）→ runtime（alpine:3.22，非 root）
   Dockerfile.web                web 镜像：web-build（node:24-alpine + pnpm）→ runtime（nginx:1.29-alpine）
   nginx/
@@ -226,7 +226,11 @@ networks:
   default: { name: easy-qfnu-kjs-net }
 ```
 
-（`backup` 服务在 tasklist 第 5 项补齐；上面只钉住接口与语义。）
+（`backup` 服务在 tasklist 第 5 项补齐；上面只钉住接口与语义。编排落地时它先以占位服务出现：`restart: unless-stopped`、`command: ["sleep", "infinity"]`、无挂载、无宿主端口，目的只是让 `task ps` 里有第四个 `running` 的服务与四个服务的日志规格——`entrypoint`、crontab 与 `./backup`、`./deploy/backup` 两个挂载由第 5 项补齐。）
+
+路径与命令口径：编排文件在 `deploy/` 下，compose 以该文件所在目录为项目目录，且默认不发现它。所以下文所有 `docker compose ...` 示例都在仓库根执行并隐含 `-f deploy/compose.yaml`；`build.context` 写 `..`（仓库根），`dockerfile` 再相对该 context 写 `deploy/Dockerfile.*`；将来挂宿主目录时，仓库根的 `backup/` 要写成 `../backup`。
+
+环境文件口径：compose 的默认环境文件按**项目目录**找，即 `deploy/.env`，仓库根的 `.env` 不会被自动读取。`.env` 仍固定在仓库根（与 `.env.example` 同目录、被 `.gitignore` 忽略），所以运行期命令一律显式带 `--env-file .env`（`Taskfile.yml` 的 `COMPOSE` 变量统一带上，`task up/ps/down/logs` 因此在 `.env` 缺失时由 `preconditions` 直接拒绝，并提示先 `task deploy:env` 或 `cp .env.example .env` 再填 `POSTGRES_PASSWORD`）。
 
 要点：
 
@@ -293,7 +297,7 @@ networks:
 
 （已定：应用段共 8 项，`STATIC_DIR` 与 `config.StaticDir` 已随 D9 撤销，`config.Config` 回到原样、无新增字段。`web` 用的 `BACKEND_UPSTREAM` 不属应用段，见下表与「`web` 容器与 nginx 反代」段。）
 
-编排段（只被 `docker-compose.yml` 与 `deploy/nginx/default.conf.template` 读取，不进应用进程）：
+编排段（只被 `deploy/compose.yaml` 与 `deploy/nginx/default.conf.template` 读取，不进应用进程）：
 
 | 变量 | 默认 | 用途 |
 |---|---|---|
@@ -318,7 +322,7 @@ TRUST_PROXY_HEADERS=
 SECRET_KEY_PATH=
 ADMIN_COOKIE_SECURE=
 UPSTREAM_BASE_URL=
-# --- 编排变量（仅 docker-compose.yml 与 nginx 模板使用，不进入应用进程）---
+# --- 编排变量（仅 deploy/compose.yaml 与 nginx 模板使用，不进入应用进程）---
 POSTGRES_USER=
 POSTGRES_PASSWORD=
 POSTGRES_DB=
@@ -399,10 +403,10 @@ compose 的 `depends_on: postgres: service_healthy` 只保证「库能接受连�
 
 既有 target 的同步修正（同属交付物，不是新增功能）：
 
-- `up` / `down` / `ps` / `build` 的描述里 `web + server + postgres` 改成 `web + server + postgres (+ backup)`；`build` 的「两个镜像」保持（现在是真两个：`web` 与 `server`）；`logs` 的 `service` 取值补 `backup`，即 `web|server|postgres|backup`。
-- `db:dump` / `db:restore` 改为转调 `deploy/backup/backup.sh` 与 `restore.sh`，避免仓库里存在两套 `pg_dump` 实现。
+- `up` / `down` / `ps` / `build` 的描述里 `web + server + postgres` 改成 `web + server + postgres (+ backup)`；`build` 的「两个镜像」保持（现在是真两个：`web` 与 `server`）；`ps` 带 `--all`，让 `Exited` 的服务也出现在状态里（与 D6 的「坏配置停在可见的 `Exited`」一致）；`logs` 的 `service` 取值补 `backup`，即 `web|server|postgres|backup`。
+- `db:dump` / `db:restore` 改为转调 `deploy/backup/backup.sh` 与 `restore.sh`，避免仓库里存在两套 `pg_dump` 实现。第 3 项先维持直连实现：用户与库名在容器内取 `$POSTGRES_USER` / `$POSTGRES_DB`；`db:dump` 开 `pipefail` 并先写临时文件、非空才落位，避免 `pg_dump` 失败被 `gzip` 的成功退出码盖成「空备份但成功」。
 - `db:psql` 的用户与库名改用 `${POSTGRES_USER}` / `${POSTGRES_DB}`（默认不再是 `postgres`）。
-- `LOCAL_DSN` 注释与 README 的 `postgres:postgres@127.0.0.1:5432` 示例同步改成 compose 编排段的实际变量。
+- `LOCAL_DSN` 不提供可用默认值：`postgres` 不映射宿主端口，注释里只留一条临时映射示例（`ports: ["127.0.0.1:15432:5432"]` → `...@127.0.0.1:15432/...`），用户与库名仍取 `POSTGRES_USER` / `POSTGRES_DB`；README 不再出现 `postgres:postgres@127.0.0.1:5432` 这类宿主机上连不通的示例。
 
 ## Data Models
 
@@ -550,14 +554,13 @@ compose 的 `depends_on: postgres: service_healthy` 只保证「库能接受连�
 
 ## 待拍板疑点
 
-已定两条（本次拍板，不再列出）：D1 前端托管方式（独立 `web` 容器 + 反代）、D10 `deploy:check` 保持独立 target 且不并入 `gate`。剩 6 条：
+已定三条（本次拍板，不再列出）：D1 前端托管方式（独立 `web` 容器 + 反代）、D2 编排文件位置（`deploy/compose.yaml`）、D10 `deploy:check` 保持独立 target 且不并入 `gate`。剩 5 条：
 
-1. **D2 编排文件位置**：根 `docker-compose.yml` 偏离 ai-kit 惯例的 `deploy/compose.yaml`；选惯例则 `deploy/` 同时承载编排、两份 Dockerfile、nginx 配置与脚本（本 spec 现在是后者——`deploy/` 已放 Dockerfile 与 nginx 配置，再放编排也能成立）。
-2. **D5 备份落宿主 `./backup`**：偏离「数据一律命名卷」。若坚持命名卷，需要额外的取出命令（`docker run --rm -v ... tar`），备份不能直接拷走。
-3. **D6 重启上限**：`server` 与 `web` 都是 `on-failure:5`，坏配置会停在可见的 `Exited`；若更看重自愈，改回 `unless-stopped`，代价是坏配置会无限重启刷日志与库连接。
-4. **D8b 清理日志**：是否接受为「每日一条清理 INFO（含 `deleted=0`）」改 `clean.go` 一行并补测试；不接受则验收时只能靠统计表行数间接确认清理跑过。**注意**：这一条若采纳会破坏 CP13「后端零改动」，需要一并改口。
-5. **D11 镜像 tag 变量化**：两个镜像共用一个 `IMAGE_TAG` 让回退可用，但偏离「镜像名写死」的惯例；若写死 tag，回退只能重建镜像。
-6. **公网阶段的 TLS 终止归属**：本 spec 只把 `web` 暴露到 `BIND_ADDR`，不交付证书与 443。切公网时由宿主反代（Caddy/nginx，compose 外）终止 TLS 并补安全头，还是届时给 `web` 加一个 TLS `server` 块——这个决定影响 `TRUST_PROXY_HEADERS`（多一层反代仍为 `true`）、`ADMIN_COOKIE_SECURE` 的最终取值与 nginx 配置的落点，需要先定方向再写进 M5 验收。
+1. **D5 备份落宿主 `./backup`**：偏离「数据一律命名卷」。若坚持命名卷，需要额外的取出命令（`docker run --rm -v ... tar`），备份不能直接拷走。
+2. **D6 重启上限**：`server` 与 `web` 都是 `on-failure:5`，坏配置会停在可见的 `Exited`；若更看重自愈，改回 `unless-stopped`，代价是坏配置会无限重启刷日志与库连接。
+3. **D8b 清理日志**：是否接受为「每日一条清理 INFO（含 `deleted=0`）」改 `clean.go` 一行并补测试；不接受则验收时只能靠统计表行数间接确认清理跑过。**注意**：这一条若采纳会破坏 CP13「后端零改动」，需要一并改口。
+4. **D11 镜像 tag 变量化**：两个镜像共用一个 `IMAGE_TAG` 让回退可用，但偏离「镜像名写死」的惯例；若写死 tag，回退只能重建镜像。
+5. **公网阶段的 TLS 终止归属**：本 spec 只把 `web` 暴露到 `BIND_ADDR`，不交付证书与 443。切公网时由宿主反代（Caddy/nginx，compose 外）终止 TLS 并补安全头，还是届时给 `web` 加一个 TLS `server` 块——这个决定影响 `TRUST_PROXY_HEADERS`（多一层反代仍为 `true`）、`ADMIN_COOKIE_SECURE` 的最终取值与 nginx 配置的落点，需要先定方向再写进 M5 验收。
 
 ## References
 

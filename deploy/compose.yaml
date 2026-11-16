@@ -1,0 +1,154 @@
+# easy-qfnu-kjs 单机、单副本编排。四个服务：web / server / postgres / backup。
+# 用法：task up / task ps / task logs，或直接
+#   docker compose -f deploy/compose.yaml --env-file .env config -q
+#   docker compose -f deploy/compose.yaml --env-file .env up -d --build
+#
+# 环境文件口径：compose 的默认环境文件按项目目录找，即 deploy/.env；仓库根的 .env 不会
+# 自动读到，所以命令里要显式 --env-file .env（Taskfile.yml 的 COMPOSE 变量已统一带上）。
+#
+# 路径口径（关键）：本文件在 deploy/ 下，compose 以「本文件所在目录」为项目目录，
+# 下面所有相对路径都相对 deploy/ 解析，而不是仓库根：
+#   - build.context 写 `..`（仓库根），dockerfile 再相对该 context 写 deploy/Dockerfile.*；
+#   - 将来要挂宿主目录时同理，仓库根的 backup/ 得写成 `../backup`，而不是 `./backup`。
+#
+# 端口口径：宿主端口只出现在 web 一处（`${BIND_ADDR}:${SERVER_PORT}`）；server 只在
+# compose 内网监听 18080，postgres 与 backup 完全不映射宿主端口。外部流量一律经 web
+# 反代进入，探针 /healthz、/readyz 也走 web。
+
+name: easy-qfnu-kjs
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: easy-qfnu-kjs-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kjs}
+      # `:?` 让「没设置」和「设置成空值」都在部署阶段直接失败，并把变量名打进错误信息：
+      # 口令缺失不该拖到空口令库已经起好之后才被发现。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?需要设置 POSTGRES_PASSWORD（见 .env.example 编排段）}
+      POSTGRES_DB: ${POSTGRES_DB:-easy_qfnu_kjs}
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # $$ 是 compose 的转义：$${POSTGRES_USER} 由容器内的 shell 展开，用的是上面注入的值。
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # 四个服务共用同一个 logging 锚点，轮转规格只写一处，避免哪个服务漏配把磁盘写满。
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      target: runtime
+    image: easy-qfnu-kjs-server:${IMAGE_TAG:-local}
+    container_name: easy-qfnu-kjs-server
+    # 采集/统计是长跑进程：异常退出重试 5 次仍失败就停在那儿等人看，不无限重启刷日志。
+    restart: "on-failure:5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 连接串由编排段变量插值拼出（POSTGRES_* 只在这里出现，不额外塞进应用进程的变量名）。
+      # 口令里带 @ : / 这类字符会把 DSN 拆坏，取值范围见 .env.example。
+      DATABASE_URL: postgres://${POSTGRES_USER:-kjs}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-easy_qfnu_kjs}?sslmode=disable
+      HTTP_ADDR: ":18080"
+      # 可选的应用段变量一律 `${VAR:-}` 形式：空串由 config.Load 回落代码默认值，
+      # compose 不复制一份默认值，避免两处口径。
+      LOG_LEVEL: ${LOG_LEVEL:-}
+      OCR_TIMEOUT: ${OCR_TIMEOUT:-}
+      # 唯一一个默认值由拓扑决定的变量：请求全部来自 web，不信任反代头时限流与统计看到
+      # 的客户端 IP 会全是 web 容器地址。只有绕过 web 直连 server 排障时才显式置 false。
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}
+      SECRET_KEY_PATH: /var/lib/easy-qfnu-kjs/secret.key
+      ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-false}
+      UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-}
+      # 依赖 runtime 阶段的 tzdata 才生效：日志时间与宿主机一致；业务时间仍用固定 +08:00。
+      TZ: Asia/Shanghai
+    volumes:
+      - secret:/var/lib/easy-qfnu-kjs
+    healthcheck:
+      # 只探进程存活（/healthz 不查库）：库抖动不该连带把进程判死、反复重启。
+      # 就绪看 /readyz，由 task deploy:health 经 web 的宿主端口复验。
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:18080/healthz || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      # 首次启动要跑迁移、收敛过期轮次、装载密钥，60s 内不判失败。
+      start_period: 60s
+    # 迁移与 HTTP 收尾要时间：SIGTERM 之后给 20s 再 SIGKILL。
+    stop_grace_period: 20s
+    logging: *logging
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+      target: runtime
+    image: easy-qfnu-kjs-web:${IMAGE_TAG:-local}
+    container_name: easy-qfnu-kjs-web
+    restart: "on-failure:5"
+    depends_on:
+      # server 没 healthy 就不对外提供半个站点（静态能出、接口全 502 也算半个站点）。
+      server:
+        condition: service_healthy
+    environment:
+      # web 的 environment 只有这两项：上游地址（nginx 模板渲染用）与本容器时区。
+      # BACKEND_UPSTREAM 格式是 host:port，不带协议；它只被 nginx 模板读取，不进应用进程。
+      BACKEND_UPSTREAM: ${BACKEND_UPSTREAM:-server:18080}
+      TZ: Asia/Shanghai
+    ports:
+      # 全编排唯一的宿主端口映射。容器内固定 8080（nginx listen），宿主端口由 SERVER_PORT
+      # 决定，绑定地址由 BIND_ADDR 决定：默认只听回环，内网验收改 0.0.0.0。
+      - "${BIND_ADDR:-127.0.0.1}:${SERVER_PORT:-8080}:8080"
+    healthcheck:
+      # 只探「nginx 能吐出静态产物」，不探 /healthz：否则 server 一抖动就会把一个没问题的
+      # 反代判成不健康，restart: on-failure 再把它反复重启。
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    logging: *logging
+
+  backup:
+    image: postgres:17-alpine
+    container_name: easy-qfnu-kjs-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-kjs}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-easy_qfnu_kjs}
+      BACKUP_RETAIN_DAYS: ${BACKUP_RETAIN_DAYS:-7}
+      TZ: Asia/Shanghai
+    # ---- 占位（tasklist 第 5 项替换为真实的 crond sidecar）----
+    # 第 5 项会把下面换成 `entrypoint: /scripts/entrypoint.sh`（装 crontab 后 exec crond），
+    # 并补两个挂载：`../backup:/backup`（仓库根的 backup/，注意是 `..` 不是 `.`）与
+    # `./backup:/scripts:ro`（deploy/backup/）。占位阶段只跑一个不做事也不退出的进程：
+    # task ps 能看到它是 running，且不占宿主端口、不写宿主文件。
+    command: ["sleep", "infinity"]
+    logging: *logging
+
+volumes:
+  # 两个命名卷都写死 name：默认卷名会带项目名前缀，写死才能跨机对照、也方便手工
+  # `docker volume inspect` 排障。数据卷迁移按固定名字找。
+  pgdata:
+    name: easy-qfnu-kjs-pgdata
+  secret:
+    name: easy-qfnu-kjs-secret
+
+networks:
+  # 默认网络的固定名字：宿主只经 web 的映射端口进入，四个服务都在这个网络里。
+  default:
+    name: easy-qfnu-kjs-net
